@@ -1,0 +1,24 @@
+[Match]
+Name=eth* en*
+
+[Network]
+DHCP=yes
+# Answer to <hostname>.local without a DNS server on the bench.
+MulticastDNS=yes
+
+[DHCP]
+UseHostname=false
+
+[DHCPv4]
+# Identify ourselves to the DHCP server by MAC address, not by DUID.
+#
+# This is what keeps the appliance on ONE address. systemd-networkd's default client
+# identifier is a DUID derived from /etc/machine-id — but on a read-only rootfs /etc/machine-id
+# is an empty file, so systemd generates a fresh random machine-id into a tmpfs on every single
+# boot. The DUID therefore changes every boot, the router sees a brand-new client each time, and
+# it hands out a brand-new lease: the board walked .171 → .172 → .173 across three reflashes
+# while its MAC (b8:27:eb:..., burned into the Pi's serial) never changed at all.
+#
+# Keying off the MAC makes the lease stable across reboots, reflashes and image rebuilds, and
+# it is also what lets you pin a static DHCP reservation on the router.
+ClientIdentifier=mac

@@ -1,0 +1,17 @@
+[Unit]
+Description=Generate persistent ssh host keys on the data partition
+DefaultDependencies=no
+After=data.mount local-fs.target
+# Must win the race against OpenSSH's own key generator: if sshdgenkeys runs first it tries
+# to create the keys itself on the read-only /data and sshd comes up with no host key.
+Before=sshdgenkeys.service sshd.service
+# Deliberately NO ConditionPathIsMountPoint=/data: if the data partition failed to mount we
+# still want to run, fall back to a tmpfs and keep ssh working.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/soundtester-sshkeys
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sound Tester</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Sound Tester</h1>
+  <div class="status">
+    <span id="conn" class="pill bad">connecting</span>
+    <span id="engine" class="pill"></span>
+    <span id="xruns" class="pill"></span>
+    <span id="cpu" class="pill"></span>
+  </div>
+</header>
+
+<div id="syncbanner" class="banner hidden">
+  <strong>I2S sync error detected.</strong>
+  The card's TDM slots can rotate after this — verify your channel mapping in
+  <a href="#" data-tab="map">Channel map</a>.
+</div>
+
+<div id="powerbanner" class="banner hidden">
+  <strong>Under-voltage detected.</strong>
+  <span id="powertext"></span>
+  The Pi's firmware is reporting a sagging supply. Use a 5 V / 2.5 A (or better) power supply
+  and a short, thick cable — the Octo draws current the Pi's regulator has to pass through.
+</div>
+
+<div id="databanner" class="banner hidden">
+  <strong>Data partition not mounted.</strong>
+  <code>/data</code> fell back to a RAM filesystem, so the device works but settings cannot be
+  saved as boot defaults. The SD card's third partition is missing or unreadable.
+</div>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="dash">Dashboard</button>
+  <button class="tab" data-tab="scope">Scope &amp; sync</button>
+  <button class="tab" data-tab="gen">Generators</button>
+  <button class="tab" data-tab="map">Channel map</button>
+  <button class="tab" data-tab="sys">System</button>
+</nav>
+
+<main>
+
+<section id="dash" class="panel active">
+  <h2>Inputs</h2>
+  <p class="muted small">
+    <strong>Listen L</strong> / <strong>Listen R</strong> send an input to that ear — press both
+    to hear it centred, none to stop it. Inputs sharing an ear are summed at unity, so several
+    loud ones can clip the browser's output; that is the monitor mix only and changes nothing
+    that is measured. Whatever is playing stays sample-aligned across channels.
+  </p>
+  <p id="gainnote" class="muted small hidden">
+    Gain is digital make-up gain applied the moment the samples arrive, for devices too quiet to
+    read: the meters, spectrum, THD+N, scope, listen streams and anything routed to an output all
+    show the amplified signal. It cannot recover a signal the ADC already clipped, and pushing it
+    past full scale clamps — the peak meter parks at 0.0 dBFS and the scope flat-tops.
+  </p>
+
+  <div class="monitor">
+    <span class="mlabel">Monitor volume</span>
+    <input type="range" id="monvol" min="-20" max="40" step="0.5">
+    <span id="monvolv" class="mono val">unity</span>
+    <span class="muted small mnote">
+      Applied in the browser, to both ears at once, on everything Listen L / Listen R is playing.
+      Nothing measured changes — the meters, THD+N and the scope are unaffected, and the device
+      never hears it. Past unity it can clip your computer's output, which is your speakers
+      distorting, not the input.
+    </span>
+  </div>
+
+  <div id="inputs" class="grid"></div>
+  <h2>Outputs</h2>
+  <div id="outputs" class="grid"></div>
+</section>
+
+<section id="scope" class="panel">
+  <div class="toolbar">
+    <div class="tgrp tgrp-cap">
+      <span class="tglabel">Capture</span>
+      <button id="freeze" class="primary">Freeze</button>
+      <button id="clear">Clear</button>
+      <span id="capstate" class="live">live</span>
+      <span id="capdetail" class="muted"></span>
+    </div>
+
+    <div class="tgrp tgrp-del">
+      <span class="tglabel">Delay</span>
+      <select id="xa">
+        <option value="1" selected>IN 1</option><option value="2">IN 2</option>
+        <option value="3">IN 3</option><option value="4">IN 4</option>
+        <option value="5">IN 5</option><option value="6">IN 6</option>
+      </select>
+      <span class="arrow">&rarr;</span>
+      <select id="xb">
+        <option value="1">IN 1</option><option value="2" selected>IN 2</option>
+        <option value="3">IN 3</option><option value="4">IN 4</option>
+        <option value="5">IN 5</option><option value="6">IN 6</option>
+      </select>
+      <button id="measure">Measure</button>
+    </div>
+
+    <div class="tgrp tgrp-view">
+      <span class="tglabel">View</span>
+      <button id="zoomout">Zoom out</button>
+      <button id="zoomfit">Fit</button>
+      <button id="follow">Follow</button>
+      <label><input type="checkbox" id="showpings"> Ping markers</label>
+    </div>
+
+    <div class="tgrp tgrp-cur">
+      <span class="tglabel">Cursors</span>
+      <span class="cur"><span class="ckey ka">A</span><span id="curA" class="mono cval">—</span></span>
+      <span class="cur"><span class="ckey kb">B</span><span id="curB" class="mono cval">—</span></span>
+      <span class="cur"><span class="ckey">&Delta;</span><span id="curD" class="mono cvald">—</span></span>
+      <span class="curhint muted">Left-click sets A &middot; right-click sets B &middot; wheel zooms &middot; drag pans</span>
+    </div>
+  </div>
+  <div id="scopemsg" class="muted small"></div>
+  <p class="muted small">
+    Freeze first, then measure: the delay is computed from the frozen snapshot, and
+    frozen zoom goes all the way down to individual samples.
+  </p>
+  <canvas id="scopecanvas" height="520"></canvas>
+  <div id="xcorrout" class="result"></div>
+  <div id="lanes" class="lanes"></div>
+</section>
+
+<section id="gen" class="panel">
+  <div class="card">
+    <h3>Sine</h3>
+    <label>Frequency <input type="number" id="sineFreq" min="1" max="40000" step="1"> Hz</label>
+    <label>Level <input type="range" id="sineLevel" min="-60" max="0" step="0.5">
+      <span id="sineLevelV" class="mono val"></span> dBFS</label>
+    <p class="muted small">996.09 Hz is bin-centred at 96 kHz / 8192 — use it for clean THD+N.</p>
+  </div>
+  <div class="card">
+    <h3>Noise</h3>
+    <label>Mode
+      <select id="noiseMode"><option value="white">white</option><option value="pink">pink</option></select>
+    </label>
+    <label>Level <input type="range" id="noiseLevel" min="-60" max="0" step="0.5">
+      <span id="noiseLevelV" class="mono val"></span> dBFS</label>
+    <p class="muted small">Pink uses the Kellett filter, tuned for 44.1 kHz: at 96 kHz the slope
+      tilts by a couple of dB across the band.</p>
+  </div>
+  <div class="card">
+    <h3>Ping <span class="muted">(multiroom)</span></h3>
+    <label>Variant
+      <select id="pingVariant">
+        <option value="tick">tick — 3 kHz, sharp (use this to measure)</option>
+        <option value="bing">bing — 1 kHz, 60 ms</option>
+        <option value="bong">bong — 440 Hz, 250 ms</option>
+      </select>
+    </label>
+    <label>Interval <input type="number" id="pingInterval" min="0.5" max="60" step="0.5"> s</label>
+    <label>Level <input type="range" id="pingLevel" min="-60" max="0" step="0.5">
+      <span id="pingLevelV" class="mono val"></span> dBFS</label>
+    <p class="muted small">Only <em>tick</em> decays fast enough to give an unambiguous
+      correlation peak. bing and bong ring for many cycles and are meant to be heard, not measured.</p>
+    <h4>Recent emissions</h4>
+    <div id="pinglog" class="mono small"></div>
+  </div>
+</section>
+
+<section id="map" class="panel">
+  <div class="card wide">
+    <h3>Channel map</h3>
+    <p class="muted">
+      The Octo's TDM slots can rotate after an I2S sync error, so what the driver calls
+      channel 1 is not always physical input 1. Play <em>Identify</em> on an output and
+      listen, or watch the input meters, then remap here. Slots must stay distinct.
+    </p>
+    <div class="maps">
+      <div>
+        <h4>Inputs</h4>
+        <div id="imap"></div>
+      </div>
+      <div>
+        <h4>Outputs</h4>
+        <div id="omap"></div>
+      </div>
+    </div>
+    <button id="savemap" class="primary">Apply mapping</button>
+    <span id="mapmsg" class="muted"></span>
+  </div>
+</section>
+
+<section id="sys" class="panel">
+  <div class="card wide">
+    <h3>Engine</h3>
+    <table id="systable"></table>
+  </div>
+  <div class="card wide">
+    <h3>Settings</h3>
+    <p class="muted">
+      The root filesystem is read-only and settings live in RAM: the device always boots
+      into a known state. Save writes the current routing, generators and mapping to the
+      data partition so the next boot starts from them.
+    </p>
+    <button id="save" class="primary">Save as boot defaults</button>
+    <button id="reset">Factory reset</button>
+    <button id="reboot" class="danger">Reboot</button>
+    <button id="shutdown" class="danger">Shut down</button>
+    <span id="sysmsg" class="muted"></span>
+  </div>
+  <div class="card wide">
+    <h3>Host</h3>
+    <div id="cores"></div>
+    <div id="mem"></div>
+  </div>
+</section>
+
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

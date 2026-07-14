@@ -1,0 +1,127 @@
+# Sound Tester build configuration.
+#
+# Copied to yocto/build/conf/local.conf by `make yocto-setup`. Edit that copy for one-off
+# experiments; edit this file for changes you want to keep.
+#
+# Device settings (hostname, root password, ssh, Wi-Fi) are NOT here — they live in
+# meta-soundtester/conf/soundtester-device.conf, which the layer pulls in automatically.
+
+MACHINE ?= "raspberrypi3"
+
+# MACHINE=raspberrypi3 (32-bit) on purpose:
+#   - its defconfig (bcm2709_defconfig) already carries
+#     CONFIG_SND_AUDIOINJECTOR_OCTO_SOUNDCARD=m
+#   - unlike raspberrypi3-64, it does not hard-code dtparam=audio=on into config.txt
+# A Pi 4 works too (MACHINE=raspberrypi4). The Octo has no working configuration on a Pi 5
+# at all — see docs/octo-known-issues.md.
+
+DISTRO ?= "poky"
+INIT_MANAGER = "systemd"
+
+PACKAGE_CLASSES ?= "package_ipk"
+EXTRA_IMAGE_FEATURES ?= ""
+
+# ---------------------------------------------------------------------------
+# The Audio Injector Octo produces only distorted noise on every 6.x kernel; 5.15.92 is the
+# last version known to work. meta-soundtester carries the pinned recipe.
+# ---------------------------------------------------------------------------
+PREFERRED_VERSION_linux-raspberrypi = "5.15.%"
+
+# ---------------------------------------------------------------------------
+# Device trees for a 5.15 kernel.
+#
+# meta-raspberrypi/scarthgap targets kernel 6.x, where ARM device trees moved into vendor
+# subdirectories: its list says "broadcom/bcm2710-rpi-3-b.dtb". In 5.15 they are still flat
+# in arch/arm/boot/dts/, so that list fails with "No rule to make target
+# .../broadcom/bcm2708-rpi-zero.dtb". Its list also names boards that do not exist in 5.15
+# at all (Pi 5, CM5). So pin both lists to what this kernel actually ships.
+#
+# audioinjector-addons.dtbo is NOT in meta-raspberrypi's default overlay list either —
+# without it the dtoverlay= line below silently fails at boot and the card never appears.
+# ---------------------------------------------------------------------------
+RPI_KERNEL_DEVICETREE = " \
+    bcm2709-rpi-2-b.dtb \
+    bcm2710-rpi-2-b.dtb \
+    bcm2710-rpi-3-b.dtb \
+    bcm2710-rpi-3-b-plus.dtb \
+    bcm2710-rpi-cm3.dtb \
+    bcm2837-rpi-3-a-plus.dtb \
+    bcm2837-rpi-3-b.dtb \
+    bcm2837-rpi-3-b-plus.dtb \
+"
+RPI_KERNEL_DEVICETREE_OVERLAYS = " \
+    overlays/overlay_map.dtb \
+    overlays/audioinjector-addons.dtbo \
+    overlays/disable-bt.dtbo \
+    overlays/disable-wifi.dtbo \
+"
+
+# non-stop-clocks keeps BCLK running between streams: the documented mitigation for the
+# card's TDM slot-rotation bug.
+#
+# The onboard Wi-Fi radio is switched off unless a Wi-Fi network was configured in
+# soundtester-device.conf. The image only ships the Broadcom firmware blob when an SSID is set,
+# so on an Ethernet-only build the brcmfmac driver would otherwise probe a radio it can never
+# use: four "Direct firmware load ... failed with error -2" lines in dmesg and a 1.1 s SDIO
+# busy-wait. Set SOUNDTESTER_WIFI_SSID and the overlay disappears.
+RPI_EXTRA_CONFIG = '\n# Audio Injector Octo\ndtoverlay=audioinjector-addons,non-stop-clocks\n${@"" if d.getVar("SOUNDTESTER_WIFI_SSID") else "dtoverlay=disable-wifi\\n"}'
+
+# busybox's syslogd/klogd ship with packagegroup-core-boot, and on a systemd image they are pure
+# duplication: journald already reads /dev/kmsg directly, so klogd re-injects every kernel line
+# back into journald over the syslog transport. Every message is stored twice in a journal that
+# lives in RAM (Storage=volatile) and is therefore size-capped — halving how far back the kernel
+# log reaches, and the kernel log is the primary evidence for the card's TDM rotation bug.
+#
+# This has to be set at config scope: the package arrives as an RDEPENDS of packagegroup-core-boot
+# and is expanded in *its* datastore, so neither IMAGE_INSTALL:remove nor an assignment in the
+# image recipe can touch it.
+VIRTUAL-RUNTIME_base-utils-syslog = ""
+
+# meta-raspberrypi's rpi-cmdline.bb builds cmdline.txt from its own CMDLINE variable and
+# never sees oe-core's automatic "ro" append, so ask for it explicitly.
+CMDLINE_ROOTFS:append = " ro"
+
+# Headless bench instrument.
+DISABLE_VC4GRAPHICS = "1"
+
+# Serial console on the GPIO header (115200 8N1, GPIO14/15) plus a getty on it.
+#
+# A board can come up on the network, answer ping and DHCP under the right hostname, and still
+# run no services at all — with no console there is no way to see why. A 3-wire USB-TTL adapter
+# is enough to watch it boot.
+ENABLE_UART = "1"
+SERIAL_CONSOLES = "115200;ttyS0"
+
+# ...and the same messages on HDMI, so a monitor is enough to see a failed boot even
+# without a USB-TTL adapter. (CMDLINE_DEBUG is the free slot in rpi-cmdline.bb.)
+CMDLINE_DEBUG = "console=tty1"
+
+# The Pi's onboard Wi-Fi firmware (linux-firmware-rpidistro) is a binary blob behind
+# LICENSE_FLAGS = "synaptics-killswitch". The machine config only *recommends* it, so
+# without this line the firmware is quietly left out and Wi-Fi fails at runtime with no
+# error at build time. Drop this line if you do not need Wi-Fi and do not want the blob.
+LICENSE_FLAGS_ACCEPTED += "synaptics-killswitch"
+
+# ---------------------------------------------------------------------------
+# Build host
+# ---------------------------------------------------------------------------
+BB_NUMBER_THREADS ?= "${@oe.utils.cpu_count()}"
+PARALLEL_MAKE ?= "-j ${@oe.utils.cpu_count()}"
+
+# Shared between builds; safe to delete, only costs rebuild time.
+DL_DIR ?= "${TOPDIR}/../downloads"
+SSTATE_DIR ?= "${TOPDIR}/../sstate-cache"
+
+USER_CLASSES ?= "buildstats"
+PATCHRESOLVE = "noop"
+CONF_VERSION = "2"
+
+BB_DISKMON_DIRS ??= "\
+    STOPTASKS,${TMPDIR},1G,100K \
+    STOPTASKS,${DL_DIR},1G,100K \
+    STOPTASKS,${SSTATE_DIR},1G,100K \
+    STOPTASKS,/tmp,100M,100K \
+    HALT,${TMPDIR},100M,1K \
+    HALT,${DL_DIR},100M,1K \
+    HALT,${SSTATE_DIR},100M,1K \
+    HALT,/tmp,10M,1K"

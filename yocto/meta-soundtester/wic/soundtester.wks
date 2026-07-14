@@ -1,0 +1,13 @@
+# Boot (FAT) + read-only rootfs + a small writable partition for saved settings
+# ("Save as boot defaults" on an appliance whose root filesystem never changes).
+#
+# The mountpoints here name the partitions for wic only; they must never reach the image's
+# /etc/fstab. The image recipe passes --no-fstab-update to wic for that (see
+# soundtester-image.bb for why the per-partition flag of the same name would not do it) —
+# base-files owns the single /data entry, and /boot is not mounted at runtime at all.
+
+part /boot --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label boot --active --align 4096 --size 100
+part /     --source rootfs            --ondisk mmcblk0 --fstype=ext4 --label root --align 4096
+part /data                            --ondisk mmcblk0 --fstype=ext4 --label data --align 4096 --size 64
+
+bootloader --ptable msdos

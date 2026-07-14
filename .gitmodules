@@ -1,0 +1,23 @@
+# Header-only, all of them: nothing here is built or linked, the include path just points into
+# these trees.
+[submodule "app/third_party/httplib"]
+	path = app/third_party/httplib
+	url = https://github.com/yhirose/cpp-httplib
+	shallow = true
+[submodule "app/third_party/spdlog"]
+	path = app/third_party/spdlog
+	url = https://github.com/gabime/spdlog
+	shallow = true
+[submodule "app/third_party/json"]
+	path = app/third_party/json
+	url = https://github.com/nlohmann/json
+	shallow = true
+[submodule "app/third_party/cli11"]
+	path = app/third_party/cli11
+	url = https://github.com/CLIUtils/CLI11
+	shallow = true
+# No tags upstream — it develops on a rolling branch, so this pins a commit.
+[submodule "app/third_party/pocketfft"]
+	path = app/third_party/pocketfft
+	url = https://github.com/mreineck/pocketfft
+	shallow = true

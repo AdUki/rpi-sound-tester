@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: Sound Tester <soundtester@invalid>
+Date: Tue, 14 Jul 2026 00:00:00 +0000
+Subject: [PATCH] ASoC: audioinjector-octo: set the card owner
+
+snd_soc_audioinjector_octo does not set .owner, so snd_soc_bind_card()
+passes a NULL module to snd_card_new(), which trips WARN_ON(!module) at
+sound/core/init.c:305. Every boot therefore prints a WARNING with a full
+backtrace through audioinjector_octo_probe() and sets TAINT_WARN.
+
+The card still registers and audio works, so the practical damage is not
+to the audio path: it is that a measurement appliance ships with a
+tainted kernel and a scary audio-stack backtrace in dmesg, which teaches
+whoever reads the log to ignore exactly the place this card's real bug
+(TDM slot rotation, "I2S SYNC error!") shows up.
+
+Every other machine driver in sound/soc/bcm/ sets .owner. Do the same;
+it also fixes the missing module refcount while the card is in use.
+
+Signed-off-by: Sound Tester <soundtester@invalid>
+---
+ sound/soc/bcm/audioinjector-octo-soundcard.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/sound/soc/bcm/audioinjector-octo-soundcard.c b/sound/soc/bcm/audioinjector-octo-soundcard.c
+--- a/sound/soc/bcm/audioinjector-octo-soundcard.c
++++ b/sound/soc/bcm/audioinjector-octo-soundcard.c
+@@ -252,6 +252,7 @@
+
+ static struct snd_soc_card snd_soc_audioinjector_octo = {
+ 	.name = "audioinjector-octo-soundcard",
++	.owner = THIS_MODULE,
+ 	.dai_link = audioinjector_octo_dai,
+ 	.num_links = ARRAY_SIZE(audioinjector_octo_dai),
+
+--
+2.34.1

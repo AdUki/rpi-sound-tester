@@ -1,0 +1,407 @@
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --line: #2c313b;
+  --fg: #e6e9ef;
+  --muted: #8b93a3;
+  --accent: #4da3ff;
+  --good: #3ecf8e;
+  --warn: #f5a623;
+  --bad: #ef5b5b;
+}
+
+* { box-sizing: border-box; }
+
+/* Otherwise the scrollbar appearing takes ~15 px out of the content box, which is enough to
+   drop the card grid down a column at a breakpoint. */
+html { scrollbar-gutter: stable; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+h1 { font-size: 1.1rem; margin: 0; letter-spacing: 0.02em; }
+h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 1.5rem 0 0.75rem; }
+h3 { margin: 0 0 0.75rem; font-size: 1rem; }
+h4 { margin: 1rem 0 0.5rem; font-size: 0.85rem; color: var(--muted); }
+
+.status { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
+.pill {
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+.pill.good { border-color: var(--good); color: var(--good); }
+.pill.bad { border-color: var(--bad); color: var(--bad); }
+.pill.warn { border-color: var(--warn); color: var(--warn); }
+
+.banner {
+  background: rgba(245, 166, 35, 0.12);
+  border-bottom: 1px solid var(--warn);
+  color: var(--warn);
+  padding: 0.6rem 1rem;
+}
+.banner a { color: var(--warn); }
+
+.tabs { display: flex; gap: 0.25rem; padding: 0.5rem 1rem 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+
+.tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 0.5rem 0.9rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.tab:hover { color: var(--fg); }
+.tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+
+main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
+
+.panel { display: none; }
+.panel.active { display: block; }
+
+.grid { display: grid; grid-template-columns: repeat(var(--cols, 1), minmax(0, 1fr)); gap: 0.75rem; }
+.grid > .card { margin-bottom: 0; }
+
+/* The column count is always a divisor of the card count, so the last row is never a ragged
+   orphan: six inputs lay out 1/2/3 wide, eight outputs 1/2/4 (both counts are fixed in app.js).
+   auto-fill did the arithmetic on its own and picked five, which left one input stranded on a
+   second row. A count fits when cols*260 + (cols-1)*12 <= min(viewport, 1400) - 32, and that is
+   where these three breakpoints come from; 260 px is the width at which a channel name and both
+   Listen buttons still share one line. Six across would need 1620 px of content and main stops
+   at 1368, so it is not reachable without widening main. */
+#inputs, #outputs           { --cols: 1; }
+@media (min-width: 564px)  { #inputs, #outputs { --cols: 2; } }
+@media (min-width: 836px)  { #inputs           { --cols: 3; } }
+@media (min-width: 1108px) { #outputs          { --cols: 4; } }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.85rem;
+  margin-bottom: 0.75rem;
+}
+.card.wide { max-width: 900px; }
+
+/* nowrap, not wrap: a long channel name used to push the Listen buttons onto a second line,
+   and a grid row stretches every card to its tallest — so one long name grew all six. */
+.chan-head { display: flex; justify-content: space-between; align-items: center; gap: 0.4rem; flex-wrap: nowrap; margin-bottom: 0.5rem; }
+.chan-name { font-weight: 600; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* A flex item shrinks by default: without this the name squashes Identify instead of ellipsising. */
+.chan-head > button { flex: 0 0 auto; }
+
+/* The card can be as narrow as 260 px: trim the padding so "IN 3 — living room" plus both
+   buttons still fit on one line. */
+.listen-grp { display: flex; gap: 0.3rem; flex: 0 0 auto; }
+.lbtn { padding: 0.35rem 0.5rem; font-size: 0.85rem; }
+
+/* The browser's own playback level for the Listen streams. Nothing here reaches the device. */
+.monitor {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.85rem;
+  margin-bottom: 0.75rem;
+}
+.monitor .mlabel { font-weight: 600; flex: 0 0 auto; }
+.monitor .mnote { flex: 1 1 20rem; min-width: 0; }
+.monitor input[type="range"] { width: 220px; }
+
+.meter { height: 10px; background: #0e1014; border-radius: 3px; overflow: hidden; position: relative; margin: 0.35rem 0; }
+.meter .rms { height: 100%; background: var(--good); width: 0%; transition: width 80ms linear; }
+.meter .peak { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--fg); left: 0; }
+
+/* Four slots on two rows, always — the card's height must not depend on what the numbers say.
+   As one flex line, "-inf dBFS  pk -120.0" and "48000.0 Hz  THD+N 100.000%" together overflowed a
+   card and wrapped, and since a grid row stretches to its tallest card, one channel finding a
+   loud harmonic grew the whole row. The values are padded in JS, so white-space is pre, not
+   nowrap: HTML collapses runs of spaces and nothing would line up. */
+.readout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-auto-rows: 1.4em;
+  gap: 0 0.5rem;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+}
+.readout span { white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.readout .rt { text-align: right; }
+
+/* Every slider's value sits in a slot wide enough for its widest reading, so dragging one does
+   not shuffle the text after it. */
+.val { display: inline-block; min-width: 5ch; text-align: right; font-variant-numeric: tabular-nums; }
+
+canvas.mini { width: 100%; height: 54px; display: block; margin-top: 0.5rem; background: #0e1014; border-radius: 3px; }
+
+/* The height must be in CSS as well as on the element. A canvas takes its intrinsic ratio from
+   its width/height attributes, and with only height="520" and width:100% the element claims a
+   ~2370 px tall box until drawScope() first writes cv.width — the page reflows under you. */
+#scopecanvas { width: 100%; height: 520px; display: block; background: #0e1014; border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; }
+
+label { display: block; margin: 0.5rem 0; color: var(--muted); }
+label input, label select { margin-left: 0.35rem; }
+
+input[type="number"], select {
+  background: #0e1014;
+  border: 1px solid var(--line);
+  color: var(--fg);
+  border-radius: 4px;
+  padding: 0.3rem 0.4rem;
+  font: inherit;
+}
+input[type="range"] { vertical-align: middle; width: 140px; }
+
+button {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  border-radius: 5px;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+  font: inherit;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+button.danger:hover { border-color: var(--bad); color: var(--bad); }
+button.on { background: var(--good); border-color: var(--good); color: #05170f; font-weight: 600; }
+
+/* The toolbar's shape is a function of the window width and of nothing else. It used to be
+   fifteen siblings on one wrapping flex line, so the wrap point fell wherever the widest
+   reading of the moment put it: setting a cursor swung #curB from one character to forty,
+   which shoved Measure 640 px sideways and wrapped Follow onto a second line — and the canvas,
+   below it, moved out from under the pointer that had just clicked. Named areas fix the
+   arrangement at each width, a group is atomic and cannot split across lines, and every field
+   the data rewrites is given a slot it cannot outgrow. */
+.toolbar {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: 5fr 3fr 4fr;
+  grid-template-areas:
+    "cap del view"
+    "cur cur cur";
+  margin-bottom: 0.5rem;
+}
+.tgrp {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  min-width: 0;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.tgrp-cap { grid-area: cap; }
+.tgrp-del { grid-area: del; }
+.tgrp-view { grid-area: view; }
+/* The cursor row is a readout, not a control: give it the canvas's own well. */
+.tgrp-cur { grid-area: cur; background: #0e1014; }
+
+.tglabel {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.toolbar label { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0; white-space: nowrap; }
+.arrow { color: var(--muted); }
+
+/* "Freeze" and "Resume" are not the same width in a proportional font, and it leads its group. */
+#freeze { min-width: 6.5rem; }
+
+/* A three-word vocabulary — live, paused, frozen — so the state itself can never resize the
+   group. Everything explanatory goes in #capdetail, which is the one elastic item in the whole
+   toolbar: it clips, so it can never push anything. */
+#capstate { flex: 0 0 auto; min-width: 4.5rem; font-weight: 600; }
+#capstate.live { color: var(--good); }
+#capstate.paused { color: var(--warn); }
+#capstate.frozen { color: var(--accent); }
+/* flex-basis 0, not auto: a wrapping flex line breaks on the items' pre-flex sizes, so with an
+   auto basis this one's full sentence would claim its own line and make the whole toolbar — and
+   the canvas under it — 28 px taller the moment the capture paused. At zero it simply takes the
+   space that is left and clips. */
+#capdetail {
+  flex: 1 1 0;
+  min-width: 0;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cur { display: inline-flex; align-items: center; gap: 0.35rem; }
+.ckey { color: var(--muted); font-size: 0.75rem; }
+/* The same two colours drawScope paints the cursors with. */
+.ckey.ka { color: var(--accent); }
+.ckey.kb { color: var(--bad); }
+/* The slot is reserved, so a number growing from four digits to eleven moves nothing after it;
+   the text sits at the left of its slot to stay next to the key it belongs to. */
+.cval, .cvald {
+  display: inline-block;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Wide enough for an 11-digit sample index — a week of capture at 96 kHz. The delta is signed
+   and, if you set A then pan for a minute before setting B, effectively unbounded: it clips. */
+.cval { min-width: 11ch; }
+.cvald { min-width: 24ch; }
+
+/* Fills the rest of the readout row rather than leaving it empty. Elastic and clipping, so it
+   is incapable of pushing a cursor slot. */
+.curhint {
+  flex: 1 1 0;
+  min-width: 0;
+  text-align: right;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 1240px) {
+  .toolbar {
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "cap cap"
+      "del view"
+      "cur cur";
+  }
+}
+@media (max-width: 760px) {
+  .toolbar {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "cap" "del" "view" "cur";
+  }
+}
+
+/* Always in flow, below the canvas. Unhiding it above the canvas used to shove the trace down
+   by 40-90 px at the exact moment you were reading cursors off it, and the height depended on
+   whether the low-confidence note appeared. */
+.result {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  margin: 0.5rem 0 0;
+  min-height: 3.4rem;
+  color: var(--muted);
+}
+.result.on {
+  background: rgba(77, 163, 255, 0.1);
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+.lanes { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem; }
+.lanes label { display: flex; align-items: center; gap: 0.3rem; margin: 0; }
+
+.maps { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+.maps label { display: flex; align-items: center; gap: 0.5rem; }
+
+table { border-collapse: collapse; width: 100%; }
+td { padding: 0.3rem 0.6rem 0.3rem 0; border-bottom: 1px solid var(--line); }
+td:first-child { color: var(--muted); width: 40%; }
+
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+/* A boosted input is not showing what the device under test actually sent, so colour the readout. */
+.mono.active { color: var(--accent); }
+
+/* Non-modal replacement for alert(): visible, ignorable, gone in four seconds. */
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: 1rem;
+  transform: translateX(-50%);
+  background: var(--panel);
+  border: 1px solid var(--bad);
+  color: var(--fg);
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s;
+  z-index: 10;
+  max-width: 80vw;
+}
+#toast.show { opacity: 1; }
+
+/* Reserves its line so the toolbar does not shift when a hint appears. It carries daemon error
+   strings of no fixed length, so it clips to that one line; app.js puts the full text in title. */
+#scopemsg {
+  min-height: 1.3rem;
+  margin: 0.3rem 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.muted { color: var(--muted); }
+.small { font-size: 0.8rem; }
+.hidden { display: none; }
+
+@media (max-width: 700px) {
+  .maps { grid-template-columns: 1fr; }
+}
+
+/* Per-core CPU and memory bars in the System panel. */
+.corerow {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.25rem 0;
+}
+.corelabel {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  min-width: 2.6rem;
+}
+.corebar {
+  flex: 1;
+  height: 0.6rem;
+  background: var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+/* Not animated. Each value is a one-second average of /proc/stat, and on a 4-core Pi the per-core
+   figure swings between a few percent and full tilt as threads migrate — a transition would spend
+   half of every update interval sliding toward a number that is already stale. */
+.corefill {
+  height: 100%;
+  background: var(--good);
+}
+.corefill.hot { background: var(--warn); }
+.coreval {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  min-width: 6.5rem;
+  text-align: right;
+}

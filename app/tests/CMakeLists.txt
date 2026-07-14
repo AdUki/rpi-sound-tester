@@ -1,0 +1,11 @@
+function(add_st_test name)
+  add_executable(${name} ${name}.cpp)
+  target_link_libraries(${name} PRIVATE soundtester_core)
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+add_st_test(test_generators)
+add_st_test(test_ring_buffer)
+add_st_test(test_capture)
+add_st_test(test_wav)
+add_st_test(test_config)

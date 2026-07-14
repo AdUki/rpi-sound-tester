@@ -1,0 +1,35 @@
+{
+  "rate": 96000,
+  "period": 1024,
+  "periods": 4,
+  "device": "hw:audioinjectoroc,0",
+  "capture_channels": 8,
+  "inputs": [
+    { "gain_db": 0.0 },
+    { "gain_db": 0.0 },
+    { "gain_db": 0.0 },
+    { "gain_db": 0.0 },
+    { "gain_db": 0.0 },
+    { "gain_db": 0.0 }
+  ],
+  "outputs": [
+    { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
+    { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
+    { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
+    { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
+    { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
+    { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
+    { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
+    { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false }
+  ],
+  "generators": {
+    "sine": { "freq_hz": 440.0, "level_db": -20.0 },
+    "noise": { "mode": "white", "level_db": -20.0 },
+    "ping": { "variant": "tick", "interval_s": 2.0, "level_db": -20.0 }
+  },
+  "input_map": [0, 1, 2, 3, 4, 5],
+  "output_map": [0, 1, 2, 3, 4, 5, 6, 7],
+  "input_names": ["", "", "", "", "", ""],
+  "output_names": ["", "", "", "", "", "", "", ""],
+  "loopback_offset_samples": 0
+}

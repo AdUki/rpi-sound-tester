@@ -1,0 +1,45 @@
+# =============================================================================
+#  Sound Tester — device settings
+#
+#  Template. `make configure` copies this to soundtester-device.conf and edits
+#  that copy, which is NOT tracked by git: it holds a root password and a Wi-Fi
+#  PSK in the clear, and git history keeps whatever it is once given.
+#
+#  This is the only file you need to edit to build an image for a given bench.
+#  Everything here is baked into the image at build time: the root filesystem is
+#  read-only, so none of it can be changed on the running device.
+#
+#  After editing, rebuild:  bitbake soundtester-image
+# =============================================================================
+
+# --- Identity ----------------------------------------------------------------
+# The device answers on http://${SOUNDTESTER_HOSTNAME}.local (mDNS/avahi).
+SOUNDTESTER_HOSTNAME ?= "soundtester"
+
+# --- Login -------------------------------------------------------------------
+# Root password, in the clear (bitbake hashes it into /etc/shadow at build time).
+# SSH is enabled by default so the device can be reached without a screen.
+#
+# WARNING: this appliance runs a pinned end-of-life 5.15 kernel (the Audio Injector
+# Octo does not work on any 6.x kernel — see docs/octo-known-issues.md). Keep it on a
+# trusted lab network and change this password from the default.
+SOUNDTESTER_ROOT_PASSWORD ?= "soundtester"
+SOUNDTESTER_ENABLE_SSH ?= "1"
+
+# --- Network -----------------------------------------------------------------
+# Wired Ethernet is always configured for DHCP.
+#
+# Wi-Fi is optional: set an SSID to enable it. Leave SOUNDTESTER_WIFI_SSID empty to
+# build an Ethernet-only image (no wpa_supplicant, no Wi-Fi firmware).
+SOUNDTESTER_WIFI_SSID ?= ""
+SOUNDTESTER_WIFI_PSK ?= ""
+SOUNDTESTER_WIFI_COUNTRY ?= "SK"
+
+# --- Web console -------------------------------------------------------------
+SOUNDTESTER_HTTP_PORT ?= "80"
+
+# --- Audio -------------------------------------------------------------------
+# 96 kHz is the Octo's maximum (the machine driver's rate list stops there; 192 kHz is
+# not reachable on this card). Raise the period to 2048 if the Pi reports xruns.
+SOUNDTESTER_RATE ?= "96000"
+SOUNDTESTER_PERIOD ?= "1024"

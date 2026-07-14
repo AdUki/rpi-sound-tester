@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
+From: Sound Tester <soundtester@invalid>
+Date: Tue, 14 Jul 2026 00:00:00 +0000
+Subject: [PATCH] ASoC: bcm2835-i2s: only report a SYNC error when we own the
+ clock
+
+bcm2835_i2s_clear_fifos() clears the FIFOs and then confirms the clear by
+toggling the CS_A SYNC bit and polling for it to change: the bit is meant
+to flip after 2 PCM clock cycles.
+
+That readback does not work when the BCM2835 is the clock slave -- the bit
+is clocked by the external BCLK and never reflects the write -- which is
+what the "FIXME: This does not seem to work for slave mode!" comment above
+it has been saying all along. The poll therefore always runs to its
+timeout and the driver prints "I2S SYNC error!".
+
+The FIFO clear itself is unaffected. It needs 2 PCM clock cycles (0.33us
+at 96kHz with a 64-bit frame) and the timeout loop spins on MMIO reads for
+far longer than that, so the loop doubles as the required delay. Only the
+verification is impossible in slave mode, so only report a failure when we
+are the clock master and the result actually carries information.
+
+On any card that makes the Pi a clock slave -- the Audio Injector Octo,
+whose on-board FPGA drives BCLK and LRCLK, is the case at hand -- this
+message otherwise appears on every stream setup: two lines on every boot,
+with perfectly working 96kHz audio and zero xruns behind them. The cost is
+not the noise. "I2S SYNC error!" is also the symptom of this card's real
+and unfixed TDM slot-rotation bug, so crying wolf at every boot trains
+whoever reads the log to ignore the one message that matters.
+
+Signed-off-by: Sound Tester <soundtester@invalid>
+---
+ sound/soc/bcm/bcm2835-i2s.c | 46 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 40 insertions(+), 6 deletions(-)
+
+--- a/sound/soc/bcm/bcm2835-i2s.c
++++ b/sound/soc/bcm/bcm2835-i2s.c
+@@ -125,6 +125,19 @@
+ 	int					clk_rate;
+ };
+ 
++/*
++ * True when the BCM2835 generates the bit clock. When an external device is the
++ * clock master (SND_SOC_DAIFMT_CBM_*), the PCM block is driven by that clock and
++ * a number of its status bits cannot be trusted -- see bcm2835_i2s_clear_fifos().
++ */
++static bool bcm2835_i2s_is_clock_master(struct bcm2835_i2s_dev *dev)
++{
++	unsigned int master = dev->fmt & SND_SOC_DAIFMT_MASTER_MASK;
++
++	return master == SND_SOC_DAIFMT_CBS_CFS ||
++	       master == SND_SOC_DAIFMT_CBS_CFM;
++}
++
+ static void bcm2835_i2s_start_clock(struct bcm2835_i2s_dev *dev)
+ {
+ 	unsigned int master = dev->fmt & SND_SOC_DAIFMT_MASTER_MASK;
+@@ -188,8 +201,24 @@
+ 	/* Wait for 2 PCM clock cycles */
+ 
+ 	/*
+-	 * Toggle the SYNC flag. After 2 PCM clock cycles it can be read back
+-	 * FIXME: This does not seem to work for slave mode!
++	 * Toggle the SYNC flag. After 2 PCM clock cycles it can be read back.
++	 *
++	 * This readback does not work when we are the clock slave: the flag is
++	 * clocked by the external BCLK and never reflects the write, so the
++	 * poll below always runs to its timeout. That is what the long-standing
++	 * "FIXME: This does not seem to work for slave mode!" here referred to.
++	 *
++	 * The FIFO clear itself is fine either way -- it needs 2 PCM clocks
++	 * (0.33us at 96kHz x 64), and the timeout loop spends far longer than
++	 * that spinning on MMIO reads, so it doubles as the required delay.
++	 * Only the *verification* is impossible, so only report a failure when
++	 * we are the clock master and the answer therefore means something.
++	 *
++	 * Cards that make the Pi a clock slave (e.g. the Audio Injector Octo,
++	 * whose FPGA drives BCLK/LRCLK) otherwise print "I2S SYNC error!" on
++	 * every single stream setup. That trains the operator to ignore this
++	 * message -- which is exactly the message that reports the card's real
++	 * TDM slot-rotation fault when it happens at runtime.
+ 	 */
+ 	regmap_read(dev->i2s_regmap, BCM2835_I2S_CS_A_REG, &syncval);
+ 	syncval &= BCM2835_I2S_SYNC;
+@@ -204,8 +233,13 @@
+ 			break;
+ 	}
+ 
+-	if (!timeout)
+-		dev_err(dev->dev, "I2S SYNC error!\n");
++	if (!timeout) {
++		if (bcm2835_i2s_is_clock_master(dev))
++			dev_err(dev->dev, "I2S SYNC error!\n");
++		else
++			dev_dbg(dev->dev,
++				"I2S SYNC flag not readable in slave mode (expected)\n");
++	}
+ 
+ 	/* Stop clock if it was not running before */
+ 	if (!clk_was_prepared)
+
+--
+2.34.1

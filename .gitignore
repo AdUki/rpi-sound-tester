@@ -1,0 +1,19 @@
+app/build/
+app/build-vec/
+
+# Yocto: cloned layers and build output. Reproduced by `make image`.
+yocto/layers/
+yocto/build/
+yocto/downloads/
+yocto/sstate-cache/
+
+# Where this particular machine keeps its caches. Written by `make configure`.
+yocto/conf/site.conf
+
+# Root password and Wi-Fi PSK in the clear. Written by `make configure` from the
+# tracked .sample; git history would keep them forever.
+yocto/meta-soundtester/conf/soundtester-device.conf
+
+*.wic
+*.wic.bz2
+*.bmap

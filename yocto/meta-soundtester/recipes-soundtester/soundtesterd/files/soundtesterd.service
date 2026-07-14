@@ -1,0 +1,25 @@
+[Unit]
+Description=Sound Tester audio engine and web console
+After=sysinit.target sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/soundtesterd --port @PORT@
+Restart=always
+RestartSec=2
+
+# The audio thread raises itself to SCHED_FIFO 80 and locks the ring buffer into RAM.
+# Running as root, CAP_SYS_NICE and CAP_IPC_LOCK make that work without these limits;
+# they matter only if the service is ever de-privileged.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+
+# Deliberately NOT CPUSchedulingPolicy=fifo: that would put the web threads on the
+# real-time scheduler too, where a blocked HTTP handler could starve the box.
+
+# Frequency scaling causes audible glitches and xruns at 96 kHz.
+ExecStartPre=-/bin/sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $g 2>/dev/null || true; done'
+
+[Install]
+WantedBy=multi-user.target

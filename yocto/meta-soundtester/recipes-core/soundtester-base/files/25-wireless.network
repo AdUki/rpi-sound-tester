@@ -1,0 +1,15 @@
+[Match]
+Name=wlan*
+
+[Network]
+DHCP=yes
+MulticastDNS=yes
+
+[DHCP]
+UseHostname=false
+
+[DHCPv4]
+# Identify by MAC, not by a machine-id-derived DUID, so the lease survives reboots and
+# reflashes. See 20-wired.network for the full explanation — on a read-only rootfs the
+# machine-id is regenerated on every boot, which silently changes the board's IP.
+ClientIdentifier=mac
