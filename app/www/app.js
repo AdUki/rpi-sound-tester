@@ -509,7 +509,7 @@ function applyInputEnabled(ch) {
     const rms = $('rms' + ch), pk = $('pk' + ch);
     if (rms) rms.style.width = '0%';
     if (pk) pk.style.left = '0%';
-    delete specBins[ch];
+    delete barState[ch];
     clearSpectrumCanvas(ch);
   }
   scopeDirty = true;
@@ -641,35 +641,96 @@ function buildOutputs() {
   });
 }
 
-// Kept per channel so the traces can be repainted without waiting for the next message — after a
-// tab switch or a resize, which is when the canvas has just been given a new backing store.
-const specBins = {};
+// A live bar spectrum-analyser per input. The daemon pushes 240 log-spaced dB bins at 5 Hz; we fold
+// them into SPEC_BARS bars and animate at 60 fps (spectraTick) so the display glides instead of
+// stepping five times a second. State is kept per channel so a tab switch or a resize can repaint
+// from the current bar heights — that is when the canvas has just been handed a new backing store —
+// without waiting for the next message.
+const barState = {};        // ch -> {targ, cur, peak: Float32Array(SPEC_BARS)}
+const SPEC_BARS = 40;       // 240 bins / 40 = 6 bins per bar (divides evenly)
+const BAR_RISE = 0.35;      // fast attack when the level climbs
+const BAR_FALL = 0.12;      // gentler release when it drops
+const PEAK_FALL = 0.006;    // the peak-hold cap sinks this fraction of full scale per frame
 
-function drawSpectrum(ch, bins) {
-  if (bins) specBins[ch] = bins;
-  const b = specBins[ch];
+// Each whole bar is one flat colour chosen by its height: green when low, amber as it climbs, red
+// near full scale — a level cue at a glance, no per-bar gradient. Thresholds are in normalised
+// height (0..1 over -100..0 dBFS): 0.66 ~= -34 dBFS, 0.85 ~= -15 dBFS.
+const barColor = v => v >= 0.85 ? '#ef5b5b' : v >= 0.66 ? '#f5a623' : '#3ecf8e';
+
+// Fold one 240-bin spectrum message into SPEC_BARS bar targets. Max within each group, so a lone
+// tone still lights its whole bar; same dB->height mapping the old trace used (-100..0 dBFS -> 0..1).
+function ingestSpectrum(ch, bins) {
+  if (!bins || bins.length < 2) return;
+  let st = barState[ch];
+  if (!st) st = barState[ch] = {
+    targ: new Float32Array(SPEC_BARS), cur: new Float32Array(SPEC_BARS),
+    peak: new Float32Array(SPEC_BARS),
+  };
+  const per = bins.length / SPEC_BARS;
+  for (let i = 0; i < SPEC_BARS; i++) {
+    const k0 = Math.floor(i * per), k1 = Math.min(bins.length, Math.floor((i + 1) * per));
+    let m = -Infinity;
+    for (let k = k0; k < k1; k++) if (bins[k] > m) m = bins[k];
+    st.targ[i] = Math.max(0, Math.min(1, (m + 100) / 100));
+  }
+}
+
+// One frame of easing: heights chase their targets (fast up, slow down), peak caps settle downward.
+function advanceSpectrumBars(st) {
+  for (let i = 0; i < SPEC_BARS; i++) {
+    const t = st.targ[i], c = st.cur[i];
+    st.cur[i] = c + (t - c) * (t > c ? BAR_RISE : BAR_FALL);
+    st.peak[i] = st.cur[i] > st.peak[i] ? st.cur[i] : Math.max(st.cur[i], st.peak[i] - PEAK_FALL);
+  }
+}
+
+function drawSpectrumBars(ch) {
+  const st = barState[ch];
   const cv = $('spec' + ch);
-  if (!cv || !b || b.length < 2) return;   // one bin would divide by zero below
+  if (!cv || !st) return;
   const w = cv.clientWidth, h = cv.clientHeight;
-  // Zero while the Dashboard is hidden. Sizing the canvas to it would throw the trace away and
-  // nothing would repaint it, because the next message would find the width unchanged.
+  // Zero while the Dashboard is hidden. Sizing the canvas to it would blank the display and nothing
+  // would repaint it, because the next message would find the width unchanged.
   if (!w || !h) return;
   if (cv.width !== w) cv.width = w;
   if (cv.height !== h) cv.height = h;
   const g = cv.getContext('2d');
   g.clearRect(0, 0, w, h);
-  g.strokeStyle = '#4da3ff';
-  g.beginPath();
-  for (let i = 0; i < b.length; i++) {
-    const x = i / (b.length - 1) * w;
-    const y = h - Math.max(0, Math.min(1, (b[i] + 100) / 100)) * h;
-    i ? g.lineTo(x, y) : g.moveTo(x, y);
+
+  const bw = w / SPEC_BARS, bwFill = Math.max(1, bw - 1);
+  for (let i = 0; i < SPEC_BARS; i++) {
+    const v = st.cur[i], bh = v * h;
+    if (bh > 0.5) { g.fillStyle = barColor(v); g.fillRect(i * bw + 0.5, h - bh, bwFill, bh); }
   }
-  g.stroke();
+  // Peak-hold caps: a thin bright tick riding above each bar.
+  g.fillStyle = 'rgba(230,233,239,0.75)';
+  for (let i = 0; i < SPEC_BARS; i++) {
+    if (st.peak[i] > 0.01) g.fillRect(i * bw + 0.5, h - st.peak[i] * h - 1, bwFill, 2);
+  }
 }
 
+// Force an immediate repaint of every live bar display from its current heights — used after a tab
+// switch or resize, so the view is not blank for the frame before spectraTick next runs.
 function redrawSpectra() {
-  for (const ch of Object.keys(specBins)) drawSpectrum(Number(ch), null);
+  for (const key of Object.keys(barState)) {
+    const ch = Number(key);
+    if (inputEnabled[ch]) drawSpectrumBars(ch);
+  }
+}
+
+// Dashboard render loop, twin of scopeTick: while the Dashboard is showing, ease every input's bars
+// toward the latest spectrum targets and repaint. Gated on the tab so it idles elsewhere; targets
+// keep updating in the background via ingestSpectrum, so a return to the tab catches up smoothly.
+function spectraTick() {
+  if (document.getElementById('dash').classList.contains('active')) {
+    for (const key of Object.keys(barState)) {
+      const ch = Number(key);
+      if (!inputEnabled[ch]) continue;
+      advanceSpectrumBars(barState[ch]);
+      drawSpectrumBars(ch);
+    }
+  }
+  requestAnimationFrame(spectraTick);
 }
 
 // ---------------------------------------------------------------- generators
@@ -703,8 +764,7 @@ function bindGenerators() {
     $('pingLevelV').textContent = parseFloat(e.target.value).toFixed(1);
     put('/generators/ping', {level_db: parseFloat(e.target.value)});
   };
-
-  setInterval(refreshPings, 1000);
+  // The 1 s ping poll is started (and stopped) with the live feed, not here.
 }
 
 let pings = [];
@@ -1810,7 +1870,7 @@ function onSpectrum(msg) {
     $('thd' + c.ch).textContent =
       c.tone.valid ? `THD+N ${fmtThd(c.tone.thd_n_pct)}%` : `THD+N ${pad('—', 6)}%`;
   }
-  for (const c of msg.channels) if (inputEnabled[c.ch]) drawSpectrum(c.ch, c.bins);
+  for (const c of msg.channels) if (inputEnabled[c.ch]) ingestSpectrum(c.ch, c.bins);
 }
 
 function onSystem(s) {
@@ -1824,8 +1884,21 @@ function onSystem(s) {
   renderPower(s.throttle);
 }
 
+// The single push feed carries every live visual: the waveform envelope, the spectrum, the meters
+// and the system telemetry. The socket handle is hoisted so the header's Pause-feed toggle can
+// close it to save bandwidth on a slow link; feedStopped gates the auto-reconnect so a deliberate
+// close stays closed. The two REST polls are stopped alongside it. Listen audio rides its own
+// per-channel sockets and is intentionally left running.
+let feedWs = null;
+let feedStopped = false;
+let statePoll = null;   // 5 s /api/state poll handle
+let pingPoll = null;    // 1 s /api/pings/recent poll handle
+
 function connect() {
+  if (feedStopped) return;   // a queued reconnect must not reopen a feed the user paused
+  if (feedWs) return;        // never run two sockets at once (e.g. a rapid re-toggle)
   const ws = new WebSocket(`ws://${location.host}/api/ws`);
+  feedWs = ws;
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
@@ -1834,6 +1907,12 @@ function connect() {
     sendStreamMask();   // re-apply the input mask after every (re)connect, incl. a daemon restart
   };
   ws.onclose = () => {
+    feedWs = null;
+    if (feedStopped) {   // deliberately closed by the Pause-feed toggle — stay closed
+      $('conn').textContent = 'paused';
+      $('conn').className = 'pill warn';
+      return;
+    }
     $('conn').textContent = 'reconnecting';
     $('conn').className = 'pill bad';
     setTimeout(connect, 1000);
@@ -1845,6 +1924,68 @@ function connect() {
     else if (msg.type === 'spectrum') onSpectrum(msg);
     else if (msg.type === 'system') onSystem(msg);
   };
+}
+
+// The 5 s /state poll: a browser or curl elsewhere may have frozen or resumed the shared capture,
+// and it keeps the System table current. Extracted into a named function so it can be stopped and
+// restarted with the push feed.
+function pollState() {
+  api('/state').then(s2 => {
+    const wasFrozen = srvFrozen();
+    state.capture = s2.capture;
+    // Another browser (or curl) may have frozen or resumed the shared capture.
+    if (srvFrozen() !== wasFrozen) {
+      $('freeze').textContent = srvFrozen() ? 'Live' : 'Analyze';
+      if (srvFrozen()) setCapState('frozen', frozenDetail(state.capture));
+      else setCapState('live', '');
+      if (srvFrozen()) { fetchWindows(); invalidateSpectros(); }
+      else { winCache = {}; specCache = {}; paused = false; }
+      scopeDirty = true;
+    }
+    buildSystem();
+  }).catch(() => {});
+}
+function startStatePoll() { if (!statePoll) statePoll = setInterval(pollState, 5000); }
+function stopStatePoll() { clearInterval(statePoll); statePoll = null; }
+function startPingPoll() { if (!pingPoll) pingPoll = setInterval(refreshPings, 1000); }
+function stopPingPoll() { clearInterval(pingPoll); pingPoll = null; }
+
+// The header Pause-feed toggle. Stopping closes the push feed and both polls to save bandwidth;
+// Listen audio (its own sockets) keeps playing. The choice persists across reloads.
+function setFeedStopped(stop) {
+  feedStopped = stop;
+  try { localStorage.setItem('feed_stopped', stop ? '1' : '0'); } catch (e) { /* storage blocked */ }
+  updateFeedButton();
+  if (stop) {
+    $('conn').textContent = 'paused';
+    $('conn').className = 'pill warn';
+    if (feedWs) { try { feedWs.close(); } catch (e) { /* already gone */ } }
+    stopStatePoll();
+    stopPingPoll();
+  } else {
+    $('conn').textContent = 'connecting';
+    $('conn').className = 'pill';
+    connect();          // its onopen flips the pill to connected
+    startStatePoll();
+    startPingPoll();
+  }
+}
+
+function updateFeedButton() {
+  const b = $('feedtoggle');
+  if (!b) return;
+  b.textContent = feedStopped ? 'Resume feed' : 'Pause feed';
+  b.classList.toggle('paused', feedStopped);
+  b.title = feedStopped
+    ? 'Live data feed paused to save bandwidth — click to resume. Listen audio is unaffected.'
+    : 'Stop the live data feed (waveform, spectrum, meters, telemetry) to save bandwidth. Listen audio keeps playing.';
+}
+
+function initFeedToggle() {
+  try { feedStopped = localStorage.getItem('feed_stopped') === '1'; } catch (e) { feedStopped = false; }
+  const b = $('feedtoggle');
+  if (b) b.onclick = () => setFeedStopped(!feedStopped);
+  updateFeedButton();
 }
 
 // The analyze/PCM buffer-length control. Shown only when the daemon advertises
@@ -1905,6 +2046,7 @@ api('/state').then(s => {
   buildSystem();
   initScope();
   initBufLen();
+  initFeedToggle();
   // The capture is shared and outlives a reload: pressing Freeze then reloading finds it already
   // frozen. Reflect that, AND load the snapshot — position the view over the frozen range and
   // fetch its windows. Without this the lanes sit on "loading…" forever, because on a fresh load
@@ -1920,24 +2062,18 @@ api('/state').then(s => {
     updatePlayPause();
   }
   clearResult();
-  connect();          // its onopen re-sends the input mask (no-op unless the daemon supports it)
-  refreshPings();
+  // Respect a persisted "feed paused" preference: open no socket and start no polls until resumed.
+  if (feedStopped) {
+    $('conn').textContent = 'paused';
+    $('conn').className = 'pill warn';
+  } else {
+    connect();          // its onopen re-sends the input mask (no-op unless the daemon supports it)
+    startStatePoll();
+    startPingPoll();
+    refreshPings();
+  }
   requestAnimationFrame(scopeTick);
-
-  setInterval(() => api('/state').then(s2 => {
-    const wasFrozen = srvFrozen();
-    state.capture = s2.capture;
-    // Another browser (or curl) may have frozen or resumed the shared capture.
-    if (srvFrozen() !== wasFrozen) {
-      $('freeze').textContent = srvFrozen() ? 'Live' : 'Analyze';
-      if (srvFrozen()) setCapState('frozen', frozenDetail(state.capture));
-      else setCapState('live', '');
-      if (srvFrozen()) { fetchWindows(); invalidateSpectros(); }
-      else { winCache = {}; specCache = {}; paused = false; }
-      scopeDirty = true;
-    }
-    buildSystem();
-  }).catch(() => {}), 5000);
+  requestAnimationFrame(spectraTick);
 }).catch(e => {
   document.body.insertAdjacentHTML('afterbegin',
     `<div class="banner">Cannot reach the daemon: ${e.message}</div>`);

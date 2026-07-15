@@ -52,6 +52,11 @@ h4 { margin: 1rem 0 0.5rem; font-size: 0.85rem; color: var(--muted); }
 .pill.bad { border-color: var(--bad); color: var(--bad); }
 .pill.warn { border-color: var(--warn); color: var(--warn); }
 
+/* The Pause-feed toggle sits among the status pills, so it wears the pill shape. It reuses the
+   generic button rules for its base look; .paused colours it amber to match the paused #conn pill. */
+.feedtoggle { font-size: 0.78rem; padding: 0.2rem 0.6rem; border-radius: 999px; line-height: 1.2; }
+.feedtoggle.paused { border-color: var(--warn); color: var(--warn); }
+
 .banner {
   background: rgba(245, 166, 35, 0.12);
   border-bottom: 1px solid var(--warn);
