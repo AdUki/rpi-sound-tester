@@ -89,6 +89,12 @@ const MON_MIN_DB = -20, MON_MAX_DB = 40;
 const dbToLin = db => Math.pow(10, db / 20);
 let monitorDb = 0;
 
+// How far ahead of real time the browser schedules monitor audio: the playback buffer. A bigger
+// buffer rides out a jittery link (fewer of the late re-anchors connWatch flags) but adds that
+// much delay between the device and what you hear. Configurable from the dashboard.
+const MON_LAT_MIN_MS = 50, MON_LAT_MAX_MS = 500;
+let monLatency = 0.15;   // seconds
+
 const monitor = {
   ctx: null,
   merger: null,    // input 0 = left ear, input 1 = right; Web Audio sums each input's connections
@@ -118,20 +124,26 @@ const monitor = {
     g.linearRampToValueAtTime(dbToLin(db), t + RAMP_S);
   },
 
-  // Absolute capture sample -> context play time. When the mapped time falls outside its
-  // window — a late chunk, a ring lap, or capture/DAC clock drift finally accumulating — the
-  // anchor shifts for EVERY stream at once: one brief glitch on all channels, and they come
-  // out the other side still aligned with each other. A per-stream recovery would not.
+  // Absolute capture sample -> context play time. Chunks are scheduled monLatency ahead of real
+  // time (the playback buffer). When the mapped time falls outside its window — a late chunk, a
+  // ring lap, or capture/DAC clock drift finally accumulating — the anchor shifts for EVERY stream
+  // at once: one brief glitch on all channels, and they come out the other side still aligned with
+  // each other. A per-stream recovery would not. The upper bound tracks the buffer so a larger
+  // buffer is not itself mistaken for a discontinuity.
   timeFor(sample) {
     const now = this.ctx.currentTime;
     if (this.anchorN === null) {
       this.anchorN = sample;
-      this.anchorT = now + 0.15;
+      this.anchorT = now + monLatency;
     }
     let t = this.anchorT + (sample - this.anchorN) / rate;
-    if (t < now + 0.02 || t > now + 0.6) {
-      this.anchorT += (now + 0.15) - t;
-      t = now + 0.15;
+    if (t < now + 0.02 || t > now + monLatency + 0.45) {
+      // A chunk mapped into the past (or barely ahead) arrived too late to schedule — that is the
+      // link falling behind, the one re-anchor cause we can pin on the connection. A far-future
+      // map is a capture discontinuity or a start-up burst, so it re-anchors silently.
+      if (t < now + 0.02) connWatch.drop();
+      this.anchorT += (now + monLatency) - t;
+      t = now + monLatency;
     }
     return t;
   },
@@ -139,6 +151,26 @@ const monitor = {
   idle() {
     if (listeners.size === 0) this.anchorN = null;  // next session anchors fresh
   }
+};
+
+// A dropout you HEAR has two possible causes: the device's own xruns (already in the header) or a
+// slow / lossy link between this browser and the Sound Tester. The scheduler re-anchors — one
+// glitch across every channel — whenever a monitor chunk reaches us too late to play on time, and
+// a live listen socket closing on its own is the same story. Both are the link, not the device, so
+// they get their own banner. The count clears once the link has run clean for a few seconds.
+const connWatch = {
+  count: 0,
+  timer: null,
+  drop(reason) {
+    this.count++;
+    const b = $('connbanner');
+    if (!b) return;
+    $('conntext').textContent =
+      `${this.count} dropout${this.count > 1 ? 's' : ''} in the last few seconds${reason ? ' — ' + reason : ''}.`;
+    b.classList.remove('hidden');
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => { this.count = 0; b.classList.add('hidden'); }, 6000);
+  },
 };
 
 class Listener {
@@ -158,7 +190,12 @@ class Listener {
     this.ws = new WebSocket(`ws://${location.host}/api/listen/${ch}`);
     this.ws.binaryType = 'arraybuffer';
     this.ws.onmessage = e => this.onchunk(e.data);
-    this.ws.onclose = () => this.stop();
+    // A socket still feeding an ear that closes on its own is a dropped connection, not a user
+    // stop (which clears the sides first, so this.live is already false by the time it closes).
+    this.ws.onclose = () => {
+      if (this.live) connWatch.drop('the audio stream dropped');
+      this.stop();
+    };
   }
 
   get live() { return this.sides.l || this.sides.r; }
@@ -244,7 +281,12 @@ function toggleListen(ch, side) {
 // Survives a reload: on a bench you set the monitor level once for the device under test and
 // then stop thinking about it.
 function initMonitorVolume() {
-  const saved = parseFloat(localStorage.getItem('monitor_db'));
+  // Reading localStorage throws, not just returns null, when the origin has storage blocked
+  // (browser "block site data", an enterprise policy on this plain-http LAN address). This runs
+  // first in the /state chain, so an unguarded throw here would skip building the whole UI and
+  // get swallowed as a "cannot reach the daemon" error — a healthy device misreported as dead.
+  let saved = NaN;
+  try { saved = parseFloat(localStorage.getItem('monitor_db')); } catch (err) { /* storage blocked */ }
   monitorDb = Number.isFinite(saved) ? Math.min(MON_MAX_DB, Math.max(MON_MIN_DB, saved)) : 0;
 
   const sl = $('monvol');
@@ -264,6 +306,32 @@ function setMonitorLabel(db) {
   el.classList.toggle('active', db > 0);
 }
 
+// Also survives a reload, for the same bench reason. Stored in ms because that is what the slider
+// and the readout speak; monLatency stays in seconds because that is what the scheduler speaks.
+function initMonitorLatency() {
+  let ms = NaN;
+  try { ms = parseFloat(localStorage.getItem('monitor_latency_ms')); } catch (err) { /* storage blocked */ }
+  ms = Number.isFinite(ms) ? Math.min(MON_LAT_MAX_MS, Math.max(MON_LAT_MIN_MS, ms)) : 150;
+  monLatency = ms / 1000;
+
+  const sl = $('monlat');
+  sl.value = ms;
+  setLatencyLabel(ms);
+  sl.oninput = e => {
+    const v = parseFloat(e.target.value);
+    monLatency = v / 1000;
+    setLatencyLabel(v);
+    try { localStorage.setItem('monitor_latency_ms', String(v)); } catch (err) { /* private mode */ }
+  };
+  // Apply the new buffer once, on release: dropping the anchor re-establishes the lead at the new
+  // depth on the next chunk. Doing it per input event would re-anchor once per pixel of the drag.
+  sl.onchange = () => { monitor.anchorN = null; };
+}
+
+function setLatencyLabel(ms) {
+  $('monlatv').textContent = `${Math.round(ms)} ms`;
+}
+
 // ---------------------------------------------------------------- cards
 
 const dbToPct = db => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
@@ -275,7 +343,79 @@ const fmtDb = db => pad(db > -119 ? db.toFixed(1) : '-inf', 6);
 // Three decimals on a 38 % reading is noise, and it is four characters wider than the slot.
 const fmtThd = p => pad(p >= 10 ? p.toFixed(1) : p >= 1 ? p.toFixed(2) : p.toFixed(3), 6);
 
+// Per-input on/off, kept on the client and surviving a reload. Disabling an input stops the page
+// rendering it (meters, spectrum, scope lane) and closes any listen stream on it. The shared
+// /api/ws feed is push-only and carries every channel, so this alone does NOT shrink its
+// bandwidth — sendStreamMask() does, but only once a daemon advertises channel masking. Until then
+// the disable is purely a client-side / CPU saving.
+const inputEnabled = Array(NIN).fill(true);
+
+function loadInputEnabled() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem('input_enabled')); } catch (e) { /* storage blocked */ }
+  for (let c = 0; c < NIN; c++) inputEnabled[c] = !Array.isArray(saved) || saved[c] !== false;
+}
+
+function saveInputEnabled() {
+  try { localStorage.setItem('input_enabled', JSON.stringify(inputEnabled)); } catch (e) { /* private */ }
+}
+
+function clearSpectrumCanvas(ch) {
+  const cv = $('spec' + ch);
+  if (!cv || !cv.width) return;
+  cv.getContext('2d').clearRect(0, 0, cv.width, cv.height);
+}
+
+// Reflect one input's enabled state across the card: dim the body, freeze the readouts at a muted
+// placeholder, blank the spectrum, disable the Listen buttons and drop any live listen stream.
+function applyInputEnabled(ch) {
+  const on = inputEnabled[ch];
+  const card = document.querySelector(`#inputs .card:nth-child(${ch + 1})`);
+  if (card) card.classList.toggle('disabled', !on);
+  const cb = $('en' + ch);
+  if (cb) cb.checked = on;
+  const lane = $('lane' + ch);   // the twin checkbox on the Scope tab, kept in step
+  if (lane) lane.checked = on;
+  for (const s of ['L', 'R']) { const b = $('listen' + s + ch); if (b) b.disabled = !on; }
+  if (!on) {
+    const li = listeners.get(ch);
+    if (li) li.stop();
+    const set = (id, v) => { const el = $(id + ch); if (el) el.textContent = v; };
+    set('rmsv', `${pad('off', 6)} dBFS`);
+    set('pkv', `pk ${pad('—', 6)}`);
+    set('tone', `${pad('—', 7)} Hz`);
+    set('thd', `THD+N ${pad('—', 6)}%`);
+    const rms = $('rms' + ch), pk = $('pk' + ch);
+    if (rms) rms.style.width = '0%';
+    if (pk) pk.style.left = '0%';
+    delete specBins[ch];
+    clearSpectrumCanvas(ch);
+  }
+  scopeDirty = true;
+}
+
+// One entry point for both checkbox sets (dashboard #en, scope #lane): flip the state, persist it,
+// reflect it everywhere (applyInputEnabled ticks both twins), refetch the frozen scope without the
+// dropped lane, and tell the daemon.
+function setInputEnabled(ch, on) {
+  inputEnabled[ch] = on;
+  saveInputEnabled();
+  applyInputEnabled(ch);
+  invalidateWindows();
+  sendStreamMask();
+}
+
+// Forward-compatible: a future daemon that advertises limits.stream_mask can be told which inputs
+// to stop sending, so the shared feed actually shrinks. Older daemons omit the flag and this is a
+// no-op — the already-deployed page keeps working, and starts saving bandwidth after a reflash
+// with no second web deploy.
+function sendStreamMask() {
+  if (!(state && state.limits && state.limits.stream_mask)) return;
+  post('/stream/inputs', {enabled: inputEnabled.slice()}).catch(() => { /* best effort */ });
+}
+
 function buildInputs() {
+  loadInputEnabled();
   // A daemon built before input gain existed sends no gain_db; render no slider rather than
   // a control wired to a 404.
   const hasGain = state.inputs.length && state.inputs[0].gain_db !== undefined;
@@ -284,6 +424,8 @@ function buildInputs() {
   $('inputs').innerHTML = state.inputs.map(i => `
     <div class="card">
       <div class="chan-head">
+        <label class="en" title="Enable / disable this input"><input type="checkbox"
+          id="en${i.channel}" ${inputEnabled[i.channel] ? 'checked' : ''}></label>
         <span class="chan-name">IN ${i.channel + 1}${i.name ? ' — ' + i.name : ''}</span>
         <span class="listen-grp">
           <button id="listenL${i.channel}" class="lbtn">Listen L</button>
@@ -307,6 +449,8 @@ function buildInputs() {
     const c = i.channel;
     $('listenL' + c).onclick = () => toggleListen(c, 'l');
     $('listenR' + c).onclick = () => toggleListen(c, 'r');
+    $('en' + c).onchange = e => setInputEnabled(c, e.target.checked);
+    applyInputEnabled(c);   // reflect the persisted state on this fresh card
     const nm = document.querySelector(`#inputs .card:nth-child(${c + 1}) .chan-name`);
     if (nm) nm.title = nm.textContent;   // the name now ellipsises, so keep it readable on hover
     if (!hasGain) return;
@@ -485,10 +629,13 @@ function buildMap() {
 // is narrow enough. The envelope stream alone can never show a single sample — zooming past
 // its 5 ms floor needs the snapshot.
 
-const lanes = [true, true, true, true, true, true];
+// The scope lanes are the same on/off state as the dashboard's per-input enable: disabling an
+// input hides its lane and vice versa. There is one source of truth, inputEnabled, and the two
+// checkbox sets are kept in step through applyInputEnabled().
 let view = {start: 0, len: 96000 * 2};   // absolute samples
 let cursorA = null, cursorB = null;
-let paused = false;        // user is inspecting the live view (zoom/pan): stop auto-scroll
+let paused = false;        // not following the live edge (auto: panned into history, or held)
+let held = false;          // Pause was pressed: hold the view until Play, whatever the view shows
 let envCols = [];          // {sample, min[6], max[6]}
 const ENV_KEEP = 12000;    // 60 s at 200 col/s — the server's own envelope depth
 let scopeDirty = false;
@@ -501,15 +648,22 @@ const srvFrozen = () => !!(state && state.capture && state.capture.frozen);
 // pressed": zooming out of a running wave then reads as a hang, since the view stops following
 // and the live edge runs off-screen. The slack covers the scroll easing, which trails the live
 // edge by up to a quarter of the per-frame advance.
-function updateFollow() {
+// keepPaused: a zoom passes true so that, once you are inspecting history, zooming in and back
+// out never yanks the view to the live edge — you resume by panning to the edge or pressing Play.
+// A pan passes nothing, so panning to the edge still resumes. A live view (paused === false) is
+// unaffected either way, so zooming a running wave keeps following as before.
+function updateFollow(keepPaused) {
   if (srvFrozen()) return;
-  if (envCols.length) {
+  if (held || (keepPaused && paused)) {
+    // Latched by Pause, or holding a zoom in history: stay put even if the edge is back in view.
+    paused = true;
+  } else if (envCols.length) {
     const last = envCols[envCols.length - 1].sample;
     paused = view.start + view.len < last - 20 * envColumnFrames;
   } else {
     paused = false;
   }
-  setCapState(paused ? 'paused' : 'live', paused ? 'press Follow to catch up' : '');
+  setCapState(paused ? 'paused' : 'live', paused ? 'press Play to catch up' : '');
 }
 
 // The state is one of three words, and the sentence that explains it lives in a separate slot
@@ -522,6 +676,19 @@ function setCapState(kind, detail) {
   el.className = kind;
   d.textContent = detail;
   d.title = detail;
+  updatePlayPause();
+}
+
+// The button reads the state rather than owning it: "Pause" while the view is following the live
+// edge, "Play" once it is held, and disabled while frozen, where live scroll has no meaning.
+function updatePlayPause() {
+  const b = $('playpause');
+  if (!b) return;
+  const frozen = srvFrozen();
+  const playing = !frozen && !paused;
+  b.disabled = frozen;
+  b.textContent = playing ? 'Pause' : 'Play';
+  b.classList.toggle('playing', playing);
 }
 
 const frozenDetail = cs => `at ${cs.freeze_sample} · ${(cs.valid_len / rate).toFixed(1)} s of history`;
@@ -568,7 +735,9 @@ function fetchWindows() {
   // Scope tab has been drawn once, and a freeze from another browser can land before that.
   const cols = Math.min(2048, Math.max(64, $('scopecanvas').clientWidth || 1024));
   const seq = ++winSeq;
-  const shown = lanes.map((on, i) => on ? i : -1).filter(i => i >= 0);
+  // A disabled input is not fetched at all — that is the one place a client-side disable does trim
+  // real bytes off the wire today, since these windows are pulled per channel on demand.
+  const shown = inputEnabled.map((on, i) => on ? i : -1).filter(i => i >= 0);
 
   Promise.all(shown.map(ch =>
     api(`/capture/window?ch=${ch}&start=${Math.floor(lo)}&len=${len}&cols=${cols}`)
@@ -582,14 +751,10 @@ function fetchWindows() {
 }
 
 function buildLanes() {
-  $('lanes').innerHTML = lanes.map((on, i) =>
+  $('lanes').innerHTML = inputEnabled.map((on, i) =>
     `<label><input type="checkbox" id="lane${i}" ${on ? 'checked' : ''}> IN ${i + 1}</label>`).join('');
-  lanes.forEach((_, i) => {
-    $('lane' + i).onchange = e => {
-      lanes[i] = e.target.checked;
-      scopeDirty = true;
-      invalidateWindows();
-    };
+  inputEnabled.forEach((_, i) => {
+    $('lane' + i).onchange = e => setInputEnabled(i, e.target.checked);
   });
 }
 
@@ -639,7 +804,7 @@ function drawScope() {
   g.fillStyle = '#0e1014';
   g.fillRect(0, 0, w, h);
 
-  const shown = lanes.map((on, i) => on ? i : -1).filter(i => i >= 0);
+  const shown = inputEnabled.map((on, i) => on ? i : -1).filter(i => i >= 0);
   if (!shown.length) return;
   const lh = h / shown.length;
   const x0 = view.start, x1 = view.start + view.len;
@@ -672,9 +837,11 @@ function drawScope() {
 
   shown.forEach((ch, row) => {
     const top = row * lh, mid = top + lh / 2;
+    // The zero line stays dim; the separator above each channel is brighter, so the split between
+    // channels reads clearly.
     g.strokeStyle = '#2c313b';
     g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke();
-    g.strokeStyle = '#2c313b';
+    g.strokeStyle = '#4b5563';
     g.beginPath(); g.moveTo(0, top); g.lineTo(w, top); g.stroke();
 
     g.fillStyle = '#8b93a3';
@@ -734,11 +901,7 @@ function drawScope() {
         g.fillText(has ? 'outside the frozen range' : 'loading…', w / 2 - 40, mid);
       }
     } else {
-      drew = drawEnvLane(ch, yOf, -Infinity, Infinity);
-      if (!drew) {
-        g.fillStyle = '#8b93a3';
-        g.fillText('no data in view', w / 2 - 40, mid);
-      }
+      drawEnvLane(ch, yOf, -Infinity, Infinity);
     }
   });
 
@@ -770,6 +933,7 @@ function drawScope() {
   cursor(cursorB, '#ef5b5b', 'B');
 
   updateCursorReadout();
+  updateZoomLabel();
 }
 
 // The delta has its own slot and is never concatenated into cursor B's. As part of B's string it
@@ -796,6 +960,26 @@ function updateCursorReadout() {
   el.title = el.textContent;
 }
 
+// How much time the whole canvas width is showing — the one number that says how far in or out
+// you are zoomed. Keyed on view.len so drawScope can call it every frame and it writes only on
+// an actual zoom, never on a pan.
+let zoomKey = null;
+
+function fmtSpan(samples) {
+  const sec = samples / rate;
+  if (sec >= 1) return sec.toFixed(2) + ' s';
+  if (sec >= 0.001) return (sec * 1000).toFixed(sec >= 0.1 ? 1 : 2) + ' ms';
+  return Math.round(sec * 1e6) + ' µs';
+}
+
+function updateZoomLabel() {
+  const el = $('zoomlevel');
+  if (!el || view.len === zoomKey) return;
+  zoomKey = view.len;
+  el.textContent = fmtSpan(view.len);
+  el.title = `${view.len} samples across the view`;
+}
+
 function initScope() {
   const cv = $('scopecanvas');
   const sampleAt = e => {
@@ -803,7 +987,8 @@ function initScope() {
     return Math.round(view.start + (e.clientX - r.left) / r.width * view.len);
   };
 
-  cv.addEventListener('click', e => { cursorA = sampleAt(e); scopeDirty = true; });
+  // Cursor A is set on release of a click that did not become a pan — see the drag block below.
+  // Right-click sets B; the Clear cursors button clears both.
   cv.addEventListener('contextmenu', e => { e.preventDefault(); cursorB = sampleAt(e); scopeDirty = true; });
 
   cv.addEventListener('wheel', e => {
@@ -815,7 +1000,7 @@ function initScope() {
     view.start = Math.round(at - (at - view.start) * (len / view.len));
     view.len = len;
     if (!srvFrozen()) {
-      updateFollow();
+      updateFollow(true);
       if (len < envColumnFrames * 8) {
         scopeMsg('The live view is 5 ms min/max columns — freeze to zoom down to samples.');
       }
@@ -824,11 +1009,18 @@ function initScope() {
     scopeDirty = true;
   }, {passive: false});
 
+  // Press-drag pans; a press that is released without travelling sets cursor A. The decision is
+  // made on release, from whether the pointer actually moved, because the browser also fires a
+  // 'click' at the end of a drag — binding cursor A to that click is what dropped a cursor every
+  // time you finished a pan.
   let drag = null;
-  cv.addEventListener('mousedown', e => { drag = {x: e.clientX, start: view.start}; });
-  window.addEventListener('mouseup', () => { drag = null; });
+  cv.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;   // left button pans / sets A; right button is cursor B
+    drag = {x: e.clientX, start: view.start, moved: false};
+  });
   window.addEventListener('mousemove', e => {
     if (!drag) return;
+    if (Math.abs(e.clientX - drag.x) > 3) drag.moved = true;
     const r = cv.getBoundingClientRect();
     const dx = (e.clientX - drag.x) / r.width * view.len;
     view.start = Math.round(drag.start - dx);
@@ -836,12 +1028,20 @@ function initScope() {
     invalidateWindows();
     scopeDirty = true;
   });
+  window.addEventListener('mouseup', e => {
+    if (drag && !drag.moved && e.button === 0) {
+      cursorA = sampleAt(e);
+      scopeDirty = true;
+    }
+    drag = null;
+  });
 
   $('freeze').onclick = () => {
     if (srvFrozen()) {
       post('/capture/resume').then(() => {
         state.capture.frozen = false;
         paused = false;
+        held = false;
         winCache = {};
         $('freeze').textContent = 'Freeze';
         setCapState('live', '');
@@ -869,6 +1069,7 @@ function initScope() {
       curKey = null;
       winCache = {};
       paused = false;
+      held = false;
       view.len = 2 * rate;
       clearResult();
       $('freeze').textContent = 'Freeze';
@@ -884,12 +1085,33 @@ function initScope() {
     }
   };
 
-  $('zoomout').onclick = () => {
-    view.len = Math.min(8 * rate, view.len * 2);
-    updateFollow();
+  $('clearcur').onclick = () => {
+    cursorA = cursorB = null;
+    curKey = null;
+    scopeDirty = true;
+  };
+
+  // Zoom by a fixed factor. While following the live edge, keep that edge pinned so a zoom never
+  // silently drops the view into history; otherwise pin the centre of what is on screen.
+  const zoomView = factor => {
+    const len = Math.max(32, Math.min(8 * rate, Math.round(view.len * factor)));
+    if (!srvFrozen() && !paused && envCols.length) {
+      view.start = envCols[envCols.length - 1].sample - len;
+    } else {
+      view.start = Math.round(view.start + view.len / 2 - len / 2);
+    }
+    view.len = len;
+    if (!srvFrozen()) {
+      updateFollow(true);
+      if (len < envColumnFrames * 8) {
+        scopeMsg('The live view is 5 ms min/max columns — freeze to zoom down to samples.');
+      }
+    }
     invalidateWindows();
     scopeDirty = true;
   };
+  $('zoomin').onclick = () => zoomView(0.5);
+  $('zoomout').onclick = () => zoomView(2);
   $('zoomfit').onclick = () => {
     view.len = 2 * rate;
     if (srvFrozen()) {
@@ -902,16 +1124,19 @@ function initScope() {
     scopeDirty = true;
   };
 
-  // Fit without the zoom reset: jump to the end at the current zoom level. Live, that is the
-  // live edge (which also resumes following); frozen, the end of the snapshot.
-  $('follow').onclick = () => {
-    if (srvFrozen()) {
-      view.start = state.capture.freeze_sample - view.len;
-      invalidateWindows();
-    } else if (envCols.length) {
-      view.start = envCols[envCols.length - 1].sample - view.len;
+  // Play resumes the live scroll and jumps to the live edge at the current zoom; Pause holds the
+  // view where it is and latches it there. Frozen has no live scroll, so the button is disabled.
+  $('playpause').onclick = () => {
+    if (srvFrozen()) return;
+    if (paused) {
+      held = false;
+      if (envCols.length) view.start = envCols[envCols.length - 1].sample - view.len;
+      updateFollow();
+    } else {
+      held = true;
+      paused = true;
+      setCapState('paused', 'press Play to catch up');
     }
-    updateFollow();
     scopeDirty = true;
   };
 
@@ -1057,6 +1282,7 @@ function buildSystem() {
 
 function onMeters(m) {
   for (let c = 0; c < NIN; c++) {
+    if (!inputEnabled[c]) continue;   // disabled inputs keep their "off" placeholder
     const rms = $('rms' + c);
     if (!rms) continue;
     rms.style.width = dbToPct(m.rms_db[c]) + '%';
@@ -1070,6 +1296,7 @@ function onSpectrum(msg) {
   // Text first, canvases second. Interleaving them makes every textContent write a layout the
   // next clientWidth read has to flush — one forced reflow per channel per message.
   for (const c of msg.channels) {
+    if (!inputEnabled[c.ch]) continue;
     const t = $('tone' + c.ch);
     if (!t) continue;
     // An invalid tone renders a placeholder of the same width, never an empty string: a signal
@@ -1079,7 +1306,7 @@ function onSpectrum(msg) {
     $('thd' + c.ch).textContent =
       c.tone.valid ? `THD+N ${fmtThd(c.tone.thd_n_pct)}%` : `THD+N ${pad('—', 6)}%`;
   }
-  for (const c of msg.channels) drawSpectrum(c.ch, c.bins);
+  for (const c of msg.channels) if (inputEnabled[c.ch]) drawSpectrum(c.ch, c.bins);
 }
 
 function onSystem(s) {
@@ -1100,6 +1327,7 @@ function connect() {
   ws.onopen = () => {
     $('conn').textContent = 'connected';
     $('conn').className = 'pill good';
+    sendStreamMask();   // re-apply the input mask after every (re)connect, incl. a daemon restart
   };
   ws.onclose = () => {
     $('conn').textContent = 'reconnecting';
@@ -1126,6 +1354,7 @@ api('/state').then(s => {
   view.len = 2 * rate;
 
   initMonitorVolume();
+  initMonitorLatency();
   buildInputs();
   buildOutputs();
   bindGenerators();
@@ -1133,8 +1362,21 @@ api('/state').then(s => {
   buildLanes();
   buildSystem();
   initScope();
+  // The capture is shared and outlives a reload: pressing Freeze then reloading finds it already
+  // frozen. Reflect that, AND load the snapshot — position the view over the frozen range and
+  // fetch its windows. Without this the lanes sit on "loading…" forever, because on a fresh load
+  // nothing else pulls the frozen data (the poll only fetches on a live→frozen transition).
+  if (srvFrozen()) {
+    $('freeze').textContent = 'Resume';
+    setCapState('frozen', frozenDetail(state.capture));
+    view.start = state.capture.freeze_sample - view.len;
+    fetchWindows();
+  } else {
+    setCapState('live', '');
+    updatePlayPause();
+  }
   clearResult();
-  connect();
+  connect();          // its onopen re-sends the input mask (no-op unless the daemon supports it)
   refreshPings();
   requestAnimationFrame(scopeTick);
 

@@ -37,6 +37,15 @@
   saved as boot defaults. The SD card's third partition is missing or unreadable.
 </div>
 
+<div id="connbanner" class="banner conn hidden">
+  <strong>Monitor audio is dropping out over the connection.</strong>
+  <span id="conntext"></span>
+  The audio is reaching this browser too late to play cleanly — the cause is the network between
+  your browser and the Sound Tester, not the device under test. Move closer to the access point or
+  use a wired connection. The meters, THD+N and the scope read the device directly and are
+  unaffected.
+</div>
+
 <nav class="tabs">
   <button class="tab active" data-tab="dash">Dashboard</button>
   <button class="tab" data-tab="scope">Scope &amp; sync</button>
@@ -74,6 +83,18 @@
     </span>
   </div>
 
+  <div class="monitor">
+    <span class="mlabel">Monitor buffer</span>
+    <input type="range" id="monlat" min="50" max="500" step="10">
+    <span id="monlatv" class="mono val">150 ms</span>
+    <span class="muted small mnote">
+      How far ahead the browser queues the monitor audio before playing it. A larger buffer rides
+      out a jittery link and clears the connection dropouts flagged above, at the cost of that much
+      more delay between the device and what you hear. It changes nothing that is measured; the
+      device never hears it.
+    </span>
+  </div>
+
   <div id="inputs" class="grid"></div>
   <h2>Outputs</h2>
   <div id="outputs" class="grid"></div>
@@ -84,6 +105,7 @@
     <div class="tgrp tgrp-cap">
       <span class="tglabel">Capture</span>
       <button id="freeze" class="primary">Freeze</button>
+      <button id="playpause">Pause</button>
       <button id="clear">Clear</button>
       <span id="capstate" class="live">live</span>
       <span id="capdetail" class="muted"></span>
@@ -107,9 +129,10 @@
 
     <div class="tgrp tgrp-view">
       <span class="tglabel">View</span>
+      <button id="zoomin">Zoom in</button>
       <button id="zoomout">Zoom out</button>
       <button id="zoomfit">Fit</button>
-      <button id="follow">Follow</button>
+      <span class="zlvl"><span class="zkey">span</span><span id="zoomlevel" class="mono">&mdash;</span></span>
       <label><input type="checkbox" id="showpings"> Ping markers</label>
     </div>
 
@@ -118,16 +141,13 @@
       <span class="cur"><span class="ckey ka">A</span><span id="curA" class="mono cval">—</span></span>
       <span class="cur"><span class="ckey kb">B</span><span id="curB" class="mono cval">—</span></span>
       <span class="cur"><span class="ckey">&Delta;</span><span id="curD" class="mono cvald">—</span></span>
-      <span class="curhint muted">Left-click sets A &middot; right-click sets B &middot; wheel zooms &middot; drag pans</span>
+      <button id="clearcur">Clear cursors</button>
+      <span class="curhint muted">Click sets A &middot; right-click sets B &middot; wheel zooms &middot; drag pans</span>
     </div>
   </div>
   <div id="scopemsg" class="muted small"></div>
-  <p class="muted small">
-    Freeze first, then measure: the delay is computed from the frozen snapshot, and
-    frozen zoom goes all the way down to individual samples.
-  </p>
-  <canvas id="scopecanvas" height="520"></canvas>
   <div id="xcorrout" class="result"></div>
+  <canvas id="scopecanvas" height="520"></canvas>
   <div id="lanes" class="lanes"></div>
 </section>
 

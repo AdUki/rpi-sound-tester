@@ -59,6 +59,13 @@ h4 { margin: 1rem 0 0.5rem; font-size: 0.85rem; color: var(--muted); }
   padding: 0.6rem 1rem;
 }
 .banner a { color: var(--warn); }
+/* The connection banner is about the link to the device, not a device fault, so it wears the
+   accent colour to read as a different class of problem from the amber under-voltage / sync ones. */
+.banner.conn {
+  background: rgba(77, 163, 255, 0.12);
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
 
 .tabs { display: flex; gap: 0.25rem; padding: 0.5rem 1rem 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 
@@ -106,9 +113,19 @@ main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
 /* nowrap, not wrap: a long channel name used to push the Listen buttons onto a second line,
    and a grid row stretches every card to its tallest — so one long name grew all six. */
 .chan-head { display: flex; justify-content: space-between; align-items: center; gap: 0.4rem; flex-wrap: nowrap; margin-bottom: 0.5rem; }
-.chan-name { font-weight: 600; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chan-name { flex: 1; font-weight: 600; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* A flex item shrinks by default: without this the name squashes Identify instead of ellipsising. */
 .chan-head > button { flex: 0 0 auto; }
+
+/* Per-input enable checkbox at the head of the card. Unchecking dims the body and stops the page
+   rendering that input; the head stays crisp so the control and the name are always readable. */
+.chan-head .en { flex: 0 0 auto; display: inline-flex; align-items: center; margin: 0; cursor: pointer; }
+.card.disabled .meter,
+.card.disabled .readout,
+.card.disabled canvas.mini,
+.card.disabled > label { opacity: 0.3; }
+.card.disabled .chan-name { color: var(--muted); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* The card can be as narrow as 260 px: trim the padding so "IN 3 — living room" plus both
    buttons still fit on one line. */
@@ -237,6 +254,21 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 /* "Freeze" and "Resume" are not the same width in a proportional font, and it leads its group. */
 #freeze { min-width: 6.5rem; }
 
+/* Play/Pause reuses the button styling; a fixed min keeps the label swap from resizing the
+   Capture group, and it goes green while the view is following the live edge. */
+#playpause { min-width: 4.5rem; }
+#playpause.playing { color: var(--good); }
+
+/* A little air before Measure so it reads as the action at the end of the Delay row, not a
+   fourth part of the IN → IN selector. */
+#measure { margin-left: 0.6rem; }
+
+/* The zoom readout — how much time the whole canvas width is showing. Its slot is reserved and
+   the digits are tabular, so changing zoom moves the value but nothing after it. */
+.zlvl { display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap; }
+.zkey { color: var(--muted); font-size: 0.75rem; }
+#zoomlevel { display: inline-block; min-width: 8ch; font-variant-numeric: tabular-nums; }
+
 /* A three-word vocabulary — live, paused, frozen — so the state itself can never resize the
    group. Everything explanatory goes in #capdetail, which is the one elastic item in the whole
    toolbar: it clips, so it can never push anything. */
@@ -304,16 +336,19 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
   }
 }
 
-/* Always in flow, below the canvas. Unhiding it above the canvas used to shove the trace down
-   by 40-90 px at the exact moment you were reading cursors off it, and the height depended on
-   whether the low-confidence note appeared. */
+/* Sits above the canvas and holds the measure instructions when idle, the result when measured.
+   Its height is bounded — min-height so an empty box still reserves its space, max-height with an
+   inner scroll so the rare long low-confidence note cannot grow the box and shove the trace down
+   the moment you press Measure. So it is always in flow and effectively fixed in height. */
 .result {
   background: rgba(255, 255, 255, 0.02);
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 0.6rem 0.8rem;
-  margin: 0.5rem 0 0;
+  margin: 0 0 0.5rem;
   min-height: 3.4rem;
+  max-height: 5rem;
+  overflow-y: auto;
   color: var(--muted);
 }
 .result.on {
