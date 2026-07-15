@@ -59,6 +59,7 @@ std::string Config::to_json() const {
   j["input_names"] = input_names;
   j["output_names"] = output_names;
   j["loopback_offset_samples"] = loopback_offset_samples;
+  j["listen"] = {{"codec", listen_codec}, {"bitrate_kbps", listen_bitrate_kbps}};
   return j.dump(2);
 }
 
@@ -122,6 +123,10 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
     if (j.contains("input_names")) c.input_names = j.at("input_names").get<std::vector<std::string>>();
     if (j.contains("output_names")) c.output_names = j.at("output_names").get<std::vector<std::string>>();
     c.loopback_offset_samples = j.value("loopback_offset_samples", c.loopback_offset_samples);
+    if (j.contains("listen")) {
+      c.listen_codec = j["listen"].value("codec", c.listen_codec);
+      c.listen_bitrate_kbps = j["listen"].value("bitrate_kbps", c.listen_bitrate_kbps);
+    }
   } catch (const std::exception& e) {
     if (err) *err = e.what();
     return false;
@@ -171,6 +176,11 @@ void Config::apply_to(Control& ctl) const {
   ctl.ping.interval_s.store(std::clamp(ping_interval_s, 0.5f, 60.0f));
   ctl.ping.level_db.store(std::clamp(ping_level_db, -60.0f, 0.0f));
   ctl.ping.epoch.fetch_add(1);
+
+  ctl.listen.codec.store(
+      static_cast<uint8_t>(listen_codec == "opus" ? ListenCodec::Opus : ListenCodec::Pcm));
+  ctl.listen.bitrate_kbps.store(
+      std::clamp(listen_bitrate_kbps, kListenBitrateMinKbps, kListenBitrateMaxKbps));
 
   // The audio loop writes each physical slot exactly once, via this map. A duplicate entry
   // would leave some slot never written (stale audio) and let two logical channels fight
@@ -229,6 +239,10 @@ Config Config::from_control(const Control& ctl, const Config& base) {
 
   for (unsigned i = 0; i < kInputs; ++i) c.input_map[i] = ctl.input_map[i].load();
   for (unsigned i = 0; i < kOutputs; ++i) c.output_map[i] = ctl.output_map[i].load();
+
+  c.listen_codec =
+      ctl.listen.codec.load() == static_cast<uint8_t>(ListenCodec::Opus) ? "opus" : "pcm";
+  c.listen_bitrate_kbps = ctl.listen.bitrate_kbps.load();
   return c;
 }
 

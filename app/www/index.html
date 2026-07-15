@@ -94,6 +94,23 @@
     </span>
   </div>
 
+  <div class="monitor" id="codecrow">
+    <span class="mlabel">Listen codec</span>
+    <select id="listencodec" class="mono">
+      <option value="pcm">PCM (raw)</option>
+      <option value="opus">Opus</option>
+    </select>
+    <label class="mono val" id="bitratewrap">
+      <input type="range" id="listenbitrate" min="16" max="256" step="8" style="width:120px">
+      <span id="listenbitratev">96 kbps</span>
+    </label>
+    <span class="muted small mnote">
+      Opus compresses the listen stream ~15–20× for a jittery or remote link, decoded in the
+      browser. Channels stay sample-aligned exactly as with PCM. The bitrate is per channel and
+      applies live. Nothing measured changes — this is the monitor path only.
+    </span>
+  </div>
+
   <div id="inputs" class="grid"></div>
   <h2>Outputs</h2>
   <div id="outputs" class="grid"></div>
@@ -255,6 +272,9 @@
 
 </main>
 
+<!-- Raw-Opus frame decoder (libopus via WASM, embedded — no separate .wasm, no build step).
+     charset must be UTF-8 (the embedded binary is UTF-8 text); see the vendor file's notes. -->
+<script src="/vendor/opus-decoder.min.js" charset="UTF-8"></script>
 <script src="/app.js"></script>
 </body>
 </html>

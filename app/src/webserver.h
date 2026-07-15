@@ -61,6 +61,11 @@ class WebServer {
   std::thread publisher_;
   std::atomic<bool> running_{false};
   std::atomic<unsigned> listen_streams_{0};
+  // The multichannel Ogg stream runs kInputs encoders on one worker; capped separately (and well
+  // below listen_streams_) so a few of them cannot starve the audio/analysis threads on a Pi.
+  std::atomic<unsigned> ogg_streams_{0};
+  // Monotonic Ogg bitstream serial, unique per stream.ogg connection.
+  std::atomic<uint32_t> ogg_serial_{1};
   // Per-input telemetry mask, bit c set = input c streamed. A console masks the inputs it is not
   // watching so the spectrum message (the widest frame) drops them. Written by POST
   // /api/stream/inputs, read by the publisher. Process-global: one bench, one operator.

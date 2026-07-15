@@ -29,6 +29,8 @@ void test_json_round_trip() {
   a.output_map = {7, 6, 5, 4, 3, 2, 1, 0};
   a.input_names[0] = "left speaker";
   a.loopback_offset_samples = 4321;
+  a.listen_codec = "opus";
+  a.listen_bitrate_kbps = 128;
 
   Config b;
   std::string err;
@@ -54,6 +56,8 @@ void test_json_round_trip() {
   CHECK_EQ(b.output_map[0], 7);
   CHECK_EQ(b.input_names[0], std::string("left speaker"));
   CHECK_EQ(b.loopback_offset_samples, 4321);
+  CHECK_EQ(b.listen_codec, std::string("opus"));
+  CHECK_EQ(b.listen_bitrate_kbps, 128);
 }
 
 void test_control_round_trip() {
@@ -67,11 +71,15 @@ void test_control_round_trip() {
   a.noise_mode = "pink";
   a.ping_variant = "bing";
   a.input_map = {1, 0, 2, 3, 4, 5};
+  a.listen_codec = "opus";
+  a.listen_bitrate_kbps = 64;
 
   Control ctl;
   a.apply_to(ctl);
 
   CHECK_EQ(ctl.inputs[1].gain_db.load(), 12.0f);
+  CHECK_EQ(ctl.listen.codec.load(), static_cast<uint8_t>(ListenCodec::Opus));
+  CHECK_EQ(ctl.listen.bitrate_kbps.load(), 64);
 
   CHECK_EQ(source_type(ctl.outputs[2].source.load()), SourceType::Input);
   CHECK_EQ(source_index(ctl.outputs[2].source.load()), 4);
@@ -89,6 +97,8 @@ void test_control_round_trip() {
   CHECK_EQ(b.noise_mode, std::string("pink"));
   CHECK_EQ(b.ping_variant, std::string("bing"));
   CHECK_EQ(b.input_map[0], 1);
+  CHECK_EQ(b.listen_codec, std::string("opus"));
+  CHECK_EQ(b.listen_bitrate_kbps, 64);
 }
 
 void test_defaults_are_silent_and_identity_mapped() {

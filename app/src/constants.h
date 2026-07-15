@@ -56,6 +56,33 @@ inline constexpr size_t kXcorrMaxFft = 1u << 20;
 inline constexpr unsigned kListenChunkFrames = 4096;
 inline constexpr unsigned kMaxListenStreams = 12;
 
+// Opus listen path. Opus only accepts 8/12/16/24/48 kHz input, so the 96 kHz ring is decimated
+// to 48 kHz and encoded in 20 ms frames. One WebSocket message carries one frame:
+// kOpusInFrames read from the ring -> (rate/kOpusRate):1 decimation -> kOpusFrameFrames -> one
+// opus_encode. 4096 was never a legal Opus frame size; 960 (@48 kHz) is, which is why the
+// encoded path uses its own chunk length rather than kListenChunkFrames.
+inline constexpr unsigned kOpusRate = 48000;
+inline constexpr unsigned kOpusFrameFrames = 960;  // 20 ms @ 48 kHz — a legal Opus frame size
+// Ring frames per Opus frame at the default 96 kHz rate (2:1). The encoder recomputes this from
+// the live engine rate; kOpusFrameFrames * (rate / kOpusRate).
+inline constexpr unsigned kOpusInFramesAt96 = kOpusFrameFrames * (kDefaultRate / kOpusRate);
+
+// Per-mono-channel Opus bitrate. The multichannel stream.ogg scales this by the channel count.
+inline constexpr int kListenBitrateDefaultKbps = 96;
+inline constexpr int kListenBitrateMinKbps = 16;
+inline constexpr int kListenBitrateMaxKbps = 256;
+
+// stream.ogg runs kInputs encoders on one worker thread; cap concurrent multichannel streams
+// well below kMaxListenStreams so a handful of them cannot starve the audio/analysis threads.
+inline constexpr unsigned kMaxOggStreams = 2;
+
+enum class ListenCodec : uint8_t { Pcm = 0, Opus = 1 };
+
+// Opus needs an integer decimation from the engine rate down to 48 kHz (factor 1 or 2 here).
+inline constexpr bool opus_rate_supported(unsigned rate) {
+  return rate == kOpusRate || rate == 2 * kOpusRate;
+}
+
 inline constexpr size_t kPingLogEntries = 64;
 
 }  // namespace st

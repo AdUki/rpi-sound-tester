@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "constants.h"
+#include "listen_encoder.h"
 #include "listen_stream.h"
 #include "util/dsp.h"
 #include "util/log.h"
@@ -250,7 +251,15 @@ void WebServer::install_routes() {
           {"listen_chunk_frames", kListenChunkFrames},
           {"input_gain_min_db", kInputGainMinDb},
           {"input_gain_max_db", kInputGainMaxDb},
-          {"stream_mask", true}}},
+          {"stream_mask", true},
+          {"listen_codecs",
+           opus_rate_supported(es.rate) ? json::array({"pcm", "opus"}) : json::array({"pcm"})},
+          {"listen_default_codec",
+           d_.ctl.listen.codec.load() == static_cast<uint8_t>(ListenCodec::Opus) ? "opus" : "pcm"},
+          {"listen_bitrate_kbps", d_.ctl.listen.bitrate_kbps.load()},
+          {"listen_bitrate_min_kbps", kListenBitrateMinKbps},
+          {"listen_bitrate_max_kbps", kListenBitrateMaxKbps},
+          {"opus_rate", kOpusRate}}},
         {"spectrum_freqs", d_.analysis.bin_freqs()},
     };
     send_json(res, j);
@@ -292,6 +301,32 @@ void WebServer::install_routes() {
       return send_error(res, 400, e.what());
     }
     send_json(res, json{{"ok", true}});
+  });
+
+  // Default listen codec + per-channel Opus bitrate. Body: {"codec": "pcm"|"opus"} and/or
+  // {"bitrate_kbps": N}. The bitrate is clamped and applied live (active Opus streams follow it);
+  // the reply echoes what took effect. The codec is only a default: the browser opts into Opus
+  // per connection with ?codec=opus, so this never changes the raw-PCM wire default.
+  svr.Post("/api/stream/codec", [this](const httplib::Request& req, httplib::Response& res) {
+    try {
+      const json j = json::parse(req.body);
+      if (j.contains("codec")) {
+        const std::string c = j.at("codec").get<std::string>();
+        if (c != "pcm" && c != "opus") return send_error(res, 400, "codec must be pcm or opus");
+        d_.ctl.listen.codec.store(
+            static_cast<uint8_t>(c == "opus" ? ListenCodec::Opus : ListenCodec::Pcm));
+      }
+      if (j.contains("bitrate_kbps")) {
+        const int br = std::clamp(j.at("bitrate_kbps").get<int>(), kListenBitrateMinKbps,
+                                  kListenBitrateMaxKbps);
+        d_.ctl.listen.bitrate_kbps.store(br);
+      }
+    } catch (const std::exception& e) {
+      return send_error(res, 400, e.what());
+    }
+    const bool opus = d_.ctl.listen.codec.load() == static_cast<uint8_t>(ListenCodec::Opus);
+    send_json(res, json{{"codec", opus ? "opus" : "pcm"},
+                        {"bitrate_kbps", d_.ctl.listen.bitrate_kbps.load()}});
   });
 
   svr.Put("/api/outputs/:ch", [this](const httplib::Request& req, httplib::Response& res) {
@@ -604,6 +639,44 @@ void WebServer::install_routes() {
     // so its reader is joined before the slot is released.
     WsReadPump pump(ws);
 
+    // Codec is negotiated per connection: ?codec=opus, with an optional ?bitrate=kbps override.
+    // The wire default stays PCM, so any client that does not ask keeps the raw S16 format byte
+    // for byte — an un-updated console never receives Opus bytes into PCM-parsing code.
+    const bool want_opus = req.has_param("codec") && req.get_param_value("codec") == "opus";
+    const unsigned rate = d_.engine.stats().rate;
+
+    if (want_opus && opus_rate_supported(rate)) {
+      const bool has_br = req.has_param("bitrate");
+      const int br_fixed =
+          has_br ? static_cast<int>(query_u64(req, "bitrate", kListenBitrateDefaultKbps)) : 0;
+      bool ok = false;
+      OpusMonoEncoder enc(rate, has_br ? br_fixed : d_.ctl.listen.bitrate_kbps.load(), &ok);
+      if (!ok) {
+        ws.close(httplib::ws::CloseStatus::InternalError, "opus init failed");
+        return;
+      }
+      LOG_INFO("listen ws opened on ch{} (opus)", ch);
+      ListenPacer pacer(d_.ring, ch, enc.in_frames());
+      const float* pcm = nullptr;
+      uint64_t start = 0;
+      bool skipped = false;
+      std::vector<uint8_t> packet;
+      std::string frame;
+      while (running_.load() && ws.is_open()) {
+        if (!pacer.next_float(running_, &pcm, &start, &skipped)) break;
+        if (skipped) enc.reset();  // clean restart across a skip-to-live discontinuity
+        const int br = has_br ? br_fixed : d_.ctl.listen.bitrate_kbps.load();
+        if (!enc.encode(pcm, br, &packet)) break;
+        // u64 starting sample index (native ring rate), then one raw Opus packet.
+        frame.resize(8 + packet.size());
+        std::memcpy(frame.data(), &start, 8);
+        std::memcpy(frame.data() + 8, packet.data(), packet.size());
+        if (!ws.send(frame.data(), frame.size())) break;
+      }
+      LOG_INFO("listen ws closed on ch{} (opus)", ch);
+      return;
+    }
+
     LOG_INFO("listen ws opened on ch{}", ch);
     ListenPacer pacer(d_.ring, ch);
     std::vector<int16_t> pcm;
@@ -655,6 +728,65 @@ void WebServer::install_routes() {
           return sink.write(reinterpret_cast<const char*>(pcm->data()), pcm->size() * 2);
         },
         [ch](bool) { LOG_INFO("wav stream closed on ch{}", ch); });
+  });
+
+  // One multichannel Ogg/Opus stream carrying every input, read from a single ring cursor so all
+  // channels share one granulepos clock — the only shape that keeps channels sample-aligned for a
+  // generic external player (extract with ffmpeg; see docs/api.md). Family 255, uncoupled.
+  svr.Get("/api/stream.ogg", [this](const httplib::Request& req, httplib::Response& res) {
+    const unsigned rate = d_.engine.stats().rate;
+    if (!opus_rate_supported(rate)) {
+      return send_error(res, 501, "opus is not available at this sample rate");
+    }
+
+    auto slot = std::make_shared<StreamSlot>(listen_streams_);
+    if (!slot->acquired()) return send_error(res, 503, "too many listeners");
+    auto ogg_slot = std::make_shared<StreamSlot>(ogg_streams_, kMaxOggStreams);
+    if (!ogg_slot->acquired()) return send_error(res, 503, "too many multichannel streams");
+
+    const bool has_br = req.has_param("bitrate");
+    const int br_fixed =
+        has_br ? static_cast<int>(query_u64(req, "bitrate", kListenBitrateDefaultKbps)) : 0;
+    const int br0 = has_br ? br_fixed : d_.ctl.listen.bitrate_kbps.load();
+
+    bool ok = false;
+    auto enc = std::make_shared<OpusOggMultiEncoder>(rate, br0, ogg_serial_.fetch_add(1), &ok);
+    if (!ok) return send_error(res, 500, "opus init failed");
+    auto pacer = std::make_shared<MultiListenPacer>(d_.ring, enc->in_frames());
+    auto sent_header = std::make_shared<bool>(false);
+
+    LOG_INFO("ogg stream opened ({} ch)", kInputs);
+    res.set_chunked_content_provider(
+        "audio/ogg",
+        [this, enc, pacer, sent_header, slot, ogg_slot, has_br, br_fixed](size_t,
+                                                                          httplib::DataSink& sink) {
+          if (!running_.load()) {
+            sink.done();
+            return false;
+          }
+          if (!*sent_header) {
+            const std::string h = enc->headers();
+            *sent_header = true;
+            return sink.write(h.data(), h.size());
+          }
+          const float* pcm = nullptr;
+          uint64_t start = 0;
+          bool skipped = false;
+          if (!pacer->next_float(running_, &pcm, &start, &skipped)) {
+            sink.done();
+            return false;
+          }
+          if (skipped) enc->reset();
+          const int br = has_br ? br_fixed : d_.ctl.listen.bitrate_kbps.load();
+          std::string pages;
+          if (!enc->encode(pcm, br, &pages)) {
+            sink.done();
+            return false;
+          }
+          if (pages.empty()) return true;  // Ogg is still filling a page; next_float paces us
+          return sink.write(pages.data(), pages.size());
+        },
+        [](bool) { LOG_INFO("ogg stream closed"); });
   });
 }
 

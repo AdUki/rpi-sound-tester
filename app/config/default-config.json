@@ -31,5 +31,6 @@
   "output_map": [0, 1, 2, 3, 4, 5, 6, 7],
   "input_names": ["", "", "", "", "", ""],
   "output_names": ["", "", "", "", "", "", "", ""],
-  "loopback_offset_samples": 0
+  "loopback_offset_samples": 0,
+  "listen": { "codec": "pcm", "bitrate_kbps": 96 }
 }

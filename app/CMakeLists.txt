@@ -37,6 +37,10 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ALSA REQUIRED alsa)
+# Opus encoder + Ogg muxer for the encoded listen stream. On a dev box:
+#   sudo apt install libopus-dev libogg-dev
+pkg_check_modules(OPUS REQUIRED opus)
+pkg_check_modules(OGG REQUIRED ogg)
 find_package(Threads REQUIRED)
 
 # third_party/* are git submodules pinned at a tag (pocketfft: a commit — it has no tags). All
@@ -77,6 +81,7 @@ add_library(soundtester_core STATIC
   src/config.cpp
   src/generators.cpp
   src/kmsg_watch.cpp
+  src/listen_encoder.cpp
   src/listen_stream.cpp
   src/util/log.cpp
   src/util/sysinfo.cpp
@@ -84,8 +89,11 @@ add_library(soundtester_core STATIC
   src/ws_hub.cpp
 )
 target_include_directories(soundtester_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_include_directories(soundtester_core SYSTEM PUBLIC ${ALSA_INCLUDE_DIRS})
-target_link_libraries(soundtester_core PUBLIC third_party ${ALSA_LIBRARIES} Threads::Threads)
+# Opus headers live under an opus/ subdir the .pc exposes, so the include dirs are required.
+target_include_directories(soundtester_core SYSTEM PUBLIC
+  ${ALSA_INCLUDE_DIRS} ${OPUS_INCLUDE_DIRS} ${OGG_INCLUDE_DIRS})
+target_link_libraries(soundtester_core PUBLIC third_party
+  ${ALSA_LIBRARIES} ${OPUS_LIBRARIES} ${OGG_LIBRARIES} Threads::Threads)
 target_compile_options(soundtester_core PRIVATE -Wall -Wextra)
 
 add_executable(soundtesterd src/main.cpp)

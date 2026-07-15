@@ -4,8 +4,10 @@ signal generators, spectrum/THD+N analysis and sample-accurate multiroom delay m
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
-DEPENDS = "alsa-lib"
-RDEPENDS:${PN} = "alsa-lib"
+# libopus (meta-oe; pulls ne10 transitively on armv7) + libogg (oe-core) for the encoded listen
+# stream. RDEPENDS puts the shared libraries into the read-only image, mirroring alsa-lib.
+DEPENDS = "alsa-lib libopus libogg"
+RDEPENDS:${PN} = "alsa-lib libopus libogg"
 
 # The daemon is built from app/ in this repository: the layer sits at yocto/meta-soundtester,
 # so four levels up from this recipe is the repo root. Swap this for a git:// SRC_URI if the

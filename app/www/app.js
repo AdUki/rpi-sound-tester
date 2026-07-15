@@ -95,6 +95,17 @@ let monitorDb = 0;
 const MON_LAT_MIN_MS = 50, MON_LAT_MAX_MS = 500;
 let monLatency = 0.15;   // seconds
 
+// Listen codec. PCM (raw S16) is the wire default and the always-available fallback; Opus is
+// opt-in per connection (?codec=opus) and decoded in the browser by the vendored WASM decoder,
+// which keeps channels sample-aligned exactly as PCM does (each chunk still carries its absolute
+// capture index). listenCodec is the user's preference; opusAvailable gates it on both the daemon
+// (a supported sample rate) and the decoder library having loaded.
+let listenCodec = 'pcm';
+let listenBitrate = 96;   // kbps, per channel
+let opusRate = 48000;     // the rate the daemon encodes Opus at; the decoder is built for it
+let opusAvailable = false;
+const OpusDecoderClass = (window['opus-decoder'] && window['opus-decoder'].OpusDecoder) || null;
+
 const monitor = {
   ctx: null,
   merger: null,    // input 0 = left ear, input 1 = right; Web Audio sums each input's connections
@@ -177,6 +188,10 @@ class Listener {
   constructor(ch) {
     this.ch = ch;
     this.sides = {l: false, r: false};
+    this.codec = (listenCodec === 'opus' && opusAvailable) ? 'opus' : 'pcm';
+    this.dec = null;
+    this.ws = null;
+    this.closed = false;
     const ctx = monitor.ensure();
 
     // One socket per channel however many ears it feeds. Opening a second stream for the
@@ -187,7 +202,15 @@ class Listener {
     this.taps.l.connect(monitor.merger, 0, 0);
     this.taps.r.connect(monitor.merger, 0, 1);
 
-    this.ws = new WebSocket(`ws://${location.host}/api/listen/${ch}`);
+    if (this.codec === 'opus') this.connectOpus();
+    else this.connect('pcm');
+  }
+
+  connect(codec) {
+    if (this.closed) return;   // user stopped while the decoder was still compiling
+    this.codec = codec;
+    const q = codec === 'opus' ? '?codec=opus' : '';
+    this.ws = new WebSocket(`ws://${location.host}/api/listen/${this.ch}${q}`);
     this.ws.binaryType = 'arraybuffer';
     this.ws.onmessage = e => this.onchunk(e.data);
     // A socket still feeding an ear that closes on its own is a dropped connection, not a user
@@ -196,6 +219,19 @@ class Listener {
       if (this.live) connWatch.drop('the audio stream dropped');
       this.stop();
     };
+  }
+
+  connectOpus() {
+    // The decoder compiles its WASM asynchronously; open the socket only once it is ready, and
+    // fall back to PCM if it fails to load so listening always works.
+    let dec;
+    try {
+      dec = new OpusDecoderClass({channels: 1, streamCount: 1, coupledStreamCount: 0,
+                                  channelMappingTable: [0], preSkip: 0, sampleRate: opusRate});
+    } catch (e) { this.connect('pcm'); return; }
+    this.dec = dec;
+    dec.ready.then(() => this.connect('opus'))
+             .catch(() => { this.dec = null; this.connect('pcm'); });
   }
 
   get live() { return this.sides.l || this.sides.r; }
@@ -211,10 +247,30 @@ class Listener {
     g.linearRampToValueAtTime(on ? 1 : 0, t + RAMP_S);
   }
 
+  // Opus: [u64 capture index][raw Opus packet]. Decode to Float32 @ opusRate and schedule on the
+  // shared timeline by the SAME absolute index the PCM path uses, so channels stay sample-aligned.
+  // A 48 kHz buffer in the 96 kHz context is resampled by the source node on playback.
+  onopus(buf, start) {
+    if (!this.dec) return;
+    let out;
+    try { out = this.dec.decodeFrame(new Uint8Array(buf, 8)); } catch (e) { return; }
+    const n = out.samplesDecoded;
+    if (!n) return;   // an encoder warm-up frame with nothing to play yet
+    const ctx = monitor.ctx;
+    const ab = ctx.createBuffer(1, n, out.sampleRate);
+    ab.getChannelData(0).set(out.channelData[0].subarray(0, n));
+    const src = ctx.createBufferSource();
+    src.buffer = ab;
+    src.connect(this.taps.l);
+    src.connect(this.taps.r);
+    src.start(monitor.timeFor(start));
+  }
+
   onchunk(buf) {
     const ctx = monitor.ctx;
     const view = new DataView(buf);
     const start = Number(view.getBigUint64(0, true));
+    if (this.codec === 'opus') { this.onopus(buf, start); return; }
     const pcm = new Int16Array(buf, 8);
 
     // Browsers honor {sampleRate} by resampling internally, so ratio is 1 in practice; the
@@ -243,8 +299,18 @@ class Listener {
   }
 
   stop() {
-    try { this.ws.close(); } catch (e) { /* already gone */ }
-    listeners.delete(this.ch);
+    this.closed = true;
+    try { if (this.ws) this.ws.close(); } catch (e) { /* already gone */ }
+    if (this.dec) {
+      // Free after the WASM is ready — free() throws if it never finished compiling.
+      const d = this.dec;
+      this.dec = null;
+      Promise.resolve(d.ready).then(() => d.free()).catch(() => {});
+    }
+    // Only clear the registry slot if it is still ours. A codec switch replaces the entry with a
+    // fresh Listener before this (old) socket's onclose fires a second stop(); without this guard
+    // that late stop would evict the replacement.
+    if (listeners.get(this.ch) === this) listeners.delete(this.ch);
     // Up to ~150 ms of this channel is already scheduled. Fade it, then tear the nodes down:
     // disconnecting immediately truncates that tail mid-waveform, which is a click.
     this.setSide('l', false);
@@ -330,6 +396,61 @@ function initMonitorLatency() {
 
 function setLatencyLabel(ms) {
   $('monlatv').textContent = `${Math.round(ms)} ms`;
+}
+
+// Listen codec + bitrate. PCM is always offered; Opus only when the daemon supports it at the
+// current sample rate and the decoder library loaded. The choice is the console's preference
+// (persisted, sent explicitly as ?codec=opus); the daemon's wire default stays PCM.
+function initCodec() {
+  const sel = $('listencodec');
+  const opusOpt = sel.querySelector('option[value="opus"]');
+  opusOpt.disabled = !opusAvailable;
+  opusOpt.textContent = opusAvailable ? 'Opus' : 'Opus (unavailable)';
+  if (!opusAvailable && listenCodec === 'opus') listenCodec = 'pcm';
+  sel.value = listenCodec;
+  sel.onchange = () => {
+    listenCodec = (sel.value === 'opus' && opusAvailable) ? 'opus' : 'pcm';
+    sel.value = listenCodec;
+    try { localStorage.setItem('listen_codec', listenCodec); } catch (e) { /* private mode */ }
+    post('/stream/codec', {codec: listenCodec}).catch(e => toast(e.message));
+    restartListeners();   // move any live listeners onto the new codec
+    updateBitrateVisibility();
+  };
+
+  const sl = $('listenbitrate');
+  sl.min = state.limits.listen_bitrate_min_kbps || 16;
+  sl.max = state.limits.listen_bitrate_max_kbps || 256;
+  sl.value = listenBitrate;
+  setBitrateLabel(listenBitrate);
+  sl.oninput = () => setBitrateLabel(parseInt(sl.value, 10));
+  sl.onchange = () => {
+    post('/stream/codec', {bitrate_kbps: parseInt(sl.value, 10)})
+      .then(r => { listenBitrate = r.bitrate_kbps; sl.value = listenBitrate; setBitrateLabel(listenBitrate); })
+      .catch(e => toast(e.message));
+  };
+  updateBitrateVisibility();
+}
+
+function setBitrateLabel(kbps) { $('listenbitratev').textContent = `${kbps} kbps`; }
+
+// The bitrate only bites for Opus; dim it under PCM rather than hide it, so the layout stays put.
+function updateBitrateVisibility() {
+  $('bitratewrap').style.opacity = listenCodec === 'opus' ? '1' : '0.4';
+}
+
+// Switching codec reconnects any live listeners so they pick it up, preserving which ears each was
+// feeding. A brief re-anchor glitch on this deliberate action is acceptable.
+function restartListeners() {
+  for (const [ch, li] of Array.from(listeners)) {
+    const sides = {l: li.sides.l, r: li.sides.r};
+    if (!(sides.l || sides.r)) continue;
+    li.stop();
+    const nl = new Listener(ch);
+    listeners.set(ch, nl);
+    if (sides.l) nl.setSide('l', true);
+    if (sides.r) nl.setSide('r', true);
+    syncListenButtons(ch);
+  }
 }
 
 // ---------------------------------------------------------------- cards
@@ -1429,10 +1550,20 @@ api('/state').then(s => {
     gainMinDb = s.limits.input_gain_min_db;
     gainMaxDb = s.limits.input_gain_max_db;
   }
+  opusRate = s.limits.opus_rate || 48000;
+  opusAvailable = Array.isArray(s.limits.listen_codecs) &&
+                  s.limits.listen_codecs.includes('opus') && !!OpusDecoderClass;
+  listenBitrate = s.limits.listen_bitrate_kbps || 96;
+  let savedCodec = null;
+  try { savedCodec = localStorage.getItem('listen_codec'); } catch (e) { /* storage blocked */ }
+  listenCodec = (savedCodec === 'opus' || savedCodec === 'pcm')
+      ? savedCodec : (s.limits.listen_default_codec || 'pcm');
+  if (listenCodec === 'opus' && !opusAvailable) listenCodec = 'pcm';
   view.len = FIT_SPAN_S * rate;
 
   initMonitorVolume();
   initMonitorLatency();
+  initCodec();
   buildInputs();
   buildOutputs();
   bindGenerators();

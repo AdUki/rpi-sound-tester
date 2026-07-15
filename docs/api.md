@@ -120,9 +120,35 @@ that repeats and the delay is only known modulo that repeat.
 ## Listening
 
 ### `WS /api/listen/{0-5}`
-Binary frames: a little-endian `uint64` absolute starting sample index, followed by 4096
-mono S16_LE samples at the native rate. The index lets a client detect a gap when it falls
-behind. This is what the browser uses.
+Binary frames: a little-endian `uint64` absolute starting sample index, followed by the audio.
+The index lets a client detect a gap when it falls behind, and — because every channel stamps
+the same instant with the same index — is what keeps channels sample-aligned. This is what the
+browser uses.
+
+Codec is chosen per connection with a query parameter; the default is raw PCM, so a client that
+asks for nothing keeps the original format byte for byte:
+
+- **`?codec=pcm`** (default): the index is followed by 4096 mono **S16_LE** samples at the native
+  rate.
+- **`?codec=opus`**: the index is followed by one raw **Opus** packet — a 20 ms frame of the
+  channel decimated to 48 kHz. Decode it with a stateful Opus decoder (the browser ships one as
+  WASM); frames arrive in order over TCP. `?bitrate=<kbps>` overrides the bitrate for this
+  connection, otherwise the daemon default applies. Opus is only offered when the engine runs at
+  a rate it supports (48 or 96 kHz); see `limits.listen_codecs` in `GET /api/state`.
+
+### `GET /api/stream.ogg`
+An endless chunked **Ogg/Opus** stream carrying **all six inputs interleaved** in one container,
+read from a single ring cursor so every channel shares one clock — the only way an external
+player gets sample-aligned channels (separate per-channel URLs cannot be locked together). The
+channels are independent (Opus mapping family 255, uncoupled), so extract them rather than "play"
+the file — a player rendering to stereo would surround-downmix them:
+```sh
+# split the six inputs into per-channel WAVs, preserving their sample alignment
+ffmpeg -i http://soundtester.local/api/stream.ogg -filter_complex \
+  "channelsplit=channel_layout=6.0" -map '[FL]' in0.wav -map '[FR]' in1.wav …
+```
+`?bitrate=<kbps>` overrides the per-channel bitrate. Capped at **2** concurrent Ogg streams (each
+runs six encoders on one thread). Requires an Opus-capable engine rate.
 
 ### `GET /api/inputs/{0-5}/stream.wav`
 An endless chunked WAV, for VLC / curl / ffmpeg:
@@ -135,8 +161,19 @@ and keeps going; VLC ignores a size larger than the stream. Players that *do* tr
 stop after 4 GiB — about **6.2 hours** at 96 kHz mono. That is a property of the format, not
 a bug.
 
-At most **12** listen streams (WS + WAV combined) are served at once; further requests get
+At most **12** listen streams (WS + WAV + Ogg combined) are served at once; further requests get
 503.
+
+### `POST /api/stream/codec`
+Body: `{"codec":"pcm"|"opus"}` and/or `{"bitrate_kbps":N}`. Sets the daemon's **default** codec
+(what the console prefers and what `stream.ogg` uses) and the per-channel Opus bitrate, which is
+clamped and applied live — active Opus streams follow a bitrate change. The reply echoes what took
+effect: `{"codec":…,"bitrate_kbps":…}`. This never changes the WS wire default: a browser still
+opts into Opus explicitly with `?codec=opus`. Saved by `POST /api/config/save`.
+
+`GET /api/state` advertises `limits.listen_codecs` (e.g. `["pcm","opus"]`),
+`limits.listen_default_codec`, `limits.listen_bitrate_kbps`, `limits.listen_bitrate_min_kbps` /
+`_max_kbps`, and `limits.opus_rate` (48000).
 
 ## Telemetry
 

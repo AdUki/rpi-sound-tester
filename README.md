@@ -34,9 +34,10 @@ entire chain — generators, routing, ring buffer, scope, cross-correlation, lis
 on a laptop.
 
 ```sh
-git clone --recurse-submodules <url>   # the libraries are submodules; --init works after the fact
+sudo apt install libopus-dev libogg-dev   # the daemon links these (plus libasound2-dev)
+git clone --recurse-submodules <url>   # the header-only libraries are submodules; --init works after the fact
 make            # list every target
-make test       # generators, ring buffer, xcorr, wav, config
+make test       # generators, ring buffer, xcorr, wav, config, opus
 make run        # http://localhost:8080, simulated card
 ```
 
@@ -89,9 +90,10 @@ read-write), which is also where the SSH host keys live so they survive a reboot
 
 ## How it fits together
 
-One C++17 daemon, `soundtesterd`. No scripting runtime, no GStreamer, no audio framework —
-alsa-lib is the only external dependency; everything else is header-only, pinned as a git
-submodule under `app/third_party/`, and nothing but the include path points at it.
+One C++17 daemon, `soundtesterd`. No scripting runtime, no GStreamer, no audio framework. The
+linked libraries are alsa-lib plus libopus + libogg (only the encoded "listen" stream uses those
+two); everything else is header-only, pinned as a git submodule under `app/third_party/`, and
+nothing but the include path points at it.
 
 ```
 Octo 6-in ──ALSA──▶ AUDIO THREAD (SCHED_FIFO 80, mlocked ring)
