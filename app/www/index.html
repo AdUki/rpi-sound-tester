@@ -166,6 +166,23 @@
   <div id="xcorrout" class="result"></div>
   <canvas id="scopecanvas" height="520"></canvas>
   <div id="lanes" class="lanes"></div>
+  <div id="specctl" class="specctl" hidden>
+    <span class="tglabel">Spectrogram</span>
+    <label>FFT
+      <select id="sgfft"><option>1024</option><option selected>2048</option><option>4096</option></select>
+    </label>
+    <label>Floor
+      <input type="range" id="sgfloor" min="-120" max="-20" step="5">
+      <span id="sgfloorv" class="mono">-100 dB</span>
+    </label>
+    <label>Colour
+      <select id="sgmap">
+        <option value="magma">magma</option><option value="inferno">inferno</option>
+        <option value="viridis">viridis</option><option value="grey">grey</option>
+      </select>
+    </label>
+    <span id="sghover" class="mono muted">— Hz · — dBFS</span>
+  </div>
 </section>
 
 <section id="config" class="panel">

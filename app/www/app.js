@@ -804,6 +804,7 @@ function setCapState(kind, detail) {
   d.textContent = detail;
   d.title = detail;
   updatePlayPause();
+  syncLaneToggles();
 }
 
 // The button reads the state rather than owning it: "Pause" while the view is following the live
@@ -865,6 +866,7 @@ function invalidateWindows() {
   clampFrozenView();
   clearTimeout(winTimer);
   winTimer = setTimeout(fetchWindows, 120);
+  invalidateSpectros();
 }
 
 function fetchWindows() {
@@ -895,12 +897,290 @@ function fetchWindows() {
     });
 }
 
+// ---------------------------------------------------------------- spectrogram
+//
+// A frozen-only, per-channel option: a scope lane can show its waveform or a spectrogram of the
+// SAME zoomed/panned span. The daemon has no FFT for this — we pull the frozen PCM through the
+// existing /api/capture/window endpoint (raw is capped at 4096 frames/request) and run the STFT
+// here. Cost is bounded to a request budget per lane so it never scales with the ~85 s buffer:
+// a contiguous fetch + dense STFT while the span is narrow, one window per column (sparse) once it
+// is wide. Time on X (shares the scope's view), log frequency on Y, colour is level in dBFS.
+
+const laneMode = Array(NIN).fill('wave');   // 'wave' | 'spectro' per input, persisted
+try {
+  const saved = JSON.parse(localStorage.getItem('lane_mode') || '[]');
+  for (let c = 0; c < NIN; c++) if (saved[c] === 'spectro') laneMode[c] = 'spectro';
+} catch (e) { /* private mode */ }
+function saveLaneMode() {
+  try { localStorage.setItem('lane_mode', JSON.stringify(laneMode)); } catch (e) { /* private */ }
+}
+
+// Live-adjustable display settings. FFT is also the per-column window and must stay <= RAWCAP so a
+// sparse column is one request. Floor is the colour floor (ceiling is 0 dBFS).
+let sgFft = 2048, sgFloorDb = -100, sgMap = 'magma';
+try {
+  sgFft = parseInt(localStorage.getItem('sg_fft'), 10) || sgFft;
+  sgFloorDb = parseInt(localStorage.getItem('sg_floor'), 10) || sgFloorDb;
+  sgMap = localStorage.getItem('sg_map') || sgMap;
+} catch (e) { /* private */ }
+
+const RAWCAP = 4096;      // /api/capture/window returns raw only for len <= 2*cols, cols <= 2048
+const SG_BUDGET = 96;     // max raw requests per lane per refresh
+const SG_NBINS = 256;     // offscreen height; blitted to the actual lane height
+const SG_LOW_HZ = 20;     // bottom of the log frequency axis
+
+let specCache = {};       // ch -> {start,len,ncols,nbins,db:Float32Array,off:canvas} | {narrow}|{empty}
+let specTimer = null;
+let specSeq = 0;
+
+// --- radix-2 FFT, tables cached per size ---
+const fftCache = {};
+function getFFT(N) {
+  if (fftCache[N]) return fftCache[N];
+  const rev = new Uint32Array(N);
+  for (let i = 0, j = 0; i < N; i++) {
+    rev[i] = j;
+    let bit = N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+  }
+  const cos = new Float32Array(N / 2), sin = new Float32Array(N / 2);
+  for (let i = 0; i < N / 2; i++) { const a = -2 * Math.PI * i / N; cos[i] = Math.cos(a); sin[i] = Math.sin(a); }
+  return (fftCache[N] = {N, rev, cos, sin});
+}
+// In-place complex FFT (decimation-in-time) on parallel re/im arrays of length f.N.
+function fft(re, im, f) {
+  const N = f.N, rev = f.rev;
+  for (let i = 0; i < N; i++) {
+    const j = rev[i];
+    if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let len = 2; len <= N; len <<= 1) {
+    const half = len >> 1, step = N / len;
+    for (let i = 0; i < N; i += len) {
+      for (let k = 0, idx = 0; k < half; k++, idx += step) {
+        const c = f.cos[idx], s = f.sin[idx];
+        const ar = re[i + k + half], ai = im[i + k + half];
+        const tr = ar * c - ai * s, ti = ar * s + ai * c;
+        re[i + k + half] = re[i + k] - tr; im[i + k + half] = im[i + k] - ti;
+        re[i + k] += tr; im[i + k] += ti;
+      }
+    }
+  }
+}
+
+// Hann window + its sum, cached. Bin amplitude = 2*|X|/sum(window), so a full-scale sine reads 0 dB.
+const sgWin = {};
+function hann(N) {
+  if (sgWin[N]) return sgWin[N];
+  const w = new Float32Array(N);
+  let sum = 0;
+  for (let i = 0; i < N; i++) { w[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1)); sum += w[i]; }
+  return (sgWin[N] = {w, sum});
+}
+
+// Each of SG_NBINS log-spaced display rows (20 Hz..Nyquist) maps to a linear FFT-bin range, reduced
+// by peak-hold. Cached per (N, rate).
+const sgBinMap = {};
+function binMap(N) {
+  const key = N + ':' + rate;
+  if (sgBinMap[key]) return sgBinMap[key];
+  const nyq = rate / 2, lo = SG_LOW_HZ, r = new Uint32Array(SG_NBINS * 2);
+  for (let i = 0; i < SG_NBINS; i++) {
+    const f0 = lo * Math.pow(nyq / lo, i / SG_NBINS);
+    const f1 = lo * Math.pow(nyq / lo, (i + 1) / SG_NBINS);
+    let k0 = Math.max(1, Math.floor(f0 * N / rate));
+    let k1 = Math.max(k0 + 1, Math.ceil(f1 * N / rate));
+    if (k1 > N / 2 + 1) k1 = N / 2 + 1;
+    r[i * 2] = k0; r[i * 2 + 1] = k1;
+  }
+  return (sgBinMap[key] = r);
+}
+
+const sgScratch = {re: null, im: null};
+// FFT one window of `src` at `off`, reduce to SG_NBINS log dB rows written at out[base..].
+function specColumn(src, off, out, base) {
+  const N = sgFft, f = getFFT(N), win = hann(N), map = binMap(N);
+  if (!sgScratch.re || sgScratch.re.length !== N) { sgScratch.re = new Float32Array(N); sgScratch.im = new Float32Array(N); }
+  const re = sgScratch.re, im = sgScratch.im;
+  for (let i = 0; i < N; i++) { re[i] = (src[off + i] || 0) * win.w[i]; im[i] = 0; }
+  fft(re, im, f);
+  const norm = 2 / win.sum;
+  for (let i = 0; i < SG_NBINS; i++) {
+    const k0 = map[i * 2], k1 = map[i * 2 + 1];
+    let p = 0;
+    for (let k = k0; k < k1; k++) { const m = re[k] * re[k] + im[k] * im[k]; if (m > p) p = m; }
+    const amp = Math.sqrt(p) * norm;
+    out[base + i] = amp > 1e-9 ? 20 * Math.log10(amp) : -120;
+  }
+}
+
+// A handful of anchor stops per map, interpolated to a 256-entry RGB LUT (no libraries).
+const CMAPS = {
+  magma: [[0,0,4],[28,16,68],[79,18,123],[129,37,129],[181,54,122],[229,80,100],[251,135,97],[254,194,135],[252,253,191]],
+  inferno: [[0,0,4],[31,12,72],[85,15,109],[136,34,106],[186,54,85],[227,89,51],[249,140,10],[249,201,50],[252,255,164]],
+  viridis: [[68,1,84],[70,50,127],[54,92,141],[39,127,142],[31,161,135],[74,194,109],[159,218,58],[253,231,37]],
+  grey: [[0,0,0],[255,255,255]],
+};
+function buildColormap(name) {
+  const stops = CMAPS[name] || CMAPS.magma, lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255 * (stops.length - 1), a = Math.min(stops.length - 1, Math.floor(t)), b = Math.min(stops.length - 1, a + 1), fr = t - a;
+    for (let c = 0; c < 3; c++) lut[i * 3 + c] = Math.round(stops[a][c] + (stops[b][c] - stops[a][c]) * fr);
+  }
+  return lut;
+}
+let cmapLut = buildColormap(sgMap);
+
+// Paint sc.db (col-major, row 0 = low freq) into an offscreen canvas ncols x SG_NBINS, top = high.
+function paintSpectro(sc) {
+  const off = sc.off || (sc.off = document.createElement('canvas'));
+  off.width = sc.ncols; off.height = SG_NBINS;
+  const g = off.getContext('2d'), img = g.createImageData(sc.ncols, SG_NBINS), d = img.data;
+  const floor = sgFloorDb, span = -floor;
+  for (let x = 0; x < sc.ncols; x++) {
+    const cb = x * SG_NBINS;
+    for (let y = 0; y < SG_NBINS; y++) {
+      const db = sc.db[cb + (SG_NBINS - 1 - y)];
+      let t = (db - floor) / span; t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const li = (t * 255) | 0, p = (y * sc.ncols + x) * 4;
+      d[p] = cmapLut[li * 3]; d[p + 1] = cmapLut[li * 3 + 1]; d[p + 2] = cmapLut[li * 3 + 2]; d[p + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+}
+
+function recolorSpectros() {
+  cmapLut = buildColormap(sgMap);
+  for (const k of Object.keys(specCache)) { const sc = specCache[k]; if (sc && sc.db) paintSpectro(sc); }
+  scopeDirty = true;
+}
+
+// Recompute every spectro lane for the current frozen view, debounced. Called wherever the frozen
+// view or the lane modes change; clears the cache and bails when live.
+function invalidateSpectros() {
+  if (!srvFrozen()) { specCache = {}; return; }
+  clearTimeout(specTimer);
+  specTimer = setTimeout(fetchSpectros, 150);
+}
+
+function fetchSpectros() {
+  if (!srvFrozen()) { specCache = {}; return; }
+  clampFrozenView();
+  const cap = state.capture;
+  const chans = inputEnabled.map((on, i) => (on && laneMode[i] === 'spectro') ? i : -1).filter(i => i >= 0);
+  for (const k of Object.keys(specCache)) if (!chans.includes(Number(k))) delete specCache[k];
+  updateSpecCtl();
+  if (!chans.length) { scopeDirty = true; return; }
+
+  const lo = Math.max(view.start, cap.valid_start);
+  const hi = Math.min(view.start + view.len, cap.valid_start + cap.valid_len);
+  const span = Math.floor(hi - lo), N = sgFft;
+  if (span < N) { chans.forEach(ch => specCache[ch] = {narrow: true}); scopeDirty = true; return; }
+
+  const w = Math.min(2048, Math.max(64, $('scopecanvas').clientWidth || 1024));
+  const seq = ++specSeq;
+  const contiguous = Math.ceil(span / RAWCAP) <= SG_BUDGET;
+  chans.forEach(ch => contiguous ? fetchSpectroContig(ch, lo, span, N, w, seq)
+                                 : fetchSpectroSparse(ch, lo, span, N, seq));
+}
+
+// Narrow span: pull [lo,lo+span) contiguously (<= SG_BUDGET raw requests), slide a dense STFT.
+function fetchSpectroContig(ch, lo, span, N, w, seq) {
+  const nchunks = Math.ceil(span / RAWCAP), reqs = [];
+  for (let i = 0; i < nchunks; i++) {
+    const s = lo + i * RAWCAP, l = Math.min(RAWCAP, lo + span - s);
+    reqs.push(api(`/capture/window?ch=${ch}&start=${s}&len=${l}&cols=2048`).then(r => [s, r]).catch(() => null));
+  }
+  Promise.all(reqs).then(rs => {
+    if (seq !== specSeq) return;
+    const buf = new Float32Array(span);
+    let ok = false;
+    for (const rr of rs) {
+      if (!rr) continue;
+      const [s, r] = rr;
+      if (!r || !r.raw || !r.samples) continue;
+      const at = s - lo;
+      for (let i = 0; i < r.samples.length && at + i < span; i++) buf[at + i] = r.samples[i];
+      ok = true;
+    }
+    if (!ok) { specCache[ch] = {empty: true}; scopeDirty = true; return; }
+    const ncols = Math.max(1, Math.min(w, span - N + 1));
+    const hop = ncols > 1 ? (span - N) / (ncols - 1) : 0;
+    const db = new Float32Array(ncols * SG_NBINS);
+    for (let c = 0; c < ncols; c++) specColumn(buf, Math.round(c * hop), db, c * SG_NBINS);
+    const sc = {start: lo, len: span, ncols, nbins: SG_NBINS, db};
+    paintSpectro(sc);
+    specCache[ch] = sc;
+    scopeDirty = true;
+  });
+}
+
+// Wide span: SG_BUDGET columns, one FFT window per column (coarser in time, still correct).
+function fetchSpectroSparse(ch, lo, span, N, seq) {
+  const ncols = SG_BUDGET, reqs = [];
+  for (let c = 0; c < ncols; c++) {
+    const s = lo + Math.round(c * (span - N) / (ncols - 1));
+    reqs.push(api(`/capture/window?ch=${ch}&start=${s}&len=${N}&cols=2048`).then(r => [c, r]).catch(() => null));
+  }
+  Promise.all(reqs).then(rs => {
+    if (seq !== specSeq) return;
+    const db = new Float32Array(ncols * SG_NBINS).fill(-120), tmp = new Float32Array(N);
+    let ok = false;
+    for (const rr of rs) {
+      if (!rr) continue;
+      const [c, r] = rr;
+      if (!r || !r.raw || !r.samples) continue;
+      for (let i = 0; i < N; i++) tmp[i] = r.samples[i] || 0;
+      specColumn(tmp, 0, db, c * SG_NBINS);
+      ok = true;
+    }
+    if (!ok) { specCache[ch] = {empty: true}; scopeDirty = true; return; }
+    const sc = {start: lo, len: span, ncols, nbins: SG_NBINS, db};
+    paintSpectro(sc);
+    specCache[ch] = sc;
+    scopeDirty = true;
+  });
+}
+
 function buildLanes() {
   $('lanes').innerHTML = inputEnabled.map((on, i) =>
-    `<label><input type="checkbox" id="lane${i}" ${on ? 'checked' : ''}> IN ${i + 1}</label>`).join('');
+    `<span class="lane"><label><input type="checkbox" id="lane${i}" ${on ? 'checked' : ''}> IN ${i + 1}</label>` +
+    `<button class="lm" id="lm${i}">wave</button></span>`).join('');
   inputEnabled.forEach((_, i) => {
     $('lane' + i).onchange = e => setInputEnabled(i, e.target.checked);
+    $('lm' + i).onclick = () => toggleLaneMode(i);
   });
+  syncLaneToggles();
+}
+
+function toggleLaneMode(i) {
+  laneMode[i] = laneMode[i] === 'spectro' ? 'wave' : 'spectro';
+  saveLaneMode();
+  if (laneMode[i] !== 'spectro') delete specCache[i];
+  syncLaneToggle(i);
+  invalidateSpectros();
+  scopeDirty = true;
+}
+
+// The toggle only bites while frozen; live, the lane always shows the envelope, so grey it out.
+function syncLaneToggle(i) {
+  const b = $('lm' + i);
+  if (!b) return;
+  b.textContent = laneMode[i] === 'spectro' ? 'spec' : 'wave';
+  b.classList.toggle('on', laneMode[i] === 'spectro');
+  b.disabled = !srvFrozen();
+  b.title = srvFrozen() ? 'Show this lane as waveform or spectrogram'
+    : 'Press Analyze first — the spectrogram reads the frozen buffer';
+}
+
+function syncLaneToggles() { inputEnabled.forEach((_, i) => syncLaneToggle(i)); updateSpecCtl(); }
+
+// The shared spectrogram controls (FFT / floor / colour) only matter when a lane is showing one.
+function updateSpecCtl() {
+  const el = $('specctl');
+  if (!el) return;
+  el.hidden = !(srvFrozen() && laneMode.some((m, i) => m === 'spectro' && inputEnabled[i]));
 }
 
 function onWave(buf) {
@@ -1004,7 +1284,22 @@ function drawScope() {
     const half = lh / 2 - 6;
     const yOf = s => mid - Math.max(-1, Math.min(1, s)) * half;
 
-    if (srvFrozen()) {
+    if (srvFrozen() && laneMode[ch] === 'spectro') {
+      const sc = specCache[ch];
+      if (sc && sc.off) {
+        g.imageSmoothingEnabled = true;
+        const dx = toX(sc.start), dw = toX(sc.start + sc.len) - dx;
+        g.drawImage(sc.off, 0, 0, sc.ncols, sc.nbins, dx, top, dw, lh);
+        g.fillStyle = '#cdd3de';
+        g.fillText('IN ' + (ch + 1), 6, top + 14);
+        drew = true;
+      } else {
+        g.fillStyle = '#8b93a3';
+        g.fillText(sc && sc.narrow ? 'zoom out for the spectrogram'
+                 : sc && sc.empty ? 'outside the frozen range'
+                 : 'computing spectrogram…', w / 2 - 60, mid);
+      }
+    } else if (srvFrozen()) {
       const cap = state.capture;
       const win = winCache[ch];
       // A cached window is only useful if it still overlaps the view — after a pan it may sit
@@ -1213,6 +1508,7 @@ function initScope() {
         paused = false;
         held = false;
         winCache = {};
+        specCache = {};
         $('freeze').textContent = 'Analyze';
         setCapState('live', '');
         clearResult();
@@ -1229,6 +1525,7 @@ function initScope() {
         setCapState('frozen', frozenDetail(cs));
         scopeMsg('');
         fetchWindows();
+        invalidateSpectros();
         scopeDirty = true;
       }).catch(e => scopeMsg(e.message));
     }
@@ -1240,6 +1537,7 @@ function initScope() {
       cursorA = cursorB = null;
       curKey = null;
       winCache = {};
+      specCache = {};
       paused = false;
       held = false;
       clearResult();
@@ -1342,6 +1640,41 @@ function initScope() {
       })
       .catch(e => scopeMsg(e.message));
   };
+
+  // Spectrogram controls (shared by every spectro lane). FFT changes the analysis, so it refetches;
+  // floor and colour only recolour the cached dB, no network.
+  const fftSel = $('sgfft'), floorInp = $('sgfloor'), floorV = $('sgfloorv'), mapSel = $('sgmap');
+  if (fftSel) {
+    fftSel.value = String(sgFft);
+    fftSel.onchange = e => { sgFft = parseInt(e.target.value, 10); try { localStorage.setItem('sg_fft', sgFft); } catch (x) {} invalidateSpectros(); };
+    floorInp.value = String(sgFloorDb);
+    floorV.textContent = sgFloorDb + ' dB';
+    floorInp.oninput = e => { sgFloorDb = parseInt(e.target.value, 10); floorV.textContent = sgFloorDb + ' dB'; try { localStorage.setItem('sg_floor', sgFloorDb); } catch (x) {} recolorSpectros(); };
+    mapSel.value = sgMap;
+    mapSel.onchange = e => { sgMap = e.target.value; try { localStorage.setItem('sg_map', sgMap); } catch (x) {} recolorSpectros(); };
+  }
+
+  // Hover a spectro lane → frequency (log Y) and level from the cached dB. The scope canvas backing
+  // store is 1:1 with CSS pixels (no devicePixelRatio), so the mouse Y maps straight onto a lane.
+  cv.addEventListener('mousemove', e => {
+    const el = $('sghover');
+    if (!el) return;
+    const shown = inputEnabled.map((on, i) => on ? i : -1).filter(i => i >= 0);
+    const r = cv.getBoundingClientRect();
+    const lh = shown.length ? r.height / shown.length : 0;
+    const row = lh ? Math.floor((e.clientY - r.top) / lh) : -1;
+    const ch = row >= 0 && row < shown.length ? shown[row] : null;
+    const sc = ch != null ? specCache[ch] : null;
+    if (!srvFrozen() || ch == null || laneMode[ch] !== 'spectro' || !sc || !sc.db) { el.textContent = '— Hz · — dBFS'; return; }
+    const frac = Math.max(0, Math.min(1, 1 - ((e.clientY - r.top) - row * lh) / lh));
+    const freq = SG_LOW_HZ * Math.pow((rate / 2) / SG_LOW_HZ, frac);
+    const s = view.start + (e.clientX - r.left) / r.width * view.len;
+    const col = Math.max(0, Math.min(sc.ncols - 1, Math.round((s - sc.start) / sc.len * (sc.ncols - 1))));
+    const bin = Math.max(0, Math.min(SG_NBINS - 1, Math.round(frac * (SG_NBINS - 1))));
+    const db = sc.db[col * SG_NBINS + bin];
+    const fs = freq >= 1000 ? (freq / 1000).toFixed(2) + ' kHz' : Math.round(freq) + ' Hz';
+    el.textContent = `${fs} · ${db.toFixed(1)} dBFS`;
+  });
 }
 
 // ---------------------------------------------------------------- system
@@ -1581,6 +1914,7 @@ api('/state').then(s => {
     setCapState('frozen', frozenDetail(state.capture));
     view.start = state.capture.freeze_sample - view.len;
     fetchWindows();
+    invalidateSpectros();
   } else {
     setCapState('live', '');
     updatePlayPause();
@@ -1598,7 +1932,8 @@ api('/state').then(s => {
       $('freeze').textContent = srvFrozen() ? 'Live' : 'Analyze';
       if (srvFrozen()) setCapState('frozen', frozenDetail(state.capture));
       else setCapState('live', '');
-      if (srvFrozen()) fetchWindows(); else { winCache = {}; paused = false; }
+      if (srvFrozen()) { fetchWindows(); invalidateSpectros(); }
+      else { winCache = {}; specCache = {}; paused = false; }
       scopeDirty = true;
     }
     buildSystem();

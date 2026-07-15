@@ -362,6 +362,16 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 .lanes { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem; }
 .lanes label { display: flex; align-items: center; gap: 0.3rem; margin: 0; }
 
+/* Each lane control pairs the enable checkbox with a small waveform/spectrogram toggle; the toggle
+   goes green (button.on) while that lane is a spectrogram, and greys out until Analyze is pressed. */
+.lane { display: inline-flex; align-items: center; gap: 0.4rem; }
+.lm { padding: 0.1rem 0.45rem; font-size: 0.72rem; line-height: 1.5; }
+
+/* Shared spectrogram controls, shown below the lanes only while at least one lane is a spectrogram. */
+.specctl { display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap; margin-top: 0.5rem; }
+.specctl label { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; white-space: nowrap; }
+.specctl #sghover { margin-left: auto; }
+
 .maps { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
 .maps label { display: flex; align-items: center; gap: 0.5rem; }
 
