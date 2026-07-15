@@ -632,12 +632,18 @@ function buildMap() {
 // The scope lanes are the same on/off state as the dashboard's per-input enable: disabling an
 // input hides its lane and vice versa. There is one source of truth, inputEnabled, and the two
 // checkbox sets are kept in step through applyInputEnabled().
-let view = {start: 0, len: 96000 * 2};   // absolute samples
+// Widest the scope zooms out. Keep this many seconds of columns so that span is backed by data:
+// the server backfills only its own 60 s envelope on connect, and the rest fills in from the live
+// stream while the page stays open.
+const MAX_SPAN_S = 300;
+const FIT_SPAN_S = 8;                // span the Fit button resets the view to, and the default view
+const ENV_KEEP = MAX_SPAN_S * 200;   // 300 s at 200 col/s (96 kHz / 480-frame columns)
+
+let view = {start: 0, len: 96000 * FIT_SPAN_S};   // absolute samples
 let cursorA = null, cursorB = null;
 let paused = false;        // not following the live edge (auto: panned into history, or held)
 let held = false;          // Pause was pressed: hold the view until Play, whatever the view shows
 let envCols = [];          // {sample, min[6], max[6]}
-const ENV_KEEP = 12000;    // 60 s at 200 col/s — the server's own envelope depth
 let scopeDirty = false;
 
 const srvFrozen = () => !!(state && state.capture && state.capture.frozen);
@@ -934,6 +940,7 @@ function drawScope() {
 
   updateCursorReadout();
   updateZoomLabel();
+  updateBufLabel();
 }
 
 // The delta has its own slot and is never concatenated into cursor B's. As part of B's string it
@@ -980,6 +987,23 @@ function updateZoomLabel() {
   el.title = `${view.len} samples across the view`;
 }
 
+// How much live history is held, so zooming out past it is visibly the buffer's edge, not a bug.
+// The client backfills the server's 60 s on connect and grows toward MAX_SPAN_S while the page
+// stays open. Keyed on the rounded seconds so it writes only when the number moves, not per frame.
+let bufKey = null;
+function updateBufLabel() {
+  const el = $('buflevel');
+  if (!el) return;
+  const secs = envCols.length >= 2
+    ? (envCols[envCols.length - 1].sample - envCols[0].sample) / rate : 0;
+  const shown = secs >= 1 ? Math.round(secs) + ' s'
+    : secs > 0 ? Math.round(secs * 1000) + ' ms' : '—';
+  if (shown === bufKey) return;
+  bufKey = shown;
+  el.textContent = shown;
+  el.title = `${envCols.length} live envelope columns held (max ${ENV_KEEP})`;
+}
+
 function initScope() {
   const cv = $('scopecanvas');
   const sampleAt = e => {
@@ -995,7 +1019,7 @@ function initScope() {
     e.preventDefault();
     const at = sampleAt(e);
     const f = e.deltaY > 0 ? 1.25 : 0.8;
-    const len = Math.max(32, Math.min(8 * rate, Math.round(view.len * f)));
+    const len = Math.max(32, Math.min(MAX_SPAN_S * rate, Math.round(view.len * f)));
     // keep the sample under the pointer pinned
     view.start = Math.round(at - (at - view.start) * (len / view.len));
     view.len = len;
@@ -1070,7 +1094,6 @@ function initScope() {
       winCache = {};
       paused = false;
       held = false;
-      view.len = 2 * rate;
       clearResult();
       $('freeze').textContent = 'Freeze';
       setCapState('live', '');
@@ -1094,7 +1117,7 @@ function initScope() {
   // Zoom by a fixed factor. While following the live edge, keep that edge pinned so a zoom never
   // silently drops the view into history; otherwise pin the centre of what is on screen.
   const zoomView = factor => {
-    const len = Math.max(32, Math.min(8 * rate, Math.round(view.len * factor)));
+    const len = Math.max(32, Math.min(MAX_SPAN_S * rate, Math.round(view.len * factor)));
     if (!srvFrozen() && !paused && envCols.length) {
       view.start = envCols[envCols.length - 1].sample - len;
     } else {
@@ -1113,7 +1136,7 @@ function initScope() {
   $('zoomin').onclick = () => zoomView(0.5);
   $('zoomout').onclick = () => zoomView(2);
   $('zoomfit').onclick = () => {
-    view.len = 2 * rate;
+    view.len = FIT_SPAN_S * rate;
     if (srvFrozen()) {
       view.start = state.capture.freeze_sample - view.len;
       invalidateWindows();
@@ -1351,7 +1374,7 @@ api('/state').then(s => {
     gainMinDb = s.limits.input_gain_min_db;
     gainMaxDb = s.limits.input_gain_max_db;
   }
-  view.len = 2 * rate;
+  view.len = FIT_SPAN_S * rate;
 
   initMonitorVolume();
   initMonitorLatency();
