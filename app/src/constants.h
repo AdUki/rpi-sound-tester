@@ -22,13 +22,26 @@ inline constexpr unsigned kDefaultRate = 96000;
 inline constexpr unsigned kDefaultPeriod = 1024;
 inline constexpr unsigned kDefaultPeriods = 4;
 
-// 2^20 frames = 10.9 s at 96 kHz, 24 MB of float32 x 6ch. Power of two: index by mask.
-inline constexpr size_t kRingFrames = 1u << 20;
+// 2^23 frames = 87.4 s at 96 kHz, 192 MB of float32 x 6ch. Power of two: index by mask.
+// This is the *ceiling*; how much of it a freeze actually copies is set at runtime by
+// CaptureStore::set_analyze_frames (POST /api/capture/config). Note the true RAM cost is
+// ~2x this: the live ring here plus an equally-sized frozen snapshot in CaptureStore. So
+// 192 MB ring + 192 MB snapshot = 384 MB pinned. Raise this exponent only with headroom to
+// spare — 2^24 would be 768 MB total, too tight on a 1 GB Pi.
+inline constexpr size_t kRingFrames = 1u << 23;
 
-// Freeze copies the ring minus this many periods, so the copy has room to finish before
-// the writer can lap its oldest sample (the ring's own 2-period margin is too tight for a
-// 24 MB memcpy on a Pi 3).
+// Freeze copies the ring minus a safety margin, so the copy has room to finish before the
+// writer can lap its oldest sample. The margin is max(this many periods, kRingFrames/32):
+// a fixed period count is too thin once the ring — and thus the memcpy — grows.
 inline constexpr size_t kFreezeHeadroomPeriods = 8;
+
+// Smallest analyze/snapshot length the config API will accept, so a fat-fingered 0 can't
+// leave nothing to freeze. 4096 frames = ~43 ms at 96 kHz.
+inline constexpr size_t kCaptureMinFrames = 4096;
+
+// Default analyze/snapshot length on startup — a freeze grabs this much unless the config API
+// changes it. Well under the ceiling so a fresh freeze is quick; raise it per-session as needed.
+inline constexpr double kCaptureDefaultSeconds = 20.0;
 
 // One envelope column per 480 frames = 200 columns/s at 96 kHz; 60 s of history.
 inline constexpr unsigned kEnvColumnFrames = 480;

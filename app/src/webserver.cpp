@@ -195,6 +195,7 @@ void WebServer::install_routes() {
           {"freeze_sample", cs.freeze_sample},
           {"valid_start", cs.valid_start},
           {"valid_len", cs.valid_len},
+          {"analyze_frames", d_.capture.analyze_frames()},
           {"generation", cs.generation}}},
         {"engine",
          {{"running", es.running},
@@ -213,6 +214,8 @@ void WebServer::install_routes() {
         {"limits",
          {{"env_column_frames", kEnvColumnFrames},
           {"ring_frames", kRingFrames},
+          {"capture_max_frames", d_.capture.capacity_frames()},
+          {"capture_config", true},
           {"xcorr_max_len", kXcorrMaxLen},
           {"listen_chunk_frames", kListenChunkFrames},
           {"input_gain_min_db", kInputGainMinDb},
@@ -406,6 +409,33 @@ void WebServer::install_routes() {
   svr.Post("/api/capture/resume", [this](const httplib::Request&, httplib::Response& res) {
     d_.capture.resume();
     send_json(res, json{{"frozen", false}});
+  });
+
+  // Sets how many recent frames the next Analyze/freeze grabs. Body: {"seconds": N} (preferred)
+  // or {"frames": N}. The value is clamped to [kCaptureMinFrames, capacity]; the reply echoes
+  // the clamped result so the client can show what actually took effect.
+  svr.Post("/api/capture/config", [this](const httplib::Request& req, httplib::Response& res) {
+    try {
+      const json j = json::parse(req.body);
+      const double rate = d_.engine.rate();
+      uint64_t frames;
+      if (j.contains("seconds")) {
+        const double s = j.at("seconds").get<double>();
+        if (!(s > 0.0)) return send_error(res, 400, "seconds must be > 0");
+        frames = static_cast<uint64_t>(std::llround(s * rate));
+      } else {
+        frames = j.at("frames").get<uint64_t>();
+      }
+      d_.capture.set_analyze_frames(frames);
+      const uint64_t now = d_.capture.analyze_frames();
+      const uint64_t max = d_.capture.capacity_frames();
+      send_json(res, json{{"analyze_frames", now},
+                          {"analyze_seconds", now / rate},
+                          {"max_frames", max},
+                          {"max_seconds", max / rate}});
+    } catch (const std::exception& e) {
+      send_error(res, 400, e.what());
+    }
   });
 
   svr.Get("/api/capture/status", [this](const httplib::Request&, httplib::Response& res) {

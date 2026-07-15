@@ -24,17 +24,33 @@ CaptureStore::CaptureStore(const RingBuffer& ring, double rate, unsigned period)
     : ring_(ring), rate_(rate), period_(period) {
   snap_.assign(kRingFrames * kInputs, 0.0f);
   mlock(snap_.data(), snap_.size() * sizeof(float));
+  // The copy margin scales with the ring: a fixed period count is fine at 24 MB but far too
+  // thin once a 192 MB memcpy needs room to finish before the writer laps its start.
+  const size_t margin = std::max<size_t>(kFreezeHeadroomPeriods * period_, kRingFrames / 32);
+  capacity_frames_ = kRingFrames - margin;
+  // Default to a modest window, capped at capacity, so a fresh freeze is quick out of the box.
+  analyze_frames_ = std::min<uint64_t>(
+      capacity_frames_, static_cast<uint64_t>(kCaptureDefaultSeconds * rate_));
+}
+
+void CaptureStore::set_analyze_frames(uint64_t frames) {
+  std::lock_guard<std::mutex> lock(m_);
+  analyze_frames_ = std::clamp<uint64_t>(frames, kCaptureMinFrames, capacity_frames_);
+}
+
+uint64_t CaptureStore::analyze_frames() const {
+  std::lock_guard<std::mutex> lock(m_);
+  return analyze_frames_;
 }
 
 CaptureStatus CaptureStore::freeze(uint32_t generation) {
   std::lock_guard<std::mutex> lock(m_);
 
-  // Copying the whole ring flat would tear at the write head, and ~24 MB takes longer on a
-  // Pi 3 than the ring's 2-period safety margin allows. Take a slightly shorter span (0.8% of
-  // the history) so the copy has room to finish before the writer laps the oldest sample; the
-  // ring's post-copy validation is the backstop, and a lapped copy is discarded, not handed out
-  // as mixed data.
-  const size_t span = kRingFrames - kFreezeHeadroomPeriods * period_;
+  // Copy at most the configured analyze length, and never more than the ring can safely hand
+  // out (capacity_frames_ keeps a margin below the write head so the copy finishes before the
+  // writer laps the oldest sample). The ring's post-copy validation is the backstop, and a
+  // lapped copy is discarded, not handed out as mixed data.
+  const size_t span = static_cast<size_t>(std::min<uint64_t>(analyze_frames_, capacity_frames_));
 
   for (int attempt = 0; attempt < 2; ++attempt) {
     const uint64_t n1 = ring_.counter();

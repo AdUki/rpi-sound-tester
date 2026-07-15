@@ -48,6 +48,14 @@ class CaptureStore {
   void resume();
   CaptureStatus status() const;
 
+  // How many recent frames the next freeze will copy. Clamped to [kCaptureMinFrames,
+  // capacity_frames()]. Live-settable; not persisted, so it resets to the full capacity on
+  // restart. Changing it does not affect an already-frozen snapshot.
+  void set_analyze_frames(uint64_t frames);
+  uint64_t analyze_frames() const;
+  // The largest a freeze can be: the ring minus the copy safety margin. Fixed at construction.
+  uint64_t capacity_frames() const { return capacity_frames_; }
+
   // start/len are absolute sample indices on the shared counter axis. Serves the frozen
   // snapshot when frozen, otherwise best-effort from the live ring.
   WindowResult window(unsigned ch, uint64_t start, uint64_t len, unsigned cols) const;
@@ -65,6 +73,8 @@ class CaptureStore {
   mutable std::mutex m_;
   std::vector<float> snap_;  // interleaved, kInputs channels
   uint64_t snap_base_ = 0;   // absolute sample index of snap_[0]
+  uint64_t capacity_frames_ = 0;  // ring minus copy safety margin
+  uint64_t analyze_frames_ = 0;   // recent frames the next freeze copies (<= capacity_frames_)
   CaptureStatus status_;
 
   std::mutex fft_m_;

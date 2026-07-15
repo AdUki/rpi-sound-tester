@@ -1,5 +1,6 @@
 #include "capture.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -138,6 +139,41 @@ void test_window_returns_raw_and_columns() {
   for (size_t i = 0; i < cols.mins.size(); ++i) CHECK(cols.mins[i] <= cols.maxs[i]);
 }
 
+void test_analyze_length_is_configurable() {
+  RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
+  CaptureStore cap(ring, kRate, kPeriod);
+
+  // Default: a modest fixed window (kCaptureDefaultSeconds), capped at capacity.
+  CHECK(cap.capacity_frames() > 0);
+  const uint64_t expect_default =
+      std::min<uint64_t>(cap.capacity_frames(), static_cast<uint64_t>(kCaptureDefaultSeconds * kRate));
+  CHECK_EQ(cap.analyze_frames(), expect_default);
+
+  fill_with_delayed_copy(ring, 0, 400000, Stimulus::Broadband);
+
+  // A shorter analyze length freezes only that many of the most recent frames.
+  cap.set_analyze_frames(50000);
+  CHECK_EQ(cap.analyze_frames(), 50000u);
+  const CaptureStatus cs = cap.freeze(0);
+  CHECK(cs.frozen);
+  CHECK_EQ(cs.valid_len, 50000u);
+  CHECK_EQ(cs.valid_start, cs.freeze_sample - 50000);
+
+  // The window endpoint still serves within the (now shorter) frozen range, and rejects
+  // anything reaching before its start.
+  const WindowResult in = cap.window(0, cs.valid_start + 10, 1024, 512);
+  CHECK(in.ok);
+  const WindowResult before = cap.window(0, cs.valid_start - 100, 1024, 512);
+  CHECK(!before.ok);
+
+  // Out-of-band requests clamp instead of taking effect: too small pins to the floor, too
+  // large pins to the capacity.
+  cap.set_analyze_frames(1);
+  CHECK_EQ(cap.analyze_frames(), kCaptureMinFrames);
+  cap.set_analyze_frames(kRingFrames * 4);
+  CHECK_EQ(cap.analyze_frames(), cap.capacity_frames());
+}
+
 void test_window_rejects_out_of_range() {
   RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
   CaptureStore cap(ring, kRate, kPeriod);
@@ -157,5 +193,6 @@ int main() {
   test_xcorr_needs_a_freeze();
   test_window_returns_raw_and_columns();
   test_window_rejects_out_of_range();
+  test_analyze_length_is_configurable();
   return report("capture");
 }
