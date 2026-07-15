@@ -216,7 +216,8 @@ void WebServer::install_routes() {
           {"xcorr_max_len", kXcorrMaxLen},
           {"listen_chunk_frames", kListenChunkFrames},
           {"input_gain_min_db", kInputGainMinDb},
-          {"input_gain_max_db", kInputGainMaxDb}}},
+          {"input_gain_max_db", kInputGainMaxDb},
+          {"stream_mask", true}}},
         {"spectrum_freqs", d_.analysis.bin_freqs()},
     };
     send_json(res, j);
@@ -231,6 +232,29 @@ void WebServer::install_routes() {
         d_.ctl.inputs[ch].gain_db.store(
             std::clamp(j["gain_db"].get<float>(), kInputGainMinDb, kInputGainMaxDb));
       }
+    } catch (const std::exception& e) {
+      return send_error(res, 400, e.what());
+    }
+    send_json(res, json{{"ok", true}});
+  });
+
+  // Per-input telemetry mask. The console posts which inputs it is watching; disabled inputs are
+  // dropped from the spectrum message, the widest frame on the wire. Meters and the wave frame keep
+  // their fixed six-channel shape for compatibility with any console, and the console hides
+  // disabled inputs itself regardless. Global and last-writer-wins — this appliance has one
+  // operator; see docs/api.md.
+  svr.Post("/api/stream/inputs", [this](const httplib::Request& req, httplib::Response& res) {
+    try {
+      const json j = json::parse(req.body);
+      const auto& en = j.at("enabled");
+      if (!en.is_array() || en.size() != kInputs) {
+        return send_error(res, 400, "enabled must be an array of 6 booleans");
+      }
+      uint32_t mask = 0;
+      for (unsigned c = 0; c < kInputs; ++c) {
+        if (en[c].get<bool>()) mask |= (1u << c);
+      }
+      stream_mask_.store(mask, std::memory_order_relaxed);
     } catch (const std::exception& e) {
       return send_error(res, 400, e.what());
     }
@@ -652,8 +676,10 @@ void WebServer::run_publisher() {
 
     if (fire(spectrum)) {
       const AnalysisSnapshot s = d_.analysis.snapshot();
+      const uint32_t mask = stream_mask_.load(std::memory_order_relaxed);
       json chans = json::array();
       for (unsigned c = 0; c < kInputs; ++c) {
+        if (!(mask & (1u << c))) continue;   // console is not watching this input — skip its bins
         // Quantised to 0.1 dB, which is far finer than the display can resolve and far coarser
         // than a float's shortest round-trip decimal. Raw floats serialise every bin in full
         // ("-88.61194610595703"): 27.9 kB per spectrum message, against ~7 kB for this.

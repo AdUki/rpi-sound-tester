@@ -61,6 +61,10 @@ class WebServer {
   std::thread publisher_;
   std::atomic<bool> running_{false};
   std::atomic<unsigned> listen_streams_{0};
+  // Per-input telemetry mask, bit c set = input c streamed. A console masks the inputs it is not
+  // watching so the spectrum message (the widest frame) drops them. Written by POST
+  // /api/stream/inputs, read by the publisher. Process-global: one bench, one operator.
+  std::atomic<uint32_t> stream_mask_{0xffffffffu};
 
   // CPU load is a delta measurement with exactly one owner: the 1 Hz publisher samples it and
   // parks the whole SysInfo here, and the /api/state handler — which runs on an arbitrary web

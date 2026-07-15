@@ -160,6 +160,19 @@ envelope columns (~20 per tick). Frame rate is only a packing choice — the sco
 from the 200 columns/s. Pushing at 15 Hz finds an empty ring on a third of its ticks and sends
 nothing.
 
+### `POST /api/stream/inputs`
+Body: `{"enabled":[bool ×6]}`. Tells the daemon which inputs the console is watching; inputs set
+`false` are **dropped from the spectrum message**, the widest frame on the wire, so a console
+showing two of six inputs pulls roughly a third of the spectrum bandwidth. The meters message and
+the binary wave frame keep their fixed six-channel shape for compatibility with any console — the
+console hides disabled inputs on its own regardless.
+
+The mask is process-global and last-writer-wins: this is a single-operator bench, so two consoles
+disagreeing is out of scope. It resets to all-enabled on daemon restart; the console re-posts it on
+every WebSocket (re)connect. Support is advertised by `limits.stream_mask: true` in
+`GET /api/state`; a console that does not see the flag simply skips the POST and disables inputs
+client-side only.
+
 ## System
 
 ### `POST /api/config/save`
