@@ -1,6 +1,10 @@
 #include <CLI11.hpp>
+#include <atomic>
+#include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <memory>
+#include <thread>
 
 #include "analysis.h"
 #include "audio_engine.h"
@@ -16,9 +20,27 @@
 
 namespace {
 st::WebServer* g_server = nullptr;
+std::atomic<bool> g_stopping{false};
 
 void on_signal(int) {
+  g_stopping.store(true);
   if (g_server) g_server->stop();
+}
+
+// Bound how long a stop can take. Each WebSocket connection has a reader thread parked in a
+// blocking recv (see WsReadPump in webserver.cpp); a client still attached when we are asked to
+// stop leaves that recv blocked until the socket's read timeout, and the clean path joins it. The
+// daemon holds nothing a teardown must flush — config saves are explicit — so once a stop is
+// requested, give the clean path a moment and then hard-exit. The kernel reclaims the ALSA handle,
+// the mlock'd ring and the threads. Without this, a reboot from the web console would stall until
+// systemd's stop timeout fired SIGKILL.
+void start_shutdown_watchdog() {
+  std::thread([] {
+    using namespace std::chrono_literals;
+    while (!g_stopping.load()) std::this_thread::sleep_for(100ms);
+    std::this_thread::sleep_for(3s);
+    std::_Exit(0);
+  }).detach();
 }
 }  // namespace
 
@@ -110,6 +132,7 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
   std::signal(SIGPIPE, SIG_IGN);
+  start_shutdown_watchdog();
 
   const bool ok = server.start();
 

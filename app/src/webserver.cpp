@@ -87,6 +87,36 @@ json sysinfo_json(const SysInfo& si) {
         {"throttled_seen", si.throttle.throttled_seen}}}};
 }
 
+// The listen and telemetry handlers below only ever *send*. A send-only httplib WebSocket loop
+// never observes the browser's Close frame: read() is what processes it (flips is_open(), echoes
+// it so the browser can tear the TCP down) and what answers heartbeat pings — and nothing here
+// reads. So after a clean browser ws.close() the socket stays "open" from the server's side, and
+// the loop keeps streaming (a listen socket burning ~190 kB/s and one of the device's twelve
+// slots) until a *write* finally fails. That write does not fail on a clean close: the browser
+// holds the TCP connection open, draining, while it waits for the closing handshake we never
+// complete. So the audio keeps coming long after the user stopped listening.
+//
+// This pump gives the connection its reader: one side thread that just drains inbound frames, so
+// read() runs and the Close is seen within a chunk. It is the *only* reader, so it never races the
+// paced send (the sole writer) on the stream. A parked reader at shutdown is not joined out here —
+// its blocking recv only unwinds on the socket's 5-minute timeout — so main() hard-exits a couple
+// of seconds after a stop is requested rather than stalling the reboot on this join.
+class WsReadPump {
+ public:
+  explicit WsReadPump(httplib::ws::WebSocket& ws) {
+    thread_ = std::thread([&ws] {
+      std::string msg;
+      while (ws.read(msg) != httplib::ws::Fail) { /* clients send nothing but the closing frame */ }
+    });
+  }
+  ~WsReadPump() { if (thread_.joinable()) thread_.join(); }
+  WsReadPump(const WsReadPump&) = delete;
+  WsReadPump& operator=(const WsReadPump&) = delete;
+
+ private:
+  std::thread thread_;
+};
+
 // Binary wave frame: u8 type=1, u64 first column's sample index, u16 column count, then
 // ncols x 6 x {i16 min, i16 max}.
 std::string wave_frame(uint64_t first_col, const std::vector<EnvColumn>& cols) {
@@ -545,6 +575,7 @@ void WebServer::install_routes() {
 
   svr.WebSocket("/api/ws", [this](const httplib::Request&, httplib::ws::WebSocket& ws) {
     auto client = hub_.add();
+    WsReadPump pump(ws);   // notice a closed tab instead of streaming telemetry to it forever
     LOG_INFO("telemetry client connected ({} total)", hub_.clients());
     while (running_.load() && ws.is_open()) {
       WsMessagePtr m = hub_.wait(client, 250);
@@ -567,6 +598,11 @@ void WebServer::install_routes() {
       ws.close(httplib::ws::CloseStatus::InternalError, "too many listeners");
       return;
     }
+
+    // Notice a clean browser close promptly (see WsReadPump) — otherwise the stream keeps
+    // pushing audio and holding this slot until a write eventually fails. Declared after `slot`
+    // so its reader is joined before the slot is released.
+    WsReadPump pump(ws);
 
     LOG_INFO("listen ws opened on ch{}", ch);
     ListenPacer pacer(d_.ring, ch);
