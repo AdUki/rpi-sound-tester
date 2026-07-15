@@ -21,7 +21,7 @@
 <div id="syncbanner" class="banner hidden">
   <strong>I2S sync error detected.</strong>
   The card's TDM slots can rotate after this — verify your channel mapping in
-  <a href="#" data-tab="map">Channel map</a>.
+  <a href="#" data-tab="config">Configuration</a>.
 </div>
 
 <div id="powerbanner" class="banner hidden">
@@ -49,8 +49,7 @@
 <nav class="tabs">
   <button class="tab active" data-tab="dash">Dashboard</button>
   <button class="tab" data-tab="scope">Scope &amp; sync</button>
-  <button class="tab" data-tab="gen">Generators</button>
-  <button class="tab" data-tab="map">Channel map</button>
+  <button class="tab" data-tab="config">Configuration</button>
   <button class="tab" data-tab="sys">System</button>
 </nav>
 
@@ -104,7 +103,7 @@
   <div class="toolbar">
     <div class="tgrp tgrp-cap">
       <span class="tglabel">Capture</span>
-      <button id="freeze" class="primary">Freeze</button>
+      <button id="freeze" class="primary" title="Analyze pulls the full-resolution PCM buffer held on the device (the last several seconds) and holds it still — far more detail than the live 5 ms preview stream, so you can zoom in sample-by-sample and measure the delay between channels. Press again to go back to live.">Analyze</button>
       <button id="playpause">Pause</button>
       <button id="clear">Clear</button>
       <span id="capstate" class="live">live</span>
@@ -152,7 +151,18 @@
   <div id="lanes" class="lanes"></div>
 </section>
 
-<section id="gen" class="panel">
+<section id="config" class="panel">
+  <div class="card">
+    <h3>Capture buffer</h3>
+    <p class="muted small">How many seconds of full-resolution PCM the device holds when you press
+      <em>Analyze</em> on the scope. Longer means more history to inspect, but more RAM and a slower
+      freeze. Takes effect on the next Analyze.</p>
+    <label id="buflenwrap" class="buflen" hidden>Analyze buffer
+      <input id="buflen" type="number" min="0.5" step="0.5"> s
+      <span id="buflenmax" class="muted small"></span></label>
+    <p id="buflenna" class="muted small" hidden>This device's firmware doesn't support a configurable
+      capture buffer — reflash to enable it.</p>
+  </div>
   <div class="card">
     <h3>Sine</h3>
     <label>Frequency <input type="number" id="sineFreq" min="1" max="40000" step="1"> Hz</label>
@@ -187,9 +197,7 @@
     <h4>Recent emissions</h4>
     <div id="pinglog" class="mono small"></div>
   </div>
-</section>
 
-<section id="map" class="panel">
   <div class="card wide">
     <h3>Channel map</h3>
     <p class="muted">
@@ -210,6 +218,17 @@
     <button id="savemap" class="primary">Apply mapping</button>
     <span id="mapmsg" class="muted"></span>
   </div>
+
+  <div class="card wide">
+    <h3>Boot defaults</h3>
+    <p class="muted">
+      The root filesystem is read-only and settings live in RAM: the device always boots
+      into a known state. Save writes the current routing, generators and mapping to the
+      data partition so the next boot starts from them.
+    </p>
+    <button id="save" class="primary">Save as boot defaults</button>
+    <span id="cfgmsg" class="muted"></span>
+  </div>
 </section>
 
 <section id="sys" class="panel">
@@ -218,13 +237,10 @@
     <table id="systable"></table>
   </div>
   <div class="card wide">
-    <h3>Settings</h3>
-    <p class="muted">
-      The root filesystem is read-only and settings live in RAM: the device always boots
-      into a known state. Save writes the current routing, generators and mapping to the
-      data partition so the next boot starts from them.
-    </p>
-    <button id="save" class="primary">Save as boot defaults</button>
+    <h3>Maintenance</h3>
+    <p class="muted">Boot defaults, generators and the channel map are set in the
+      <a href="#" data-tab="config">Configuration</a> tab. Factory reset deletes the saved
+      settings so the next boot uses the image defaults.</p>
     <button id="reset">Factory reset</button>
     <button id="reboot" class="danger">Reboot</button>
     <button id="shutdown" class="danger">Shut down</button>

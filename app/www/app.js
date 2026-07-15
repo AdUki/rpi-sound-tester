@@ -588,7 +588,7 @@ function bindGenerators() {
 
 let pings = [];
 function refreshPings() {
-  if (!document.getElementById('gen').classList.contains('active') && !document.getElementById('scope').classList.contains('active')) return;
+  if (!document.getElementById('config').classList.contains('active') && !document.getElementById('scope').classList.contains('active')) return;
   api('/pings/recent').then(list => {
     pings = list;
     const el = $('pinglog');
@@ -708,7 +708,7 @@ function scopeMsg(text) {
 
 // The result box keeps its place in the layout whether or not it holds a result. Unhiding it
 // used to move the canvas the moment you had finished lining the cursors up on it.
-const XCORR_IDLE = 'Freeze, bracket one ping with cursor A and cursor B, then press Measure.';
+const XCORR_IDLE = 'Press Analyze, bracket one ping with cursor A and cursor B, then press Measure.';
 
 function clearResult() {
   const el = $('xcorrout');
@@ -722,15 +722,33 @@ function clearResult() {
 let winCache = {};
 let winTimer = null;
 let winSeq = 0;
+// The zoom the live view had when Freeze was pressed, so Resume returns to it instead of keeping
+// whatever narrow span you zoomed to while inspecting the snapshot. Null when not entered via Freeze.
+let frozenReturnLen = null;
+
+// The frozen snapshot is a fixed span — at most the server's ring (~11 s), often less — and its
+// window endpoint 400s outright for any request that reaches past [valid_start, valid_end). Keep
+// the frozen view inside that span: never zoom out wider than the snapshot, never pan off its ends.
+// Without this, widening the scope to 300 s (live-buffer depth) lets a freeze zoom or pan into
+// blank the snapshot can't fill, and the straddling fetch fails instead of returning what it has.
+function clampFrozenView() {
+  if (!srvFrozen()) return;
+  const cap = state.capture;
+  if (view.len > cap.valid_len) view.len = cap.valid_len;
+  const maxStart = cap.valid_start + cap.valid_len - view.len;
+  view.start = Math.max(cap.valid_start, Math.min(maxStart, view.start));
+}
 
 function invalidateWindows() {
   if (!srvFrozen()) return;
+  clampFrozenView();
   clearTimeout(winTimer);
   winTimer = setTimeout(fetchWindows, 120);
 }
 
 function fetchWindows() {
   if (!srvFrozen()) return;
+  clampFrozenView();
   const cap = state.capture;
   const lo = Math.max(view.start, cap.valid_start);
   const hi = Math.min(view.start + view.len, cap.valid_start + cap.valid_len);
@@ -799,6 +817,12 @@ function scopeTick() {
   requestAnimationFrame(scopeTick);
 }
 
+// The frozen trace is drawn icy blue, not the live green, so a held snapshot never looks like the
+// running signal. The dim variant is the provisional 5 ms envelope shown until the sharp window lands.
+const WAVE_LIVE = '#3ecf8e';
+const WAVE_FROZEN = '#5ac8fa';
+const WAVE_FROZEN_DIM = '#2f6d8a';
+
 function drawScope() {
   const cv = $('scopecanvas');
   const w = cv.clientWidth;
@@ -840,6 +864,7 @@ function drawScope() {
   // at, so the preview would be a lie; at that zoom we wait for the real samples instead.
   const envUsable = view.len >= 8 * envColumnFrames;
   let provisional = false;
+  const wave = srvFrozen() ? WAVE_FROZEN : WAVE_LIVE;
 
   shown.forEach((ch, row) => {
     const top = row * lh, mid = top + lh / 2;
@@ -853,7 +878,7 @@ function drawScope() {
     g.fillStyle = '#8b93a3';
     g.fillText('IN ' + (ch + 1), 6, top + 14);
 
-    g.strokeStyle = '#3ecf8e';
+    g.strokeStyle = wave;
     let drew = false;
     const half = lh / 2 - 6;
     const yOf = s => mid - Math.max(-1, Math.min(1, s)) * half;
@@ -878,7 +903,7 @@ function drawScope() {
         }
         g.stroke();
         if (pxPer >= 5) {
-          g.fillStyle = '#3ecf8e';
+          g.fillStyle = wave;
           for (let i = 0; i < win.samples.length; i++) {
             g.fillRect(toX(win.start + i) - 1.5, yOf(win.samples[i]) - 1.5, 3, 3);
           }
@@ -897,9 +922,9 @@ function drawScope() {
       } else if (envUsable) {
         // Nothing fetched for this region yet. Draw the envelope columns, dimmed and clipped to
         // what the snapshot actually holds, so the freeze is instant and the trace only sharpens.
-        g.strokeStyle = '#2b6e52';
+        g.strokeStyle = WAVE_FROZEN_DIM;
         drew = drawEnvLane(ch, yOf, cap.valid_start, cap.valid_start + cap.valid_len);
-        g.strokeStyle = '#3ecf8e';
+        g.strokeStyle = wave;
         provisional = provisional || drew;
       }
       if (!drew) {
@@ -1026,7 +1051,7 @@ function initScope() {
     if (!srvFrozen()) {
       updateFollow(true);
       if (len < envColumnFrames * 8) {
-        scopeMsg('The live view is 5 ms min/max columns — freeze to zoom down to samples.');
+        scopeMsg('The live view is 5 ms min/max columns — press Analyze to zoom down to samples.');
       }
     }
     invalidateWindows();
@@ -1067,17 +1092,19 @@ function initScope() {
         paused = false;
         held = false;
         winCache = {};
-        $('freeze').textContent = 'Freeze';
+        $('freeze').textContent = 'Analyze';
         setCapState('live', '');
         clearResult();
         scopeMsg('');
+        if (frozenReturnLen != null) { view.len = frozenReturnLen; frozenReturnLen = null; }
         if (envCols.length) view.start = envCols[envCols.length - 1].sample - view.len;
         scopeDirty = true;
       }).catch(e => scopeMsg(e.message));
     } else {
+      frozenReturnLen = view.len;
       post('/capture/freeze').then(cs => {
         state.capture = cs;
-        $('freeze').textContent = 'Resume';
+        $('freeze').textContent = 'Live';
         setCapState('frozen', frozenDetail(cs));
         scopeMsg('');
         fetchWindows();
@@ -1095,7 +1122,7 @@ function initScope() {
       paused = false;
       held = false;
       clearResult();
-      $('freeze').textContent = 'Freeze';
+      $('freeze').textContent = 'Analyze';
       setCapState('live', '');
       scopeMsg('');
       scopeDirty = true;
@@ -1127,7 +1154,7 @@ function initScope() {
     if (!srvFrozen()) {
       updateFollow(true);
       if (len < envColumnFrames * 8) {
-        scopeMsg('The live view is 5 ms min/max columns — freeze to zoom down to samples.');
+        scopeMsg('The live view is 5 ms min/max columns — press Analyze to zoom down to samples.');
       }
     }
     invalidateWindows();
@@ -1167,7 +1194,7 @@ function initScope() {
 
   $('measure').onclick = () => {
     if (!srvFrozen()) {
-      scopeMsg('Freeze first — the delay is measured on the frozen snapshot.');
+      scopeMsg('Press Analyze first — the delay is measured on the captured snapshot.');
       return;
     }
     if (cursorA === null || cursorB === null) {
@@ -1281,8 +1308,8 @@ function buildSystem() {
   $('databanner').classList.toggle('hidden', s.data_persistent !== false);
 
   $('save').onclick = () => post('/config/save')
-    .then(r => { $('sysmsg').textContent = 'saved to ' + r.path; })
-    .catch(e => { $('sysmsg').textContent = e.message; });
+    .then(r => { $('cfgmsg').textContent = 'saved to ' + r.path; })
+    .catch(e => { $('cfgmsg').textContent = e.message; });
   $('reset').onclick = () => {
     if (!confirm('Delete the saved settings? The next boot will use the image defaults.')) return;
     post('/config/reset')
@@ -1366,6 +1393,34 @@ function connect() {
   };
 }
 
+// The analyze/PCM buffer-length control. Shown only when the daemon advertises
+// limits.capture_config (older daemons that predate POST /api/capture/config leave it hidden,
+// same forward-compatible pattern as the input stream mask). Sets how many seconds of
+// full-resolution PCM the device copies on the next Analyze; the reply echoes the clamped value.
+function initBufLen() {
+  const wrap = $('buflenwrap'), inp = $('buflen'), na = $('buflenna'), maxEl = $('buflenmax');
+  if (!wrap || !inp) return;
+  const supported = state.limits.capture_config && state.capture.analyze_frames !== undefined;
+  wrap.hidden = !supported;
+  if (na) na.hidden = supported;
+  if (!supported) return;
+  const maxS = Math.floor((state.limits.capture_max_frames || 0) / rate);
+  inp.max = maxS;
+  inp.value = (state.capture.analyze_frames / rate).toFixed(1);
+  if (maxEl) maxEl.textContent = `(max ${maxS} s)`;
+  inp.onchange = () => {
+    const s = parseFloat(inp.value);
+    if (!(s > 0)) { inp.value = (state.capture.analyze_frames / rate).toFixed(1); return; }
+    post('/capture/config', {seconds: s})
+      .then(r => {
+        state.capture.analyze_frames = r.analyze_frames;
+        inp.value = r.analyze_seconds.toFixed(1);   // reflect the clamp
+        if (maxEl) maxEl.textContent = `(max ${Math.floor(r.max_seconds)} s · applies on next Analyze)`;
+      })
+      .catch(e => { if (maxEl) maxEl.textContent = e.message; });
+  };
+}
+
 api('/state').then(s => {
   state = s;
   rate = s.engine.rate || 96000;
@@ -1385,12 +1440,13 @@ api('/state').then(s => {
   buildLanes();
   buildSystem();
   initScope();
+  initBufLen();
   // The capture is shared and outlives a reload: pressing Freeze then reloading finds it already
   // frozen. Reflect that, AND load the snapshot — position the view over the frozen range and
   // fetch its windows. Without this the lanes sit on "loading…" forever, because on a fresh load
   // nothing else pulls the frozen data (the poll only fetches on a live→frozen transition).
   if (srvFrozen()) {
-    $('freeze').textContent = 'Resume';
+    $('freeze').textContent = 'Live';
     setCapState('frozen', frozenDetail(state.capture));
     view.start = state.capture.freeze_sample - view.len;
     fetchWindows();
@@ -1408,7 +1464,7 @@ api('/state').then(s => {
     state.capture = s2.capture;
     // Another browser (or curl) may have frozen or resumed the shared capture.
     if (srvFrozen() !== wasFrozen) {
-      $('freeze').textContent = srvFrozen() ? 'Resume' : 'Freeze';
+      $('freeze').textContent = srvFrozen() ? 'Live' : 'Analyze';
       if (srvFrozen()) setCapState('frozen', frozenDetail(state.capture));
       else setCapState('live', '');
       if (srvFrozen()) fetchWindows(); else { winCache = {}; paused = false; }

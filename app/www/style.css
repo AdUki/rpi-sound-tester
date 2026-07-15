@@ -194,6 +194,8 @@ input[type="number"], select {
   font: inherit;
 }
 input[type="range"] { vertical-align: middle; width: 140px; }
+.buflen { color: var(--muted); white-space: nowrap; }
+.buflen input[type="number"] { width: 3.8em; padding: 0.2rem 0.35rem; }
 
 button {
   background: var(--panel);
