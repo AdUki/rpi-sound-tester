@@ -36,7 +36,8 @@ do_configure:prepend() {
     rm -rf ${S}/build ${S}/build-vec
 }
 
-# 32-bit ARM NEON cannot vectorize float loops without this; see app/CMakeLists.txt.
+# Release only; the NEON float-vectorization flag for 32-bit ARM is auto-detected in
+# app/CMakeLists.txt (ST_UNSAFE_MATH defaults on for arm32).
 EXTRA_OECMAKE = "-DCMAKE_BUILD_TYPE=Release"
 
 do_install:append() {

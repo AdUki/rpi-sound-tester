@@ -46,12 +46,19 @@ void prefault_stack() {
 }  // namespace
 
 AudioEngine::AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt)
-    : ctl_(ctl), ring_(ring), opt_(opt) {
-  gen_.init(opt_.rate);
-  identify_frames_ = static_cast<uint64_t>(kIdentifySeconds * opt_.rate);
-}
+    : ctl_(ctl), ring_(ring), opt_(opt) {}
 
 AudioEngine::~AudioEngine() { stop(); }
+
+void AudioEngine::set_error(std::string msg) {
+  std::lock_guard<std::mutex> lock(err_m_);
+  last_error_ = std::move(msg);
+}
+
+std::string AudioEngine::error() const {
+  std::lock_guard<std::mutex> lock(err_m_);
+  return last_error_;
+}
 
 EngineStats AudioEngine::stats() const {
   EngineStats s;
@@ -59,14 +66,14 @@ EngineStats AudioEngine::stats() const {
   s.sim = opt_.sim;
   s.device = opt_.sim ? "simulator" : opt_.device;
   s.rate = opt_.rate;
-  s.period = opt_.period;
+  s.period = period_.load(std::memory_order_relaxed);
   s.periods = opt_.periods;
-  s.capture_channels = opt_.sim ? kInputs : cap_ch_;
+  s.capture_channels = opt_.sim ? kInputs : cap_ch_.load(std::memory_order_relaxed);
   s.format = opt_.sim ? "float32 (simulated)" : "S32_LE";
   s.xruns = xruns_.load();
   s.generation = generation_.load();
   s.samples = ring_.counter();
-  s.last_error = last_error_;
+  s.last_error = error();
   return s;
 }
 
@@ -76,53 +83,53 @@ bool AudioEngine::configure(snd_pcm_t* pcm, unsigned channels, const char* what)
 
   int err = snd_pcm_hw_params_any(pcm, hw);
   if (err < 0) {
-    last_error_ = std::string(what) + ": hw_params_any: " + snd_strerror(err);
+    set_error(std::string(what) + ": hw_params_any: " + snd_strerror(err));
     return false;
   }
 
   err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
   if (err < 0) {
-    last_error_ = std::string(what) + ": set_access: " + snd_strerror(err);
+    set_error(std::string(what) + ": set_access: " + snd_strerror(err));
     return false;
   }
 
   err = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S32_LE);
   if (err < 0) {
-    last_error_ = std::string(what) + ": S32_LE not available: " + snd_strerror(err);
+    set_error(std::string(what) + ": S32_LE not available: " + snd_strerror(err));
     return false;
   }
 
   err = snd_pcm_hw_params_set_channels(pcm, hw, channels);
   if (err < 0) {
-    last_error_ = std::string(what) + ": " + std::to_string(channels) +
-                  " channels not available: " + snd_strerror(err);
+    set_error(std::string(what) + ": " + std::to_string(channels) +
+                  " channels not available: " + snd_strerror(err));
     return false;
   }
 
   err = snd_pcm_hw_params_set_rate(pcm, hw, opt_.rate, 0);
   if (err < 0) {
-    last_error_ = std::string(what) + ": rate " + std::to_string(opt_.rate) +
-                  " not available: " + snd_strerror(err);
+    set_error(std::string(what) + ": rate " + std::to_string(opt_.rate) +
+                  " not available: " + snd_strerror(err));
     return false;
   }
 
   snd_pcm_uframes_t period = opt_.period;
   err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, nullptr);
   if (err < 0) {
-    last_error_ = std::string(what) + ": set_period_size: " + snd_strerror(err);
+    set_error(std::string(what) + ": set_period_size: " + snd_strerror(err));
     return false;
   }
 
   snd_pcm_uframes_t buffer = static_cast<snd_pcm_uframes_t>(opt_.period) * opt_.periods;
   err = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
   if (err < 0) {
-    last_error_ = std::string(what) + ": set_buffer_size: " + snd_strerror(err);
+    set_error(std::string(what) + ": set_buffer_size: " + snd_strerror(err));
     return false;
   }
 
   err = snd_pcm_hw_params(pcm, hw);
   if (err < 0) {
-    last_error_ = std::string(what) + ": hw_params: " + snd_strerror(err);
+    set_error(std::string(what) + ": hw_params: " + snd_strerror(err));
     return false;
   }
 
@@ -130,6 +137,7 @@ bool AudioEngine::configure(snd_pcm_t* pcm, unsigned channels, const char* what)
     LOG_WARN("{}: driver chose period {} (asked {})", what, static_cast<unsigned>(period),
              opt_.period);
     opt_.period = static_cast<unsigned>(period);
+    period_.store(opt_.period, std::memory_order_relaxed);
   }
   LOG_INFO("{}: {} ch, {} Hz, S32_LE, period {}, buffer {}", what, channels, opt_.rate,
            static_cast<unsigned>(period), static_cast<unsigned>(buffer));
@@ -138,7 +146,7 @@ bool AudioEngine::configure(snd_pcm_t* pcm, unsigned channels, const char* what)
   snd_pcm_sw_params_alloca(&sw);
   err = snd_pcm_sw_params_current(pcm, sw);
   if (err < 0) {
-    last_error_ = std::string(what) + ": sw_params_current: " + snd_strerror(err);
+    set_error(std::string(what) + ": sw_params_current: " + snd_strerror(err));
     return false;
   }
   // Nothing may auto-start: the linked group is started once, explicitly, so capture and
@@ -147,14 +155,16 @@ bool AudioEngine::configure(snd_pcm_t* pcm, unsigned channels, const char* what)
   snd_pcm_sw_params_set_avail_min(pcm, sw, opt_.period);
   err = snd_pcm_sw_params(pcm, sw);
   if (err < 0) {
-    last_error_ = std::string(what) + ": sw_params: " + snd_strerror(err);
+    set_error(std::string(what) + ": sw_params: " + snd_strerror(err));
     return false;
   }
   return true;
 }
 
 bool AudioEngine::open_alsa() {
-  const unsigned deadline_ms = opt_.open_retry_s * 1000;
+  // Give the device node this long to appear per attempt; thread_entry() retries the whole
+  // open forever on the same cadence.
+  const unsigned deadline_ms = kReopenDelayS * 1000;
   unsigned waited = 0;
   int err = 0;
 
@@ -164,8 +174,8 @@ bool AudioEngine::open_alsa() {
     err = snd_pcm_open(&capture_, opt_.device.c_str(), SND_PCM_STREAM_CAPTURE, 0);
     if (err >= 0) break;
     if (waited >= deadline_ms) {
-      last_error_ = "cannot open capture device " + opt_.device + ": " + snd_strerror(err);
-      LOG_ERROR("{}", last_error_);
+      set_error("cannot open capture device " + opt_.device + ": " + snd_strerror(err));
+      LOG_ERROR("{}", error());
       return false;
     }
     if (waited == 0) LOG_WARN("waiting for {} to appear ({})", opt_.device, snd_strerror(err));
@@ -175,8 +185,8 @@ bool AudioEngine::open_alsa() {
 
   err = snd_pcm_open(&playback_, opt_.device.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
   if (err < 0) {
-    last_error_ = "cannot open playback device " + opt_.device + ": " + snd_strerror(err);
-    LOG_ERROR("{}", last_error_);
+    set_error("cannot open playback device " + opt_.device + ": " + snd_strerror(err));
+    LOG_ERROR("{}", error());
     close_alsa();
     return false;
   }
@@ -189,12 +199,12 @@ bool AudioEngine::open_alsa() {
     }
     // The driver only widens capture to 8 TDM slots while a stream is open; if it refuses,
     // the plain 6 ADC channels always work.
-    LOG_WARN("{} — retrying capture with {} channels", last_error_, kInputs);
+    LOG_WARN("{} — retrying capture with {} channels", error(), kInputs);
     snd_pcm_close(capture_);
     capture_ = nullptr;
     err = snd_pcm_open(&capture_, opt_.device.c_str(), SND_PCM_STREAM_CAPTURE, 0);
     if (err < 0) {
-      last_error_ = std::string("reopen capture: ") + snd_strerror(err);
+      set_error(std::string("reopen capture: ") + snd_strerror(err));
       close_alsa();
       return false;
     }
@@ -213,8 +223,8 @@ bool AudioEngine::open_alsa() {
   err = snd_pcm_link(capture_, playback_);
   if (err < 0) {
     // Without a linked start the two streams have an unknown offset between them.
-    last_error_ = std::string("snd_pcm_link failed: ") + snd_strerror(err);
-    LOG_ERROR("{}", last_error_);
+    set_error(std::string("snd_pcm_link failed: ") + snd_strerror(err));
+    LOG_ERROR("{}", error());
     close_alsa();
     return false;
   }
@@ -236,7 +246,7 @@ void AudioEngine::close_alsa() {
 bool AudioEngine::prefill_and_start() {
   int err = snd_pcm_prepare(capture_);
   if (err < 0) {
-    last_error_ = std::string("prepare: ") + snd_strerror(err);
+    set_error(std::string("prepare: ") + snd_strerror(err));
     return false;
   }
 
@@ -246,14 +256,14 @@ bool AudioEngine::prefill_and_start() {
   for (unsigned i = 0; i < 3; ++i) {
     snd_pcm_sframes_t w = snd_pcm_writei(playback_, raw_out_.data(), opt_.period);
     if (w < 0) {
-      last_error_ = std::string("prefill writei: ") + snd_strerror(static_cast<int>(w));
+      set_error(std::string("prefill writei: ") + snd_strerror(static_cast<int>(w)));
       return false;
     }
   }
 
   err = snd_pcm_start(capture_);
   if (err < 0) {
-    last_error_ = std::string("start: ") + snd_strerror(err);
+    set_error(std::string("start: ") + snd_strerror(err));
     return false;
   }
   return true;
@@ -403,10 +413,9 @@ void AudioEngine::run_alsa() {
   while (running_.load(std::memory_order_relaxed)) {
     snd_pcm_sframes_t got = snd_pcm_readi(capture_, raw_in_.data(), opt_.period);
     if (got < 0) {
-      if (!recover(static_cast<int>(got))) {
-        running_.store(false);
-        return;
-      }
+      // An unrecoverable xrun ends this stream, not the engine: thread_entry() closes the
+      // card and reopens it, the same never-fatal path as a failed open.
+      if (!recover(static_cast<int>(got))) return;
       continue;
     }
     const size_t frames = static_cast<size_t>(got);
@@ -414,18 +423,17 @@ void AudioEngine::run_alsa() {
 
     // Snapshot the channel maps once per block; loading an atomic per sample would keep
     // the conversion loops scalar.
+    const unsigned cap_ch = cap_ch_.load(std::memory_order_relaxed);
     unsigned imap[kInputs];
     unsigned omap[kOutputs];
     for (unsigned c = 0; c < kInputs; ++c) {
       const unsigned slot = ctl_.input_map[c].load(std::memory_order_relaxed);
-      imap[c] = slot < cap_ch_ ? slot : c;
+      imap[c] = slot < cap_ch ? slot : c;
     }
     for (unsigned c = 0; c < kOutputs; ++c) {
       const unsigned slot = ctl_.output_map[c].load(std::memory_order_relaxed);
       omap[c] = slot < kOutputs ? slot : c;
     }
-
-    const unsigned cap_ch = cap_ch_;
     for (unsigned c = 0; c < kInputs; ++c) {
       const int32_t* src = raw_in_.data() + imap[c];
       float* dst = in6_.data() + c;
@@ -445,10 +453,7 @@ void AudioEngine::run_alsa() {
       snd_pcm_sframes_t w =
           snd_pcm_writei(playback_, raw_out_.data() + written * kOutputs, frames - written);
       if (w < 0) {
-        if (!recover(static_cast<int>(w))) {
-          running_.store(false);
-          return;
-        }
+        if (!recover(static_cast<int>(w))) return;
         break;
       }
       written += static_cast<size_t>(w);
@@ -464,12 +469,7 @@ void AudioEngine::run_sim() {
   clock_gettime(CLOCK_MONOTONIC, &next);
 
   uint64_t seed = 0x9e3779b97f4a7c15ull;
-  auto noise = [&seed]() {
-    seed ^= seed >> 12;
-    seed ^= seed << 25;
-    seed ^= seed >> 27;
-    return static_cast<float>((seed * 0x2545f4914f6cdd1dull) >> 40) / 8388608.0f - 1.0f;
-  };
+  auto noise = [&seed] { return xorshift_white(seed); };
 
   while (running_.load(std::memory_order_relaxed)) {
     const uint64_t n = ring_.counter();
@@ -519,7 +519,7 @@ void* AudioEngine::thread_entry(void* self) {
   // is the only way to find out why. The error is reported through /api/state instead.
   while (e->running_.load()) {
     if (!e->open_alsa()) {
-      LOG_ERROR("{} — retrying in {} s", e->last_error_, kReopenDelayS);
+      LOG_ERROR("{} — retrying in {} s", e->error(), kReopenDelayS);
       e->wait_before_retry();
       continue;
     }
@@ -527,14 +527,14 @@ void* AudioEngine::thread_entry(void* self) {
     e->size_buffers();
 
     if (!e->prefill_and_start()) {
-      LOG_ERROR("cannot start stream: {} — retrying in {} s", e->last_error_, kReopenDelayS);
+      LOG_ERROR("cannot start stream: {} — retrying in {} s", e->error(), kReopenDelayS);
       e->close_alsa();
       e->wait_before_retry();
       continue;
     }
 
     LOG_INFO("stream running");
-    e->last_error_.clear();
+    e->set_error({});
     e->streaming_.store(true);
     e->run_alsa();
     e->streaming_.store(false);
@@ -555,7 +555,7 @@ void AudioEngine::wait_before_retry() {
 void AudioEngine::size_buffers() {
   // The driver may have renegotiated the period, so size the DSP buffers only once it has
   // agreed to something.
-  raw_in_.assign(static_cast<size_t>(opt_.period) * cap_ch_, 0);
+  raw_in_.assign(static_cast<size_t>(opt_.period) * cap_ch_.load(std::memory_order_relaxed), 0);
   raw_out_.assign(static_cast<size_t>(opt_.period) * kOutputs, 0);
   in6_.assign(static_cast<size_t>(opt_.period) * kInputs, 0.0f);
   out8_.assign(static_cast<size_t>(opt_.period) * kOutputs, 0.0f);
@@ -567,7 +567,8 @@ void AudioEngine::size_buffers() {
 }
 
 bool AudioEngine::start() {
-  cap_ch_ = opt_.capture_channels;
+  cap_ch_.store(opt_.capture_channels, std::memory_order_relaxed);
+  period_.store(opt_.period, std::memory_order_relaxed);
   size_buffers();
 
   if (opt_.sim) {
@@ -585,7 +586,7 @@ bool AudioEngine::start() {
   const int rc = pthread_create(&thread_, &attr, &AudioEngine::thread_entry, this);
   pthread_attr_destroy(&attr);
   if (rc != 0) {
-    last_error_ = "cannot create audio thread";
+    set_error("cannot create audio thread");
     running_.store(false);
     return false;
   }

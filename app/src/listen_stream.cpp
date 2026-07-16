@@ -2,6 +2,8 @@
 
 #include <time.h>
 
+#include <string>
+
 #include "util/dsp.h"
 #include "util/log.h"
 
@@ -14,42 +16,53 @@ void sleep_ms(long ms) {
   nanosleep(&ts, nullptr);
 }
 
-}  // namespace
-
-ListenPacer::ListenPacer(const RingBuffer& ring, unsigned ch, unsigned chunk_frames)
-    : ring_(ring), ch_(ch), chunk_(chunk_frames), cursor_(ring.counter()), buf_(chunk_frames) {}
-
-bool ListenPacer::wait_and_read(const std::atomic<bool>& running, uint64_t* start, bool* skipped) {
+// The pacing loop both pacer classes share: sleep until the next chunk exists, skip forward to
+// live audio when the listener has fallen behind the ring, and advance the cursor only once
+// `read(cursor)` — the one thing the two pacers do differently — has succeeded.
+template <class ReadFn>
+bool pace(const RingBuffer& ring, unsigned chunk, uint64_t* cursor,
+          const std::atomic<bool>& running, uint64_t* start, bool* skipped,
+          const std::string& who, ReadFn read) {
   if (skipped) *skipped = false;
   while (running.load()) {
-    const uint64_t now = ring_.counter();
+    const uint64_t now = ring.counter();
 
-    if (now < cursor_ + chunk_) {
+    if (now < *cursor + chunk) {
       sleep_ms(5);
       continue;
     }
 
     // A listener that has fallen behind the ring cannot be served the samples it wants;
     // skipping forward to live audio beats sending nothing.
-    const uint64_t oldest = ring_.oldest(now);
-    if (cursor_ < oldest) {
-      LOG_WARN("listener on ch{} fell behind by {} frames — skipping to live", ch_,
-               oldest - cursor_);
-      cursor_ = now - chunk_;
+    const uint64_t oldest = ring.oldest(now);
+    if (*cursor < oldest) {
+      LOG_WARN("{} fell behind by {} frames — skipping to live", who, oldest - *cursor);
+      *cursor = now - chunk;
       if (skipped) *skipped = true;
     }
 
-    if (!ring_.read_channel(cursor_, chunk_, ch_, buf_.data())) {
-      cursor_ = ring_.counter() - chunk_;
+    if (!read(*cursor)) {
+      *cursor = ring.counter() - chunk;
       if (skipped) *skipped = true;
       continue;
     }
 
-    *start = cursor_;
-    cursor_ += chunk_;
+    *start = *cursor;
+    *cursor += chunk;
     return true;
   }
   return false;
+}
+
+}  // namespace
+
+ListenPacer::ListenPacer(const RingBuffer& ring, unsigned ch, unsigned chunk_frames)
+    : ring_(ring), ch_(ch), chunk_(chunk_frames), cursor_(ring.counter()), buf_(chunk_frames) {}
+
+bool ListenPacer::wait_and_read(const std::atomic<bool>& running, uint64_t* start, bool* skipped) {
+  return pace(ring_, chunk_, &cursor_, running, start, skipped,
+              "listener on ch" + std::to_string(ch_),
+              [this](uint64_t cur) { return ring_.read_channel(cur, chunk_, ch_, buf_.data()); });
 }
 
 bool ListenPacer::next(const std::atomic<bool>& running, std::vector<int16_t>* out,
@@ -72,43 +85,20 @@ MultiListenPacer::MultiListenPacer(const RingBuffer& ring, unsigned chunk_frames
 
 bool MultiListenPacer::next_float(const std::atomic<bool>& running, const float** out,
                                   uint64_t* start, bool* skipped) {
-  if (skipped) *skipped = false;
-  while (running.load()) {
-    const uint64_t now = ring_.counter();
-
-    if (now < cursor_ + chunk_) {
-      sleep_ms(5);
-      continue;
-    }
-
-    const uint64_t oldest = ring_.oldest(now);
-    if (cursor_ < oldest) {
-      LOG_WARN("multichannel listener fell behind by {} frames — skipping to live",
-               oldest - cursor_);
-      cursor_ = now - chunk_;
-      if (skipped) *skipped = true;
-    }
-
-    if (!ring_.read_interleaved(cursor_, chunk_, buf_.data())) {
-      cursor_ = ring_.counter() - chunk_;
-      if (skipped) *skipped = true;
-      continue;
-    }
-
-    *start = cursor_;
-    cursor_ += chunk_;
-    *out = buf_.data();
-    return true;
+  if (!pace(ring_, chunk_, &cursor_, running, start, skipped, "multichannel listener",
+            [this](uint64_t cur) { return ring_.read_interleaved(cur, chunk_, buf_.data()); })) {
+    return false;
   }
-  return false;
+  *out = buf_.data();
+  return true;
 }
 
-StreamSlot::StreamSlot(std::atomic<unsigned>& active, unsigned limit)
+StreamSlot::StreamSlot(std::atomic<unsigned>& active, unsigned limit, const char* what)
     : active_(active), limit_(limit) {
   unsigned cur = active_.load();
   for (;;) {
     if (cur >= limit_) {
-      LOG_WARN("refusing listen stream: {} already active", cur);
+      LOG_WARN("refusing {} stream: {} already active", what, cur);
       return;
     }
     if (active_.compare_exchange_weak(cur, cur + 1)) {

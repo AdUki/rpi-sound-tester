@@ -14,7 +14,6 @@ using namespace st;
 
 namespace {
 
-constexpr double kPi = 3.14159265358979323846;
 constexpr unsigned kRate96 = 96000;
 
 // A linear chirp: a sharp autocorrelation peak, so a cross-correlation recovers a delay cleanly.

@@ -31,9 +31,6 @@ class RingBuffer {
 
   ~RingBuffer() { munlock(buf_.data(), buf_.size() * sizeof(float)); }
 
-  size_t frames() const { return frames_; }
-  unsigned channels() const { return channels_; }
-
   uint64_t counter() const { return n_.load(std::memory_order_acquire); }
 
   // Oldest sample index a reader may still ask for, given the current write head.
@@ -60,7 +57,9 @@ class RingBuffer {
   bool read_channel(uint64_t start, size_t len, unsigned ch, float* out) const {
     if (ch >= channels_ || len == 0 || len > frames_) return false;
     const uint64_t n1 = n_.load(std::memory_order_acquire);
-    if (start + len > n1) return false;
+    // start > n1 - len is the overflow-safe form of start + len > n1: a caller that computed
+    // start by subtracting below zero must fail here, not wrap into a "valid" range.
+    if (n1 < len || start > n1 - len) return false;
     if (n1 - start > frames_ - safety_) return false;
 
     for (size_t i = 0; i < len; ++i) {
@@ -77,7 +76,7 @@ class RingBuffer {
   bool read_interleaved(uint64_t start, size_t len, float* out) const {
     if (len == 0 || len > frames_) return false;
     const uint64_t n1 = n_.load(std::memory_order_acquire);
-    if (start + len > n1) return false;
+    if (n1 < len || start > n1 - len) return false;  // overflow-safe start + len > n1
     if (n1 - start > frames_ - safety_) return false;
 
     const size_t idx = static_cast<size_t>(start & mask_);
@@ -91,8 +90,6 @@ class RingBuffer {
     const uint64_t n2 = n_.load(std::memory_order_relaxed);
     return n2 - start <= frames_;
   }
-
-  const float* raw() const { return buf_.data(); }
 
  private:
   const size_t frames_;

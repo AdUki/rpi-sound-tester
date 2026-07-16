@@ -37,13 +37,13 @@ on a laptop.
 sudo apt install libopus-dev libogg-dev   # the daemon links these (plus libasound2-dev)
 git clone --recurse-submodules <url>   # the header-only libraries are submodules; --init works after the fact
 make            # list every target
-make test       # generators, ring buffer, xcorr, wav, config, opus
+make test       # generators, ring buffer, xcorr, wav, config, opus, dsp
 make run        # http://localhost:8080, simulated card
 ```
 
-Then: route the ping generator to OUT 1/2/3, go to **Scope**, **Freeze**, bracket a ping with
-the cursors and **Measure delay** — IN 1→IN 2 reads exactly 137 samples, IN 1→IN 3 exactly
-274.
+Then: route the ping generator to OUT 1/2/3, go to **Scope & sync**, press **Analyze**,
+bracket a ping with the cursors and press **Measure** — IN 1→IN 2 reads exactly 137 samples,
+IN 1→IN 3 exactly 274.
 
 ## Build the image
 
@@ -69,9 +69,9 @@ make flash DISK=/dev/mmcblk0   # shows what it will erase, then asks before writ
 directory; it warns if the target is not flagged removable (normal for a card in a built-in
 reader, but also what an internal drive looks like). Add `DEV=1` to flash the dev image.
 
-Plain poky and bitbake — no kas, no pip. `make yocto-setup` is three `git clone`s and two
-generated conf files (`yocto/conf/*.sample`); `make bitbake-shell` drops you into the usual
-bitbake environment if you want to poke at it by hand.
+Plain poky and bitbake — no kas, no pip. The first `make image` clones the three layers and
+generates the two conf files (from `yocto/conf/*.sample`) on its own; `make bitbake` with no
+ARGS drops you into the usual bitbake environment if you want to poke at it by hand.
 
 Two images:
 
@@ -85,8 +85,8 @@ hand (`aplay -l`, `speaker-test`, `arecord`). The production image is what ships
 so `journalctl -u soundtesterd -f` on the device is the usual way to watch the daemon.
 
 Settings changed in the web UI live in RAM: the device always boots into a known state.
-**System → Save as boot defaults** writes them to a small ext4 partition (briefly remounted
-read-write), which is also where the SSH host keys live so they survive a reboot.
+**Configuration → Save as boot defaults** writes them to a small ext4 partition (briefly
+remounted read-write), which is also where the SSH host keys live so they survive a reboot.
 
 ## How it fits together
 
@@ -97,7 +97,7 @@ nothing but the include path points at it.
 
 ```
 Octo 6-in ──ALSA──▶ AUDIO THREAD (SCHED_FIFO 80, mlocked ring)
-                    read 8ch → remap → ring buffer (float32, ~11 s) + sample counter n
+                    read 8ch → remap → ring buffer (float32, ~87 s) + sample counter n
                     generators driven by n, routed per output
 Octo 8-out ◀─ALSA── remap → write 8ch      (streams snd_pcm_link'ed: one clock, one start)
                     ├── ANALYSIS (10 Hz): meters, 8192-pt FFT, THD+N, scope columns
@@ -123,7 +123,8 @@ atomic (a torn `{type, index}` would index out of bounds in the audio thread).
 app/            C++17 daemon + vanilla-JS web console (no build step)
   src/          engine, generators, analysis, capture, web server
   tests/        ctest: ping spacing, ring seqlock under a concurrent writer,
-                xcorr known-lag recovery, WAV header, config round-trip
+                xcorr known-lag recovery, WAV header, config round-trip,
+                Opus cross-channel alignment, dsp conversions
   third_party/  submodules: cpp-httplib, pocketfft, nlohmann/json, spdlog, CLI11
                 (header-only, pinned at a tag — pocketfft at a commit, it has no tags)
 yocto/

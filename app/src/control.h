@@ -161,4 +161,38 @@ inline bool parse_ping(const std::string& s, PingVariant* out) {
   return false;
 }
 
+inline const char* noise_name(NoiseMode m) {
+  return m == NoiseMode::Pink ? "pink" : "white";
+}
+
+inline bool parse_noise(const std::string& s, NoiseMode* out) {
+  if (s == "white") { *out = NoiseMode::White; return true; }
+  if (s == "pink") { *out = NoiseMode::Pink; return true; }
+  return false;
+}
+
+inline const char* codec_name(ListenCodec c) {
+  return c == ListenCodec::Opus ? "opus" : "pcm";
+}
+
+inline bool parse_codec(const std::string& s, ListenCodec* out) {
+  if (s == "pcm") { *out = ListenCodec::Pcm; return true; }
+  if (s == "opus") { *out = ListenCodec::Opus; return true; }
+  return false;
+}
+
+// The audio loop writes each physical slot exactly once, via the channel maps. A map that is
+// not a permutation would leave one slot never written (stale audio) and let two logical
+// channels fight over another, so both the config loader and the web handler reject it.
+template <class Vec>
+inline bool is_slot_permutation(const Vec& v, unsigned limit) {
+  bool seen[kTdmSlots] = {false};
+  for (const auto& e : v) {
+    const long x = static_cast<long>(e);
+    if (x < 0 || x >= static_cast<long>(limit) || seen[x]) return false;
+    seen[x] = true;
+  }
+  return true;
+}
+
 }  // namespace st

@@ -22,20 +22,22 @@ size_t next_pow2(size_t n) {
 
 CaptureStore::CaptureStore(const RingBuffer& ring, double rate, unsigned period)
     : ring_(ring), rate_(rate), period_(period) {
-  snap_.assign(kRingFrames * kInputs, 0.0f);
-  mlock(snap_.data(), snap_.size() * sizeof(float));
   // The copy margin scales with the ring: a fixed period count is fine at 24 MB but far too
   // thin once a 192 MB memcpy needs room to finish before the writer laps its start.
   const size_t margin = std::max<size_t>(kFreezeHeadroomPeriods * period_, kRingFrames / 32);
-  capacity_frames_ = kRingFrames - margin;
-  // Default to a modest window, capped at capacity, so a fresh freeze is quick out of the box.
-  analyze_frames_ = std::min<uint64_t>(
-      capacity_frames_, static_cast<uint64_t>(kCaptureDefaultSeconds * rate_));
+  max_frames_ = kRingFrames - margin;
+  // A freeze can never copy more than max_frames_, so the margin's worth of snapshot memory
+  // would be pinned for nothing.
+  snap_.assign(max_frames_ * kInputs, 0.0f);
+  mlock(snap_.data(), snap_.size() * sizeof(float));
+  // Default to a modest window, capped at the maximum, so a fresh freeze is quick out of the box.
+  analyze_frames_ =
+      std::min<uint64_t>(max_frames_, static_cast<uint64_t>(kCaptureDefaultSeconds * rate_));
 }
 
 void CaptureStore::set_analyze_frames(uint64_t frames) {
   std::lock_guard<std::mutex> lock(m_);
-  analyze_frames_ = std::clamp<uint64_t>(frames, kCaptureMinFrames, capacity_frames_);
+  analyze_frames_ = std::clamp<uint64_t>(frames, kCaptureMinFrames, max_frames_);
 }
 
 uint64_t CaptureStore::analyze_frames() const {
@@ -47,10 +49,10 @@ CaptureStatus CaptureStore::freeze(uint32_t generation) {
   std::lock_guard<std::mutex> lock(m_);
 
   // Copy at most the configured analyze length, and never more than the ring can safely hand
-  // out (capacity_frames_ keeps a margin below the write head so the copy finishes before the
+  // out (max_frames_ keeps a margin below the write head so the copy finishes before the
   // writer laps the oldest sample). The ring's post-copy validation is the backstop, and a
   // lapped copy is discarded, not handed out as mixed data.
-  const size_t span = static_cast<size_t>(std::min<uint64_t>(analyze_frames_, capacity_frames_));
+  const size_t span = static_cast<size_t>(std::min<uint64_t>(analyze_frames_, max_frames_));
 
   for (int attempt = 0; attempt < 2; ++attempt) {
     const uint64_t n1 = ring_.counter();
@@ -63,7 +65,6 @@ CaptureStatus CaptureStore::freeze(uint32_t generation) {
       continue;
     }
 
-    snap_base_ = start;
     status_.frozen = true;
     status_.freeze_sample = n1;
     status_.valid_start = start;
@@ -92,10 +93,17 @@ CaptureStatus CaptureStore::status() const {
 bool CaptureStore::snapshot_read(unsigned ch, uint64_t start, uint64_t len, float* out) const {
   if (!status_.frozen || ch >= kInputs) return false;
   if (start < status_.valid_start) return false;
-  if (start + len > status_.valid_start + status_.valid_len) return false;
-  const uint64_t off = start - snap_base_;
+  const uint64_t off = start - status_.valid_start;
+  // off > valid_len - len is the overflow-safe form of start + len > valid_start + valid_len:
+  // a huge start from the query string must fail here, not wrap into a "valid" offset.
+  if (len > status_.valid_len || off > status_.valid_len - len) return false;
   for (uint64_t i = 0; i < len; ++i) out[i] = snap_[(off + i) * kInputs + ch];
   return true;
+}
+
+std::string CaptureStore::frozen_range_error() const {
+  return "outside the frozen range [" + std::to_string(status_.valid_start) + ", " +
+         std::to_string(status_.valid_start + status_.valid_len) + ")";
 }
 
 WindowResult CaptureStore::window(unsigned ch, uint64_t start, uint64_t len, unsigned cols) const {
@@ -115,8 +123,7 @@ WindowResult CaptureStore::window(unsigned ch, uint64_t start, uint64_t len, uns
     std::lock_guard<std::mutex> lock(m_);
     if (status_.frozen) {
       if (!snapshot_read(ch, start, len, buf.data())) {
-        r.error = "outside the frozen range [" + std::to_string(status_.valid_start) + ", " +
-                  std::to_string(status_.valid_start + status_.valid_len) + ")";
+        r.error = frozen_range_error();
         return r;
       }
     } else if (!ring_.read_channel(start, static_cast<size_t>(len), ch, buf.data())) {
@@ -188,8 +195,7 @@ XcorrResult CaptureStore::xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, ui
     }
     if (!snapshot_read(ch_a, start, len, fa_.data()) ||
         !snapshot_read(ch_b, start, len, fb_.data())) {
-      r.error = "outside the frozen range [" + std::to_string(status_.valid_start) + ", " +
-                std::to_string(status_.valid_start + status_.valid_len) + ")";
+      r.error = frozen_range_error();
       return r;
     }
   }

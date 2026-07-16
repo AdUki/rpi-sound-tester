@@ -12,7 +12,12 @@ struct PingShape {
   float tau_s;  // exponential decay time constant
 };
 
-PingShape ping_shape(PingVariant v);
+// The per-output Identify pattern: kIdentifyBursts tone bursts of kIdentifyBurstS each,
+// separated by equally long gaps. identify_sample() renders it; AudioEngine derives the
+// total override length (identify_frames_) from kIdentifySeconds.
+inline constexpr double kIdentifyBurstS = 0.1;
+inline constexpr unsigned kIdentifyBursts = 3;
+inline constexpr double kIdentifySeconds = (2 * kIdentifyBursts - 1) * kIdentifyBurstS;
 
 // Owned exclusively by the audio thread. All timing derives from the absolute sample
 // counter, so generated audio and captured audio share one time axis.
@@ -25,7 +30,7 @@ class Generators {
   void render(uint64_t n, size_t frames, const Control& ctl, float* sine, float* noise,
               float* ping, PingLog& log);
 
-  // 3 short 1 kHz bursts used by the per-output Identify button.
+  // Renders the Identify pattern (short 1 kHz bursts) sample by sample.
   float identify_sample(uint64_t elapsed) const;
 
  private:

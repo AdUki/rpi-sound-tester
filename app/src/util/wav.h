@@ -6,16 +6,15 @@
 
 namespace st {
 
-// A 44-byte canonical WAV header whose RIFF and data sizes are 0xFFFFFFFF.
+// A 44-byte canonical WAV header (16-bit mono PCM, the only shape the daemon streams) whose
+// RIFF and data sizes are 0xFFFFFFFF.
 //
 // FFmpeg's wav demuxer (so Chrome) special-cases 0xFFFFFFFF as "unknown length" and reads
 // until the connection ends; VLC ignores a declared size larger than the stream. Players
 // that do trust the size stop after 4 GiB, which at 96 kHz 16-bit mono is ~6.2 hours.
-inline std::string endless_wav_header(unsigned rate, unsigned channels = 1,
-                                      unsigned bits = 16) {
+inline std::string endless_wav_header(unsigned rate) {
   const uint32_t kUnknown = 0xFFFFFFFFu;
-  const uint16_t block_align = static_cast<uint16_t>(channels * bits / 8);
-  const uint32_t byte_rate = rate * block_align;
+  const uint16_t block_align = 2;  // 1 channel x 16 bits
 
   std::string h(44, '\0');
   char* p = h.data();
@@ -29,11 +28,11 @@ inline std::string endless_wav_header(unsigned rate, unsigned channels = 1,
   tag("fmt ");
   put32(16);
   put16(1);  // PCM
-  put16(static_cast<uint16_t>(channels));
+  put16(1);  // mono
   put32(rate);
-  put32(byte_rate);
+  put32(rate * block_align);
   put16(block_align);
-  put16(static_cast<uint16_t>(bits));
+  put16(16);  // bits per sample
   tag("data");
   put32(kUnknown);
   return h;

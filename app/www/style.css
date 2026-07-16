@@ -2,6 +2,7 @@
   --bg: #14161a;
   --panel: #1c1f26;
   --line: #2c313b;
+  --well: #0e1014;   /* the dark inset canvases, meters and inputs share */
   --fg: #e6e9ef;
   --muted: #8b93a3;
   --accent: #4da3ff;
@@ -152,8 +153,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .monitor .mlabel { font-weight: 600; flex: 0 0 auto; }
 .monitor .mnote { flex: 1 1 20rem; min-width: 0; }
 .monitor input[type="range"] { width: 220px; }
+/* Deliberately narrower than the monitor sliders: the bitrate shares a row with the codec select. */
+#listenbitrate { width: 120px; }
 
-.meter { height: 10px; background: #0e1014; border-radius: 3px; overflow: hidden; position: relative; margin: 0.35rem 0; }
+.meter { height: 10px; background: var(--well); border-radius: 3px; overflow: hidden; position: relative; margin: 0.35rem 0; }
 .meter .rms { height: 100%; background: var(--good); width: 0%; transition: width 80ms linear; }
 .meter .peak { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--fg); left: 0; }
 
@@ -180,18 +183,18 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
    not shuffle the text after it. */
 .val { display: inline-block; min-width: 5ch; text-align: right; font-variant-numeric: tabular-nums; }
 
-canvas.mini { width: 100%; height: 54px; display: block; margin-top: 0.5rem; background: #0e1014; border-radius: 3px; }
+canvas.mini { width: 100%; height: 54px; display: block; margin-top: 0.5rem; background: var(--well); border-radius: 3px; }
 
 /* The height must be in CSS as well as on the element. A canvas takes its intrinsic ratio from
    its width/height attributes, and with only height="520" and width:100% the element claims a
    ~2370 px tall box until drawScope() first writes cv.width — the page reflows under you. */
-#scopecanvas { width: 100%; height: 520px; display: block; background: #0e1014; border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; }
+#scopecanvas { width: 100%; height: 520px; display: block; background: var(--well); border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; }
 
 label { display: block; margin: 0.5rem 0; color: var(--muted); }
 label input, label select { margin-left: 0.35rem; }
 
 input[type="number"], select {
-  background: #0e1014;
+  background: var(--well);
   border: 1px solid var(--line);
   color: var(--fg);
   border-radius: 4px;
@@ -246,7 +249,7 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 .tgrp-del { grid-area: del; }
 .tgrp-view { grid-area: view; }
 /* The cursor row is a readout, not a control: give it the canvas's own well. */
-.tgrp-cur { grid-area: cur; background: #0e1014; }
+.tgrp-cur { grid-area: cur; background: var(--well); }
 
 .tglabel {
   flex: 0 0 auto;
@@ -258,7 +261,7 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 .toolbar label { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0; white-space: nowrap; }
 .arrow { color: var(--muted); }
 
-/* "Freeze" and "Resume" are not the same width in a proportional font, and it leads its group. */
+/* "Analyze" and "Live" are not the same width in a proportional font, and it leads its group. */
 #freeze { min-width: 6.5rem; }
 
 /* Play/Pause reuses the button styling; a fixed min keeps the label swap from resizing the
@@ -270,11 +273,14 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
    fourth part of the IN → IN selector. */
 #measure { margin-left: 0.6rem; }
 
-/* The zoom readout — how much time the whole canvas width is showing. Its slot is reserved and
-   the digits are tabular, so changing zoom moves the value but nothing after it. */
+/* The zoom and buffered readouts — their slots are reserved and the digits tabular, so a value
+   changing moves nothing after it (the buffered figure is rewritten ~once a second as history
+   fills, and would otherwise shuffle the Ping-markers checkbox). */
 .zlvl { display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap; }
 .zkey { color: var(--muted); font-size: 0.75rem; }
-#zoomlevel { display: inline-block; min-width: 8ch; font-variant-numeric: tabular-nums; }
+#zoomlevel, #buflevel { display: inline-block; font-variant-numeric: tabular-nums; }
+#zoomlevel { min-width: 8ch; }
+#buflevel { min-width: 6ch; }   /* widest reading: "999 ms" */
 
 /* A three-word vocabulary — live, paused, frozen — so the state itself can never resize the
    group. Everything explanatory goes in #capdetail, which is the one elastic item in the whole
@@ -373,9 +379,9 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 .lm { padding: 0.1rem 0.45rem; font-size: 0.72rem; line-height: 1.5; }
 
 /* Shared spectrogram controls, shown below the lanes only while at least one lane is a spectrogram. */
-.specctl { display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap; margin-top: 0.5rem; }
-.specctl label { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; white-space: nowrap; }
-.specctl #sghover { margin-left: auto; }
+.sgctl { display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap; margin-top: 0.5rem; }
+.sgctl label { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; white-space: nowrap; }
+.sgctl #sghover { margin-left: auto; }
 
 .maps { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
 .maps label { display: flex; align-items: center; gap: 0.5rem; }
@@ -419,6 +425,9 @@ td:first-child { color: var(--muted); width: 40%; }
 .muted { color: var(--muted); }
 .small { font-size: 0.8rem; }
 .hidden { display: none; }
+/* The UA's [hidden] rule loses to any display: the flex on .sgctl would otherwise keep the
+   spectrogram controls visible after el.hidden = true. */
+[hidden] { display: none !important; }
 
 @media (max-width: 700px) {
   .maps { grid-template-columns: 1fr; }
@@ -433,7 +442,6 @@ td:first-child { color: var(--muted); width: 40%; }
 }
 .corelabel {
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   min-width: 2.6rem;
 }
 .corebar {
@@ -453,7 +461,6 @@ td:first-child { color: var(--muted); width: 40%; }
 .corefill.hot { background: var(--warn); }
 .coreval {
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   min-width: 6.5rem;
   text-align: right;
 }

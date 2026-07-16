@@ -21,13 +21,19 @@ void test_json_round_trip() {
   a.outputs[1].source_index = "ping";
   a.outputs[1].mute = true;
   a.inputs[2].gain_db = 18.5f;
+  a.periods = 6;
+  a.capture_channels = 6;
   a.sine_freq_hz = 996.09375f;
+  a.sine_level_db = -12.0f;
   a.noise_mode = "pink";
+  a.noise_level_db = -18.0f;
   a.ping_variant = "bong";
   a.ping_interval_s = 3.5f;
+  a.ping_level_db = -24.0f;
   a.input_map = {5, 4, 3, 2, 1, 0};
   a.output_map = {7, 6, 5, 4, 3, 2, 1, 0};
   a.input_names[0] = "left speaker";
+  a.output_names[7] = "sub";
   a.loopback_offset_samples = 4321;
   a.listen_codec = "opus";
   a.listen_bitrate_kbps = 128;
@@ -48,13 +54,19 @@ void test_json_round_trip() {
   CHECK_EQ(b.outputs[1].mute, true);
   CHECK_EQ(b.inputs[2].gain_db, 18.5f);
   CHECK_EQ(b.inputs[0].gain_db, 0.0f);
+  CHECK_EQ(b.periods, 6u);
+  CHECK_EQ(b.capture_channels, 6u);
   CHECK_EQ(b.sine_freq_hz, 996.09375f);
+  CHECK_EQ(b.sine_level_db, -12.0f);
   CHECK_EQ(b.noise_mode, std::string("pink"));
+  CHECK_EQ(b.noise_level_db, -18.0f);
   CHECK_EQ(b.ping_variant, std::string("bong"));
   CHECK_EQ(b.ping_interval_s, 3.5f);
+  CHECK_EQ(b.ping_level_db, -24.0f);
   CHECK_EQ(b.input_map[0], 5);
   CHECK_EQ(b.output_map[0], 7);
   CHECK_EQ(b.input_names[0], std::string("left speaker"));
+  CHECK_EQ(b.output_names[7], std::string("sub"));
   CHECK_EQ(b.loopback_offset_samples, 4321);
   CHECK_EQ(b.listen_codec, std::string("opus"));
   CHECK_EQ(b.listen_bitrate_kbps, 128);
@@ -114,17 +126,33 @@ void test_defaults_are_silent_and_identity_mapped() {
 }
 
 // A saved config is a file on a partition anyone with the SD card can edit, so an out-of-range
-// gain must be clamped on the way in, not trusted. +80 dB would be 10000x on the capture path.
-void test_input_gain_is_clamped() {
+// value must be clamped on the way in, not trusted. +80 dB would be 10000x on the capture path.
+void test_saved_values_are_clamped() {
   Config c;
   c.inputs[0].gain_db = 80.0f;
   c.inputs[1].gain_db = -30.0f;
+  c.outputs[0].gain_db = 10.0f;
+  c.sine_level_db = 10.0f;
+  c.ping_interval_s = 0.01f;
 
   Control ctl;
   c.apply_to(ctl);
 
   CHECK_EQ(ctl.inputs[0].gain_db.load(), kInputGainMaxDb);
   CHECK_EQ(ctl.inputs[1].gain_db.load(), kInputGainMinDb);
+  CHECK_EQ(ctl.outputs[0].gain_db.load(), kLevelMaxDb);
+  CHECK_EQ(ctl.sine.level_db.load(), kLevelMaxDb);
+  CHECK_EQ(ctl.ping.interval_s.load(), kPingIntervalMinS);
+}
+
+// A hand-edited output source may omit "index" entirely; the parse must fall back, not abort
+// the daemon at boot.
+void test_source_without_index_parses() {
+  Config c;
+  std::string err;
+  CHECK(Config::from_json(R"({"outputs": [{"source": {"type": "silence"}}]})", &c, &err));
+  CHECK_EQ(c.outputs[0].source_type, std::string("silence"));
+  CHECK_EQ(c.outputs[0].source_index, std::string(""));
 }
 
 void test_garbage_is_rejected() {
@@ -140,7 +168,8 @@ int main() {
   test_json_round_trip();
   test_control_round_trip();
   test_defaults_are_silent_and_identity_mapped();
-  test_input_gain_is_clamped();
+  test_saved_values_are_clamped();
+  test_source_without_index_parses();
   test_garbage_is_rejected();
   return report("config");
 }

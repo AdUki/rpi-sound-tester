@@ -1,10 +1,9 @@
 #pragma once
 
 #include <atomic>
-#include <mutex>
+#include <cstdint>
 #include <string>
 #include <thread>
-#include <vector>
 
 namespace st {
 
@@ -19,10 +18,10 @@ class KmsgWatch {
   void stop();
 
   uint32_t sync_errors() const { return sync_errors_.load(); }
-  std::vector<std::string> recent() const;
 
-  // Test hook (also used by the acceptance check): pretend this line came from the kernel.
-  void inject(const std::string& line);
+  // Classifies one kernel line; run() feeds it every /dev/kmsg record. Public so that
+  // POST /api/system/inject-kmsg (and the acceptance check) can feed synthetic lines.
+  void process_line(const std::string& line);
 
  private:
   void run();
@@ -30,9 +29,6 @@ class KmsgWatch {
   std::thread thread_;
   std::atomic<bool> running_{false};
   std::atomic<uint32_t> sync_errors_{0};
-
-  mutable std::mutex m_;
-  std::vector<std::string> recent_;
 };
 
 }  // namespace st

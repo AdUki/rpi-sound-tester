@@ -17,15 +17,12 @@ namespace st {
 struct ChannelMeters {
   float rms_db = kMinDb;
   float peak_db = kMinDb;
-  float dc = 0.0f;
 };
 
 struct ToneMetrics {
   bool valid = false;
   float freq_hz = 0.0f;
-  float level_db = kMinDb;
   float thd_n_pct = 0.0f;
-  float thd_n_db = 0.0f;
 };
 
 struct EnvColumn {
@@ -86,7 +83,6 @@ class Analysis {
 
   AnalysisSnapshot snapshot() const;
   EnvelopeRing& envelope() { return env_; }
-  const std::vector<float>& bin_freqs() const { return bin_freqs_; }
 
  private:
   void run();
@@ -111,7 +107,6 @@ class Analysis {
   std::vector<std::complex<float>> spec_;
   std::vector<float> power_;  // |X|^2 per FFT bin
 
-  std::vector<float> bin_freqs_;  // centre frequency of each display bin
   std::array<std::pair<unsigned, unsigned>, kSpectrumBins> bin_ranges_{};
 
   std::array<float, kInputs> peak_hold_{};

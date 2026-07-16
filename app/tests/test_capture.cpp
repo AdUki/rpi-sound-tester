@@ -35,7 +35,7 @@ void fill_with_delayed_copy(RingBuffer& ring, int64_t delay, uint64_t frames, St
       for (unsigned i = 0; i < 600; ++i) {
         const double t = i / kRate;
         const float env = std::exp(-static_cast<float>(t) / 0.0004f);
-        src[tick + i] += 0.8f * env * static_cast<float>(std::sin(2 * M_PI * 3000.0 * t));
+        src[tick + i] += 0.8f * env * static_cast<float>(std::sin(2 * kPi * 3000.0 * t));
       }
     }
   }
@@ -143,10 +143,10 @@ void test_analyze_length_is_configurable() {
   RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
   CaptureStore cap(ring, kRate, kPeriod);
 
-  // Default: a modest fixed window (kCaptureDefaultSeconds), capped at capacity.
-  CHECK(cap.capacity_frames() > 0);
+  // Default: a modest fixed window (kCaptureDefaultSeconds), capped at the maximum.
+  CHECK(cap.max_frames() > 0);
   const uint64_t expect_default =
-      std::min<uint64_t>(cap.capacity_frames(), static_cast<uint64_t>(kCaptureDefaultSeconds * kRate));
+      std::min<uint64_t>(cap.max_frames(), static_cast<uint64_t>(kCaptureDefaultSeconds * kRate));
   CHECK_EQ(cap.analyze_frames(), expect_default);
 
   fill_with_delayed_copy(ring, 0, 400000, Stimulus::Broadband);
@@ -167,11 +167,11 @@ void test_analyze_length_is_configurable() {
   CHECK(!before.ok);
 
   // Out-of-band requests clamp instead of taking effect: too small pins to the floor, too
-  // large pins to the capacity.
+  // large pins to the maximum.
   cap.set_analyze_frames(1);
   CHECK_EQ(cap.analyze_frames(), kCaptureMinFrames);
   cap.set_analyze_frames(kRingFrames * 4);
-  CHECK_EQ(cap.analyze_frames(), cap.capacity_frames());
+  CHECK_EQ(cap.analyze_frames(), cap.max_frames());
 }
 
 void test_window_rejects_out_of_range() {
@@ -183,6 +183,11 @@ void test_window_rejects_out_of_range() {
   const WindowResult bad = cap.window(0, cs.freeze_sample + 10000, 1024, 512);
   CHECK(!bad.ok);
   CHECK(!bad.error.empty());
+
+  // A huge start (a negative number pushed through the query string's u64 parse) must fail
+  // the range check, not wrap start + len around and index far outside the snapshot.
+  const WindowResult wrapped = cap.window(0, ~0ull - 500, 1024, 512);
+  CHECK(!wrapped.ok);
 }
 
 }  // namespace

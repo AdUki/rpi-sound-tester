@@ -35,6 +35,8 @@ void send_error(httplib::Response& res, int status, const std::string& msg) {
   send_json(res, json{{"error", msg}}, status);
 }
 
+void send_ok(httplib::Response& res) { send_json(res, json{{"ok", true}}); }
+
 bool parse_index(const httplib::Request& req, const char* name, unsigned limit, unsigned* out) {
   auto it = req.path_params.find(name);
   if (it == req.path_params.end()) return false;
@@ -44,27 +46,76 @@ bool parse_index(const httplib::Request& req, const char* name, unsigned limit, 
   return true;
 }
 
+// The scaffold every mutating JSON handler shares: parse the body, turn a parse/type error
+// into a 400, and answer {"ok":true} unless the handler already sent its own reply.
+template <class Fn>
+auto json_route(Fn fn) {
+  return [fn](const httplib::Request& req, httplib::Response& res) {
+    try {
+      fn(json::parse(req.body), req, res);
+    } catch (const std::exception& e) {
+      return send_error(res, 400, e.what());
+    }
+    if (res.body.empty()) send_ok(res);
+  };
+}
+
+// json_route for the per-channel routes: the 404 for a bad channel must win over the 400 for
+// a bad body, so the index check runs before the body is parsed.
+template <class Fn>
+auto json_channel_route(const char* name, unsigned limit, const char* missing, Fn fn) {
+  return [=](const httplib::Request& req, httplib::Response& res) {
+    unsigned ch = 0;
+    if (!parse_index(req, name, limit, &ch)) return send_error(res, 404, missing);
+    json_route([fn, ch](const json& j, const httplib::Request& r, httplib::Response& s) {
+      fn(ch, j, r, s);
+    })(req, res);
+  };
+}
+
 uint64_t query_u64(const httplib::Request& req, const char* key, uint64_t fallback) {
   if (!req.has_param(key)) return fallback;
   return std::strtoull(req.get_param_value(key).c_str(), nullptr, 10);
 }
 
+// A listen stream's ?bitrate= override. When absent, every encode() call re-reads the live
+// daemon default, so an active stream follows POST /api/listen/codec bitrate changes.
+struct BitrateOverride {
+  bool fixed = false;
+  int kbps = 0;
+};
+
+BitrateOverride query_bitrate(const httplib::Request& req) {
+  BitrateOverride b;
+  b.fixed = req.has_param("bitrate");
+  if (b.fixed) b.kbps = static_cast<int>(query_u64(req, "bitrate", 0));
+  return b;
+}
+
+int effective_kbps(const BitrateOverride& b, const Control& ctl) {
+  return b.fixed ? b.kbps : ctl.listen.bitrate_kbps.load();
+}
+
 json meters_json(const AnalysisSnapshot& s) {
-  json rms = json::array(), peak = json::array(), dc = json::array();
+  json rms = json::array(), peak = json::array();
   for (unsigned c = 0; c < kInputs; ++c) {
     rms.push_back(s.meters[c].rms_db);
     peak.push_back(s.meters[c].peak_db);
-    dc.push_back(s.meters[c].dc);
   }
-  return json{{"type", "meters"}, {"n", s.sample}, {"rms_db", rms}, {"peak_db", peak}, {"dc", dc}};
+  return json{{"type", "meters"}, {"sample", s.sample}, {"rms_db", rms}, {"peak_db", peak}};
 }
 
 json tone_json(const ToneMetrics& t) {
-  return json{{"valid", t.valid},
-              {"freq_hz", t.freq_hz},
-              {"level_db", t.level_db},
-              {"thd_n_pct", t.thd_n_pct},
-              {"thd_n_db", t.thd_n_db}};
+  return json{{"valid", t.valid}, {"freq_hz", t.freq_hz}, {"thd_n_pct", t.thd_n_pct}};
+}
+
+// The five fields shared by /api/state, /api/capture/freeze and /api/capture/status.
+json capture_json(const CaptureStatus& cs) {
+  return json{{"frozen", cs.frozen},
+              {"freeze_sample", cs.freeze_sample},
+              {"valid_start", cs.valid_start},
+              {"valid_len", cs.valid_len},
+              {"generation", cs.generation}};
 }
 
 // The host-health fields, identical in GET /api/state and the 1 Hz WS system message, so that
@@ -118,9 +169,9 @@ class WsReadPump {
   std::thread thread_;
 };
 
-// Binary wave frame: u8 type=1, u64 first column's sample index, u16 column count, then
+// Binary envelope frame: u8 type=1, u64 first column's sample index, u16 column count, then
 // ncols x 6 x {i16 min, i16 max}.
-std::string wave_frame(uint64_t first_col, const std::vector<EnvColumn>& cols) {
+std::string envelope_frame(uint64_t first_col, const std::vector<EnvColumn>& cols) {
   std::string out;
   out.resize(11 + cols.size() * kInputs * 4);
   char* p = out.data();
@@ -165,16 +216,24 @@ void WebServer::install_routes() {
       std::lock_guard<std::mutex> lk(sys_m_);
       si = sys_;
     }
+    // Copies, because a concurrent /api/config/save may replace d_.config.
+    std::vector<std::string> in_names, out_names;
+    int64_t loopback_offset = 0;
+    {
+      std::lock_guard<std::mutex> lk(config_m_);
+      in_names = d_.config.input_names;
+      out_names = d_.config.output_names;
+      loopback_offset = d_.config.loopback_offset_samples;
+    }
 
     json sys_json = sysinfo_json(si);
     sys_json.update(json{{"sync_errors", d_.kmsg.sync_errors()},
-                         {"sync_lines", d_.kmsg.recent()},
                          {"hostname", si.hostname},
                          {"ips", si.ips},
                          {"has_saved_config", d_.store.has_saved()},
                          {"data_persistent", d_.store.is_persistent()},
                          {"listen_streams", listen_streams_.load()},
-                         {"loopback_offset_samples", d_.config.loopback_offset_samples}});
+                         {"loopback_offset_samples", loopback_offset}});
 
     json outs = json::array();
     for (unsigned i = 0; i < kOutputs; ++i) {
@@ -187,17 +246,17 @@ void WebServer::install_routes() {
       } else if (t == SourceType::Gen) {
         src["index"] = gen_name(static_cast<GenId>(idx));
       }
-      outs.push_back({{"channel", i},
+      outs.push_back({{"ch", i},
                       {"source", src},
                       {"gain_db", d_.ctl.outputs[i].gain_db.load()},
                       {"mute", d_.ctl.outputs[i].mute.load()},
-                      {"name", d_.config.output_names[i]}});
+                      {"name", out_names[i]}});
     }
 
     json ins = json::array();
     for (unsigned i = 0; i < kInputs; ++i) {
-      ins.push_back({{"channel", i},
-                     {"name", d_.config.input_names[i]},
+      ins.push_back({{"ch", i},
+                     {"name", in_names[i]},
                      {"gain_db", d_.ctl.inputs[i].gain_db.load()},
                      {"rms_db", as.meters[i].rms_db},
                      {"peak_db", as.meters[i].peak_db},
@@ -208,26 +267,23 @@ void WebServer::install_routes() {
     for (unsigned i = 0; i < kInputs; ++i) imap.push_back(d_.ctl.input_map[i].load());
     for (unsigned i = 0; i < kOutputs; ++i) omap.push_back(d_.ctl.output_map[i].load());
 
+    json cap = capture_json(cs);
+    cap["analyze_frames"] = d_.capture.analyze_frames();
+
     json j{
         {"inputs", ins},
         {"outputs", outs},
         {"generators",
          {{"sine", {{"freq_hz", d_.ctl.sine.freq_hz.load()}, {"level_db", d_.ctl.sine.level_db.load()}}},
           {"noise",
-           {{"mode", d_.ctl.noise.mode.load() == static_cast<uint8_t>(NoiseMode::Pink) ? "pink" : "white"},
+           {{"mode", noise_name(static_cast<NoiseMode>(d_.ctl.noise.mode.load()))},
             {"level_db", d_.ctl.noise.level_db.load()}}},
           {"ping",
            {{"variant", ping_name(static_cast<PingVariant>(d_.ctl.ping.variant.load()))},
             {"interval_s", d_.ctl.ping.interval_s.load()},
             {"level_db", d_.ctl.ping.level_db.load()}}}}},
         {"channel_map", {{"input_map", imap}, {"output_map", omap}}},
-        {"capture",
-         {{"frozen", cs.frozen},
-          {"freeze_sample", cs.freeze_sample},
-          {"valid_start", cs.valid_start},
-          {"valid_len", cs.valid_len},
-          {"analyze_frames", d_.capture.analyze_frames()},
-          {"generation", cs.generation}}},
+        {"capture", cap},
         {"engine",
          {{"running", es.running},
           {"sim", es.sim},
@@ -244,127 +300,100 @@ void WebServer::install_routes() {
         {"system", sys_json},
         {"limits",
          {{"env_column_frames", kEnvColumnFrames},
-          {"ring_frames", kRingFrames},
-          {"capture_max_frames", d_.capture.capacity_frames()},
+          {"capture_max_frames", d_.capture.max_frames()},
           {"capture_config", true},
-          {"xcorr_max_len", kXcorrMaxLen},
-          {"listen_chunk_frames", kListenChunkFrames},
           {"input_gain_min_db", kInputGainMinDb},
           {"input_gain_max_db", kInputGainMaxDb},
-          {"stream_mask", true},
+          {"telemetry_mask", true},
           {"listen_codecs",
            opus_rate_supported(es.rate) ? json::array({"pcm", "opus"}) : json::array({"pcm"})},
-          {"listen_default_codec",
-           d_.ctl.listen.codec.load() == static_cast<uint8_t>(ListenCodec::Opus) ? "opus" : "pcm"},
+          {"listen_default_codec", codec_name(static_cast<ListenCodec>(d_.ctl.listen.codec.load()))},
           {"listen_bitrate_kbps", d_.ctl.listen.bitrate_kbps.load()},
           {"listen_bitrate_min_kbps", kListenBitrateMinKbps},
           {"listen_bitrate_max_kbps", kListenBitrateMaxKbps},
           {"opus_rate", kOpusRate}}},
-        {"spectrum_freqs", d_.analysis.bin_freqs()},
     };
     send_json(res, j);
   });
 
-  svr.Put("/api/inputs/:ch", [this](const httplib::Request& req, httplib::Response& res) {
-    unsigned ch = 0;
-    if (!parse_index(req, "ch", kInputs, &ch)) return send_error(res, 404, "no such input");
-    try {
-      const json j = json::parse(req.body);
-      if (j.contains("gain_db")) {
-        d_.ctl.inputs[ch].gain_db.store(
-            std::clamp(j["gain_db"].get<float>(), kInputGainMinDb, kInputGainMaxDb));
-      }
-    } catch (const std::exception& e) {
-      return send_error(res, 400, e.what());
+  svr.Put("/api/inputs/:ch", json_channel_route("ch", kInputs, "no such input",
+      [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response&) {
+    if (j.contains("gain_db")) {
+      d_.ctl.inputs[ch].gain_db.store(
+          std::clamp(j["gain_db"].get<float>(), kInputGainMinDb, kInputGainMaxDb));
     }
-    send_json(res, json{{"ok", true}});
-  });
+  }));
 
   // Per-input telemetry mask. The console posts which inputs it is watching; disabled inputs are
-  // dropped from the spectrum message, the widest frame on the wire. Meters and the wave frame keep
-  // their fixed six-channel shape for compatibility with any console, and the console hides
+  // dropped from the spectrum message, the widest frame on the wire. Meters and the envelope frame
+  // keep their fixed six-channel shape for compatibility with any console, and the console hides
   // disabled inputs itself regardless. Global and last-writer-wins — this appliance has one
   // operator; see docs/api.md.
-  svr.Post("/api/stream/inputs", [this](const httplib::Request& req, httplib::Response& res) {
-    try {
-      const json j = json::parse(req.body);
-      const auto& en = j.at("enabled");
-      if (!en.is_array() || en.size() != kInputs) {
-        return send_error(res, 400, "enabled must be an array of 6 booleans");
-      }
-      uint32_t mask = 0;
-      for (unsigned c = 0; c < kInputs; ++c) {
-        if (en[c].get<bool>()) mask |= (1u << c);
-      }
-      stream_mask_.store(mask, std::memory_order_relaxed);
-    } catch (const std::exception& e) {
-      return send_error(res, 400, e.what());
+  svr.Post("/api/telemetry/inputs", json_route([this](const json& j, const httplib::Request&,
+                                                      httplib::Response& res) {
+    const auto& en = j.at("enabled");
+    if (!en.is_array() || en.size() != kInputs) {
+      return send_error(res, 400, "enabled must be an array of 6 booleans");
     }
-    send_json(res, json{{"ok", true}});
-  });
+    uint32_t mask = 0;
+    for (unsigned c = 0; c < kInputs; ++c) {
+      if (en[c].get<bool>()) mask |= (1u << c);
+    }
+    telemetry_mask_.store(mask, std::memory_order_relaxed);
+  }));
 
   // Default listen codec + per-channel Opus bitrate. Body: {"codec": "pcm"|"opus"} and/or
   // {"bitrate_kbps": N}. The bitrate is clamped and applied live (active Opus streams follow it);
   // the reply echoes what took effect. The codec is only a default: the browser opts into Opus
   // per connection with ?codec=opus, so this never changes the raw-PCM wire default.
-  svr.Post("/api/stream/codec", [this](const httplib::Request& req, httplib::Response& res) {
-    try {
-      const json j = json::parse(req.body);
-      if (j.contains("codec")) {
-        const std::string c = j.at("codec").get<std::string>();
-        if (c != "pcm" && c != "opus") return send_error(res, 400, "codec must be pcm or opus");
-        d_.ctl.listen.codec.store(
-            static_cast<uint8_t>(c == "opus" ? ListenCodec::Opus : ListenCodec::Pcm));
+  svr.Post("/api/listen/codec", json_route([this](const json& j, const httplib::Request&,
+                                                  httplib::Response& res) {
+    if (j.contains("codec")) {
+      ListenCodec c;
+      if (!parse_codec(j.at("codec").get<std::string>(), &c)) {
+        return send_error(res, 400, "codec must be pcm or opus");
       }
-      if (j.contains("bitrate_kbps")) {
-        const int br = std::clamp(j.at("bitrate_kbps").get<int>(), kListenBitrateMinKbps,
-                                  kListenBitrateMaxKbps);
-        d_.ctl.listen.bitrate_kbps.store(br);
-      }
-    } catch (const std::exception& e) {
-      return send_error(res, 400, e.what());
+      d_.ctl.listen.codec.store(static_cast<uint8_t>(c));
     }
-    const bool opus = d_.ctl.listen.codec.load() == static_cast<uint8_t>(ListenCodec::Opus);
-    send_json(res, json{{"codec", opus ? "opus" : "pcm"},
+    if (j.contains("bitrate_kbps")) {
+      const int br = std::clamp(j.at("bitrate_kbps").get<int>(), kListenBitrateMinKbps,
+                                kListenBitrateMaxKbps);
+      d_.ctl.listen.bitrate_kbps.store(br);
+    }
+    send_json(res, json{{"codec", codec_name(static_cast<ListenCodec>(d_.ctl.listen.codec.load()))},
                         {"bitrate_kbps", d_.ctl.listen.bitrate_kbps.load()}});
-  });
+  }));
 
-  svr.Put("/api/outputs/:ch", [this](const httplib::Request& req, httplib::Response& res) {
-    unsigned ch = 0;
-    if (!parse_index(req, "ch", kOutputs, &ch)) return send_error(res, 404, "no such output");
-    try {
-      const json j = json::parse(req.body);
-      if (j.contains("source")) {
-        const std::string type = j["source"].value("type", "silence");
-        SourceType t = SourceType::Silence;
-        uint8_t index = 0;
-        if (type == "input") {
-          const auto& iv = j["source"].at("index");
-          const int i = iv.is_string() ? std::atoi(iv.get<std::string>().c_str()) : iv.get<int>();
-          if (i < 0 || i >= static_cast<int>(kInputs)) return send_error(res, 400, "bad input index");
-          t = SourceType::Input;
-          index = static_cast<uint8_t>(i);
-        } else if (type == "gen") {
-          GenId g;
-          if (!parse_gen(j["source"].at("index").get<std::string>(), &g)) {
-            return send_error(res, 400, "bad generator name");
-          }
-          t = SourceType::Gen;
-          index = static_cast<uint8_t>(g);
-        } else if (type != "silence") {
-          return send_error(res, 400, "bad source type");
+  svr.Put("/api/outputs/:ch", json_channel_route("ch", kOutputs, "no such output",
+      [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response& res) {
+    if (j.contains("source")) {
+      const std::string type = j["source"].value("type", "silence");
+      SourceType t = SourceType::Silence;
+      uint8_t index = 0;
+      if (type == "input") {
+        const auto& iv = j["source"].at("index");
+        const int i = iv.is_string() ? std::atoi(iv.get<std::string>().c_str()) : iv.get<int>();
+        if (i < 0 || i >= static_cast<int>(kInputs)) return send_error(res, 400, "bad input index");
+        t = SourceType::Input;
+        index = static_cast<uint8_t>(i);
+      } else if (type == "gen") {
+        GenId g;
+        if (!parse_gen(j["source"].at("index").get<std::string>(), &g)) {
+          return send_error(res, 400, "bad generator name");
         }
-        d_.ctl.outputs[ch].source.store(pack_source(t, index));
+        t = SourceType::Gen;
+        index = static_cast<uint8_t>(g);
+      } else if (type != "silence") {
+        return send_error(res, 400, "bad source type");
       }
-      if (j.contains("gain_db")) {
-        d_.ctl.outputs[ch].gain_db.store(std::clamp(j["gain_db"].get<float>(), -60.0f, 0.0f));
-      }
-      if (j.contains("mute")) d_.ctl.outputs[ch].mute.store(j["mute"].get<bool>());
-    } catch (const std::exception& e) {
-      return send_error(res, 400, e.what());
+      d_.ctl.outputs[ch].source.store(pack_source(t, index));
     }
-    send_json(res, json{{"ok", true}});
-  });
+    if (j.contains("gain_db")) {
+      d_.ctl.outputs[ch].gain_db.store(
+          std::clamp(j["gain_db"].get<float>(), kLevelMinDb, kLevelMaxDb));
+    }
+    if (j.contains("mute")) d_.ctl.outputs[ch].mute.store(j["mute"].get<bool>());
+  }));
 
   svr.Post("/api/outputs/:ch/identify", [this](const httplib::Request& req, httplib::Response& res) {
     unsigned ch = 0;
@@ -373,102 +402,72 @@ void WebServer::install_routes() {
     send_json(res, json{{"ok", true}});
   });
 
-  svr.Put("/api/generators/sine", [this](const httplib::Request& req, httplib::Response& res) {
-    try {
-      const json j = json::parse(req.body);
-      if (j.contains("freq_hz")) {
-        d_.ctl.sine.freq_hz.store(std::clamp(j["freq_hz"].get<float>(), 1.0f, 40000.0f));
-      }
-      if (j.contains("level_db")) {
-        d_.ctl.sine.level_db.store(std::clamp(j["level_db"].get<float>(), -60.0f, 0.0f));
-      }
-    } catch (const std::exception& e) {
-      return send_error(res, 400, e.what());
+  svr.Put("/api/generators/sine", json_route([this](const json& j, const httplib::Request&,
+                                                    httplib::Response&) {
+    if (j.contains("freq_hz")) {
+      d_.ctl.sine.freq_hz.store(std::clamp(j["freq_hz"].get<float>(), kSineFreqMinHz, kSineFreqMaxHz));
     }
-    send_json(res, json{{"ok", true}});
-  });
+    if (j.contains("level_db")) {
+      d_.ctl.sine.level_db.store(std::clamp(j["level_db"].get<float>(), kLevelMinDb, kLevelMaxDb));
+    }
+  }));
 
-  svr.Put("/api/generators/noise", [this](const httplib::Request& req, httplib::Response& res) {
-    try {
-      const json j = json::parse(req.body);
-      if (j.contains("mode")) {
-        const std::string m = j["mode"].get<std::string>();
-        if (m != "white" && m != "pink") return send_error(res, 400, "mode must be white or pink");
-        d_.ctl.noise.mode.store(
-            static_cast<uint8_t>(m == "pink" ? NoiseMode::Pink : NoiseMode::White));
+  svr.Put("/api/generators/noise", json_route([this](const json& j, const httplib::Request&,
+                                                     httplib::Response& res) {
+    if (j.contains("mode")) {
+      NoiseMode m;
+      if (!parse_noise(j["mode"].get<std::string>(), &m)) {
+        return send_error(res, 400, "mode must be white or pink");
       }
-      if (j.contains("level_db")) {
-        d_.ctl.noise.level_db.store(std::clamp(j["level_db"].get<float>(), -60.0f, 0.0f));
-      }
-    } catch (const std::exception& e) {
-      return send_error(res, 400, e.what());
+      d_.ctl.noise.mode.store(static_cast<uint8_t>(m));
     }
-    send_json(res, json{{"ok", true}});
-  });
+    if (j.contains("level_db")) {
+      d_.ctl.noise.level_db.store(std::clamp(j["level_db"].get<float>(), kLevelMinDb, kLevelMaxDb));
+    }
+  }));
 
-  svr.Put("/api/generators/ping", [this](const httplib::Request& req, httplib::Response& res) {
-    try {
-      const json j = json::parse(req.body);
-      if (j.contains("variant")) {
-        PingVariant v;
-        if (!parse_ping(j["variant"].get<std::string>(), &v)) {
-          return send_error(res, 400, "variant must be tick, bing or bong");
-        }
-        d_.ctl.ping.variant.store(static_cast<uint8_t>(v));
+  svr.Put("/api/generators/ping", json_route([this](const json& j, const httplib::Request&,
+                                                    httplib::Response& res) {
+    if (j.contains("variant")) {
+      PingVariant v;
+      if (!parse_ping(j["variant"].get<std::string>(), &v)) {
+        return send_error(res, 400, "variant must be tick, bing or bong");
       }
-      if (j.contains("interval_s")) {
-        d_.ctl.ping.interval_s.store(std::clamp(j["interval_s"].get<float>(), 0.5f, 60.0f));
-      }
-      if (j.contains("level_db")) {
-        d_.ctl.ping.level_db.store(std::clamp(j["level_db"].get<float>(), -60.0f, 0.0f));
-      }
-      // Tells the generator to reschedule from the current sample.
-      d_.ctl.ping.epoch.fetch_add(1);
-    } catch (const std::exception& e) {
-      return send_error(res, 400, e.what());
+      d_.ctl.ping.variant.store(static_cast<uint8_t>(v));
     }
-    send_json(res, json{{"ok", true}});
-  });
+    if (j.contains("interval_s")) {
+      d_.ctl.ping.interval_s.store(
+          std::clamp(j["interval_s"].get<float>(), kPingIntervalMinS, kPingIntervalMaxS));
+    }
+    if (j.contains("level_db")) {
+      d_.ctl.ping.level_db.store(std::clamp(j["level_db"].get<float>(), kLevelMinDb, kLevelMaxDb));
+    }
+    // Tells the generator to reschedule from the current sample.
+    d_.ctl.ping.epoch.fetch_add(1);
+  }));
 
-  svr.Put("/api/channel-map", [this](const httplib::Request& req, httplib::Response& res) {
-    try {
-      const json j = json::parse(req.body);
-      const auto imap = j.at("input_map").get<std::vector<int>>();
-      const auto omap = j.at("output_map").get<std::vector<int>>();
-      if (imap.size() != kInputs || omap.size() != kOutputs) {
-        return send_error(res, 400, "input_map needs 6 entries, output_map 8");
-      }
-      // Duplicate slots would make two logical channels fight over one physical slot.
-      auto distinct = [](std::vector<int> v, int limit) {
-        for (int x : v) {
-          if (x < 0 || x >= limit) return false;
-        }
-        std::sort(v.begin(), v.end());
-        return std::adjacent_find(v.begin(), v.end()) == v.end();
-      };
-      if (!distinct(imap, kTdmSlots) || !distinct(omap, kOutputs)) {
-        return send_error(res, 400, "slots must be distinct and in range");
-      }
-      for (unsigned i = 0; i < kInputs; ++i) {
-        d_.ctl.input_map[i].store(static_cast<uint8_t>(imap[i]));
-      }
-      for (unsigned i = 0; i < kOutputs; ++i) {
-        d_.ctl.output_map[i].store(static_cast<uint8_t>(omap[i]));
-      }
-    } catch (const std::exception& e) {
-      return send_error(res, 400, e.what());
+  svr.Put("/api/channel-map", json_route([this](const json& j, const httplib::Request&,
+                                                httplib::Response& res) {
+    const auto imap = j.at("input_map").get<std::vector<int>>();
+    const auto omap = j.at("output_map").get<std::vector<int>>();
+    if (imap.size() != kInputs || omap.size() != kOutputs) {
+      return send_error(res, 400, "input_map needs 6 entries, output_map 8");
     }
-    send_json(res, json{{"ok", true}});
-  });
+    if (!is_slot_permutation(imap, kTdmSlots) || !is_slot_permutation(omap, kOutputs)) {
+      return send_error(res, 400, "slots must be distinct and in range");
+    }
+    for (unsigned i = 0; i < kInputs; ++i) {
+      d_.ctl.input_map[i].store(static_cast<uint8_t>(imap[i]));
+    }
+    for (unsigned i = 0; i < kOutputs; ++i) {
+      d_.ctl.output_map[i].store(static_cast<uint8_t>(omap[i]));
+    }
+  }));
 
   svr.Post("/api/capture/freeze", [this](const httplib::Request&, httplib::Response& res) {
     const CaptureStatus cs = d_.capture.freeze(d_.engine.stats().generation);
     if (!cs.frozen) return send_error(res, 503, "not enough captured audio to freeze yet");
-    send_json(res, json{{"frozen", cs.frozen},
-                        {"freeze_sample", cs.freeze_sample},
-                        {"valid_start", cs.valid_start},
-                        {"valid_len", cs.valid_len},
-                        {"generation", cs.generation}});
+    send_json(res, capture_json(cs));
   });
 
   svr.Post("/api/capture/resume", [this](const httplib::Request&, httplib::Response& res) {
@@ -477,42 +476,34 @@ void WebServer::install_routes() {
   });
 
   // Sets how many recent frames the next Analyze/freeze grabs. Body: {"seconds": N} (preferred)
-  // or {"frames": N}. The value is clamped to [kCaptureMinFrames, capacity]; the reply echoes
+  // or {"frames": N}. The value is clamped to [kCaptureMinFrames, max_frames]; the reply echoes
   // the clamped result so the client can show what actually took effect.
-  svr.Post("/api/capture/config", [this](const httplib::Request& req, httplib::Response& res) {
-    try {
-      const json j = json::parse(req.body);
-      const double rate = d_.engine.rate();
-      uint64_t frames;
-      if (j.contains("seconds")) {
-        const double s = j.at("seconds").get<double>();
-        if (!(s > 0.0)) return send_error(res, 400, "seconds must be > 0");
-        frames = static_cast<uint64_t>(std::llround(s * rate));
-      } else {
-        frames = j.at("frames").get<uint64_t>();
-      }
-      d_.capture.set_analyze_frames(frames);
-      const uint64_t now = d_.capture.analyze_frames();
-      const uint64_t max = d_.capture.capacity_frames();
-      send_json(res, json{{"analyze_frames", now},
-                          {"analyze_seconds", now / rate},
-                          {"max_frames", max},
-                          {"max_seconds", max / rate}});
-    } catch (const std::exception& e) {
-      send_error(res, 400, e.what());
+  svr.Post("/api/capture/config", json_route([this](const json& j, const httplib::Request&,
+                                                    httplib::Response& res) {
+    const double rate = d_.engine.rate();
+    uint64_t frames;
+    if (j.contains("seconds")) {
+      const double s = j.at("seconds").get<double>();
+      if (!(s > 0.0)) return send_error(res, 400, "seconds must be > 0");
+      frames = static_cast<uint64_t>(std::llround(s * rate));
+    } else {
+      frames = j.at("frames").get<uint64_t>();
     }
-  });
+    d_.capture.set_analyze_frames(frames);
+    const uint64_t now = d_.capture.analyze_frames();
+    const uint64_t max = d_.capture.max_frames();
+    send_json(res, json{{"analyze_frames", now},
+                        {"analyze_seconds", now / rate},
+                        {"max_frames", max},
+                        {"max_seconds", max / rate}});
+  }));
 
   svr.Get("/api/capture/status", [this](const httplib::Request&, httplib::Response& res) {
-    const CaptureStatus cs = d_.capture.status();
     const uint64_t now = d_.ring.counter();
-    send_json(res, json{{"frozen", cs.frozen},
-                        {"freeze_sample", cs.freeze_sample},
-                        {"valid_start", cs.valid_start},
-                        {"valid_len", cs.valid_len},
-                        {"generation", cs.generation},
-                        {"live_now", now},
-                        {"live_oldest", d_.ring.oldest(now)}});
+    json j = capture_json(d_.capture.status());
+    j["live_now"] = now;
+    j["live_oldest"] = d_.ring.oldest(now);
+    send_json(res, j);
   });
 
   svr.Get("/api/capture/window", [this](const httplib::Request& req, httplib::Response& res) {
@@ -536,26 +527,22 @@ void WebServer::install_routes() {
     send_json(res, j);
   });
 
-  svr.Post("/api/capture/xcorr", [this](const httplib::Request& req, httplib::Response& res) {
-    try {
-      const json j = json::parse(req.body);
-      const unsigned a = j.at("ch_a").get<unsigned>();
-      const unsigned b = j.at("ch_b").get<unsigned>();
-      const uint64_t start = j.at("start").get<uint64_t>();
-      const uint64_t len = j.at("len").get<uint64_t>();
-      const XcorrResult r = d_.capture.xcorr(a, b, start, len);
-      if (!r.ok) return send_error(res, 400, r.error);
+  svr.Post("/api/capture/xcorr", json_route([this](const json& j, const httplib::Request&,
+                                                   httplib::Response& res) {
+    const unsigned a = j.at("ch_a").get<unsigned>();
+    const unsigned b = j.at("ch_b").get<unsigned>();
+    const uint64_t start = j.at("start").get<uint64_t>();
+    const uint64_t len = j.at("len").get<uint64_t>();
+    const XcorrResult r = d_.capture.xcorr(a, b, start, len);
+    if (!r.ok) return send_error(res, 400, r.error);
 
-      const double c = 343.0;  // speed of sound, m/s
-      send_json(res, json{{"lag_samples", r.lag_samples},
-                          {"lag_ms", r.lag_ms},
-                          {"lag_m", r.lag_ms * c / 1000.0},
-                          {"confidence", r.confidence},
-                          {"peak", r.peak}});
-    } catch (const std::exception& e) {
-      send_error(res, 400, e.what());
-    }
-  });
+    const double c = 343.0;  // speed of sound, m/s
+    send_json(res, json{{"lag_samples", r.lag_samples},
+                        {"lag_ms", r.lag_ms},
+                        {"lag_m", r.lag_ms * c / 1000.0},
+                        {"confidence", r.confidence},
+                        {"peak", r.peak}});
+  }));
 
   svr.Get("/api/pings/recent", [this](const httplib::Request&, httplib::Response& res) {
     json arr = json::array();
@@ -566,10 +553,18 @@ void WebServer::install_routes() {
   });
 
   svr.Post("/api/config/save", [this](const httplib::Request&, httplib::Response& res) {
-    const Config cfg = Config::from_control(d_.ctl, d_.config);
+    Config base;
+    {
+      std::lock_guard<std::mutex> lk(config_m_);
+      base = d_.config;
+    }
+    const Config cfg = Config::from_control(d_.ctl, base);
     std::string err;
     if (!d_.store.save(cfg, &err)) return send_error(res, 500, err);
-    d_.config = cfg;
+    {
+      std::lock_guard<std::mutex> lk(config_m_);
+      d_.config = cfg;
+    }
     send_json(res, json{{"ok", true}, {"path", d_.store.saved_path()}});
   });
 
@@ -579,32 +574,28 @@ void WebServer::install_routes() {
     send_json(res, json{{"ok", true}});
   });
 
-  svr.Post("/api/system/reboot", [this](const httplib::Request&, httplib::Response& res) {
-    if (!opt_.allow_reboot) return send_error(res, 403, "reboot disabled");
-    send_json(res, json{{"ok", true}});
-    std::thread([] {
-      // Answer first, then go down: the browser needs the response before the socket dies.
-      std::this_thread::sleep_for(std::chrono::milliseconds(300));
-      sync();
-      if (std::system("systemctl reboot") != 0) LOG_ERROR("reboot failed");
-    }).detach();
-  });
-
   // The rootfs is read-only, so pulling the plug is *usually* survivable — but /data is briefly
-  // writable during a save, and a hard power cut inside that window can corrupt the SD card.
-  svr.Post("/api/system/shutdown", [this](const httplib::Request&, httplib::Response& res) {
-    if (!opt_.allow_reboot) return send_error(res, 403, "shutdown disabled");
-    send_json(res, json{{"ok", true}});
-    std::thread([] {
-      std::this_thread::sleep_for(std::chrono::milliseconds(300));
-      sync();
-      if (std::system("systemctl poweroff") != 0) LOG_ERROR("shutdown failed");
-    }).detach();
-  });
+  // writable during a save, and a hard power cut inside that window can corrupt the SD card,
+  // which is why a shutdown route exists at all. Disabled in a simulated run: those buttons
+  // must not systemctl a developer's workstation.
+  auto power_route = [this, &svr](const char* path, const char* what, const char* cmd) {
+    svr.Post(path, [this, what, cmd](const httplib::Request&, httplib::Response& res) {
+      if (!opt_.allow_reboot) return send_error(res, 403, std::string(what) + " disabled");
+      send_ok(res);
+      std::thread([what, cmd] {
+        // Answer first, then go down: the browser needs the response before the socket dies.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        sync();
+        if (std::system(cmd) != 0) LOG_ERROR("{} failed", what);
+      }).detach();
+    });
+  };
+  power_route("/api/system/reboot", "reboot", "systemctl reboot");
+  power_route("/api/system/shutdown", "shutdown", "systemctl poweroff");
 
   // Test hook for the sync-error banner; harmless in production.
   svr.Post("/api/system/inject-kmsg", [this](const httplib::Request& req, httplib::Response& res) {
-    d_.kmsg.inject(req.body.empty() ? "bcm2835-i2s: I2S SYNC error!" : req.body);
+    d_.kmsg.process_line(req.body.empty() ? "bcm2835-i2s: I2S SYNC error!" : req.body);
     send_json(res, json{{"ok", true}, {"sync_errors", d_.kmsg.sync_errors()}});
   });
 
@@ -646,16 +637,14 @@ void WebServer::install_routes() {
     const unsigned rate = d_.engine.stats().rate;
 
     if (want_opus && opus_rate_supported(rate)) {
-      const bool has_br = req.has_param("bitrate");
-      const int br_fixed =
-          has_br ? static_cast<int>(query_u64(req, "bitrate", kListenBitrateDefaultKbps)) : 0;
+      const BitrateOverride br = query_bitrate(req);
       bool ok = false;
-      OpusMonoEncoder enc(rate, has_br ? br_fixed : d_.ctl.listen.bitrate_kbps.load(), &ok);
+      OpusMonoEncoder enc(rate, effective_kbps(br, d_.ctl), &ok);
       if (!ok) {
         ws.close(httplib::ws::CloseStatus::InternalError, "opus init failed");
         return;
       }
-      LOG_INFO("listen ws opened on ch{} (opus)", ch);
+      LOG_DEBUG("listen ws opened on ch{} (opus)", ch);
       ListenPacer pacer(d_.ring, ch, enc.in_frames());
       const float* pcm = nullptr;
       uint64_t start = 0;
@@ -665,19 +654,18 @@ void WebServer::install_routes() {
       while (running_.load() && ws.is_open()) {
         if (!pacer.next_float(running_, &pcm, &start, &skipped)) break;
         if (skipped) enc.reset();  // clean restart across a skip-to-live discontinuity
-        const int br = has_br ? br_fixed : d_.ctl.listen.bitrate_kbps.load();
-        if (!enc.encode(pcm, br, &packet)) break;
+        if (!enc.encode(pcm, effective_kbps(br, d_.ctl), &packet)) break;
         // u64 starting sample index (native ring rate), then one raw Opus packet.
         frame.resize(8 + packet.size());
         std::memcpy(frame.data(), &start, 8);
         std::memcpy(frame.data() + 8, packet.data(), packet.size());
         if (!ws.send(frame.data(), frame.size())) break;
       }
-      LOG_INFO("listen ws closed on ch{} (opus)", ch);
+      LOG_DEBUG("listen ws closed on ch{} (opus)", ch);
       return;
     }
 
-    LOG_INFO("listen ws opened on ch{}", ch);
+    LOG_DEBUG("listen ws opened on ch{}", ch);
     ListenPacer pacer(d_.ring, ch);
     std::vector<int16_t> pcm;
     uint64_t start = 0;
@@ -691,7 +679,7 @@ void WebServer::install_routes() {
       std::memcpy(frame.data() + 8, pcm.data(), pcm.size() * 2);
       if (!ws.send(frame.data(), frame.size())) break;
     }
-    LOG_INFO("listen ws closed on ch{}", ch);
+    LOG_DEBUG("listen ws closed on ch{}", ch);
   });
 
   svr.Get("/api/inputs/:ch/stream.wav", [this](const httplib::Request& req, httplib::Response& res) {
@@ -706,7 +694,7 @@ void WebServer::install_routes() {
     auto sent_header = std::make_shared<bool>(false);
     auto pcm = std::make_shared<std::vector<int16_t>>();
 
-    LOG_INFO("wav stream opened on ch{}", ch);
+    LOG_DEBUG("wav stream opened on ch{}", ch);
     res.set_chunked_content_provider(
         "audio/wav",
         [this, ch, rate, pacer, sent_header, pcm, slot](size_t, httplib::DataSink& sink) {
@@ -727,7 +715,7 @@ void WebServer::install_routes() {
           }
           return sink.write(reinterpret_cast<const char*>(pcm->data()), pcm->size() * 2);
         },
-        [ch](bool) { LOG_INFO("wav stream closed on ch{}", ch); });
+        [ch](bool) { LOG_DEBUG("wav stream closed on ch{}", ch); });
   });
 
   // One multichannel Ogg/Opus stream carrying every input, read from a single ring cursor so all
@@ -741,25 +729,23 @@ void WebServer::install_routes() {
 
     auto slot = std::make_shared<StreamSlot>(listen_streams_);
     if (!slot->acquired()) return send_error(res, 503, "too many listeners");
-    auto ogg_slot = std::make_shared<StreamSlot>(ogg_streams_, kMaxOggStreams);
+    auto ogg_slot =
+        std::make_shared<StreamSlot>(ogg_streams_, kMaxOggStreams, "multichannel");
     if (!ogg_slot->acquired()) return send_error(res, 503, "too many multichannel streams");
 
-    const bool has_br = req.has_param("bitrate");
-    const int br_fixed =
-        has_br ? static_cast<int>(query_u64(req, "bitrate", kListenBitrateDefaultKbps)) : 0;
-    const int br0 = has_br ? br_fixed : d_.ctl.listen.bitrate_kbps.load();
+    const BitrateOverride br = query_bitrate(req);
 
     bool ok = false;
-    auto enc = std::make_shared<OpusOggMultiEncoder>(rate, br0, ogg_serial_.fetch_add(1), &ok);
+    auto enc = std::make_shared<OpusOggMultiEncoder>(rate, effective_kbps(br, d_.ctl),
+                                                     ogg_serial_.fetch_add(1), &ok);
     if (!ok) return send_error(res, 500, "opus init failed");
     auto pacer = std::make_shared<MultiListenPacer>(d_.ring, enc->in_frames());
     auto sent_header = std::make_shared<bool>(false);
 
-    LOG_INFO("ogg stream opened ({} ch)", kInputs);
+    LOG_DEBUG("ogg stream opened ({} ch)", kInputs);
     res.set_chunked_content_provider(
         "audio/ogg",
-        [this, enc, pacer, sent_header, slot, ogg_slot, has_br, br_fixed](size_t,
-                                                                          httplib::DataSink& sink) {
+        [this, enc, pacer, sent_header, slot, ogg_slot, br](size_t, httplib::DataSink& sink) {
           if (!running_.load()) {
             sink.done();
             return false;
@@ -777,16 +763,15 @@ void WebServer::install_routes() {
             return false;
           }
           if (skipped) enc->reset();
-          const int br = has_br ? br_fixed : d_.ctl.listen.bitrate_kbps.load();
           std::string pages;
-          if (!enc->encode(pcm, br, &pages)) {
+          if (!enc->encode(pcm, effective_kbps(br, d_.ctl), &pages)) {
             sink.done();
             return false;
           }
           if (pages.empty()) return true;  // Ogg is still filling a page; next_float paces us
           return sink.write(pages.data(), pages.size());
         },
-        [](bool) { LOG_INFO("ogg stream closed"); });
+        [](bool) { LOG_DEBUG("ogg stream closed"); });
   });
 }
 
@@ -807,28 +792,27 @@ void WebServer::run_publisher() {
   Task spectrum{t0, milliseconds(200)};  //  5 Hz
   Task system{t0, milliseconds(1000)};   //  1 Hz
 
-  // Wave frames go out in lockstep with the thing that produces them. The analysis thread
+  // Envelope frames go out in lockstep with the thing that produces them. The analysis thread
   // appends envelope columns once per tick (kTickHz = 10 Hz, ~20 columns of 480 frames each), so
   // a publisher polling faster finds an empty ring on some ticks and emits nothing. Raising the
   // producer instead would mean running the 6-channel 8192-point FFT half again as often on a
   // Pi 3 to gain nothing — the scope's fidelity is set by the column rate (a constant
   // 200 columns/s), not by how many frames those columns are packed into.
-  Task wave{t0, milliseconds(100)};      // 10 Hz — the envelope producer's cadence
+  Task envelope{t0, milliseconds(100)};  // 10 Hz — the envelope producer's cadence
 
   CpuSampler cpu;
-  uint64_t wave_cursor = 0;
+  uint64_t env_cursor = 0;
 
   while (running_.load()) {
-    std::this_thread::sleep_until(std::min({meters.next, spectrum.next, wave.next, system.next}));
+    std::this_thread::sleep_until(
+        std::min({meters.next, spectrum.next, envelope.next, system.next}));
     if (!running_.load()) break;
 
     const auto now = clock::now();
     const bool have_clients = hub_.clients() > 0;
 
-    // Deadlines advance even with nobody listening — otherwise they would all sit in the past
-    // and sleep_until() would return instantly, spinning the thread. A deadline that has fallen
-    // more than one period behind (a long stall) is snapped forward rather than firing a burst
-    // of catch-up frames.
+    // A deadline that has fallen more than one period behind (a long stall) is snapped
+    // forward rather than firing a burst of catch-up frames.
     auto fire = [&](Task& t) {
       if (now < t.next) return false;
       t.next += t.period;
@@ -836,9 +820,17 @@ void WebServer::run_publisher() {
       return true;
     };
 
+    // Every deadline advances even with nobody listening — otherwise they would all sit in
+    // the past and sleep_until() would return instantly, spinning the thread. Whether the
+    // fired work is *published* is gated on have_clients below.
+    const bool fire_system = fire(system);
+    const bool fire_meters = fire(meters);
+    const bool fire_spectrum = fire(spectrum);
+    const bool fire_envelope = fire(envelope);
+
     // Sampled whether or not a WS client is connected: GET /api/state serves these values to
     // HTTP-only clients, and the CPU delta needs a steady 1 Hz cadence to mean anything.
-    if (fire(system)) {
+    if (fire_system) {
       SysInfo si = sample_sysinfo();
       const CpuSampler::Load load = cpu.sample();
       si.cpu_pct = load.total;
@@ -863,18 +855,18 @@ void WebServer::run_publisher() {
     if (!have_clients) {
       // Nothing is watching the scope, so do not accumulate a backlog of envelope columns to
       // dump at whoever connects next.
-      wave_cursor = d_.analysis.envelope().head();
+      env_cursor = d_.analysis.envelope().head();
       continue;
     }
 
-    if (fire(meters)) {
+    if (fire_meters) {
       const AnalysisSnapshot s = d_.analysis.snapshot();
       hub_.publish(std::make_shared<WsMessage>(WsMessage{meters_json(s).dump(), false}));
     }
 
-    if (fire(spectrum)) {
+    if (fire_spectrum) {
       const AnalysisSnapshot s = d_.analysis.snapshot();
-      const uint32_t mask = stream_mask_.load(std::memory_order_relaxed);
+      const uint32_t mask = telemetry_mask_.load(std::memory_order_relaxed);
       json chans = json::array();
       for (unsigned c = 0; c < kInputs; ++c) {
         if (!(mask & (1u << c))) continue;   // console is not watching this input — skip its bins
@@ -890,12 +882,12 @@ void WebServer::run_publisher() {
       hub_.publish(std::make_shared<WsMessage>(WsMessage{j.dump(), false}));
     }
 
-    if (fire(wave)) {
+    if (fire_envelope) {
       uint64_t first = 0;
-      const auto cols = d_.analysis.envelope().since(wave_cursor, &first);
+      const auto cols = d_.analysis.envelope().since(env_cursor, &first);
       if (!cols.empty()) {
-        wave_cursor = first + cols.size();
-        hub_.publish(std::make_shared<WsMessage>(WsMessage{wave_frame(first, cols), true}));
+        env_cursor = first + cols.size();
+        hub_.publish(std::make_shared<WsMessage>(WsMessage{envelope_frame(first, cols), true}));
       }
     }
   }

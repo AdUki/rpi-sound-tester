@@ -31,10 +31,7 @@ void WsHub::publish(WsMessagePtr msg) {
   for (const auto& c : snapshot) {
     std::lock_guard<std::mutex> lock(c->m);
     if (c->closed) continue;
-    if (c->q.size() >= kMaxQueued) {
-      c->q.pop_front();
-      ++c->dropped;
-    }
+    if (c->q.size() >= kMaxQueued) c->q.pop_front();
     c->q.push_back(msg);
     c->cv.notify_one();
   }

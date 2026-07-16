@@ -2,11 +2,13 @@
 
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <iostream>
 #include <type_traits>
 
 inline int g_failures = 0;
+
+// One pi for every test file; the daemon itself uses st::kTwoPi (util/dsp.h).
+inline constexpr double kPi = 3.14159265358979323846;
 
 // Enums (SourceType, GenId, ...) have no operator<<; print them as their underlying value.
 template <typename T>

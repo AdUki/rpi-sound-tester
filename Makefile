@@ -88,6 +88,7 @@ test: build ## Run the test suite
 
 .PHONY: run
 run: build ## Run it: simulated card by default, or DEVICE=hw:... for a real one
+	@mkdir -p /tmp/soundtester
 ifeq ($(DEVICE),)
 	@echo -e "$(BOLD)http://localhost:$(PORT)$(OFF)  $(DIM)simulated card, each channel delayed $(STAGGER) frames$(OFF)"
 	@$(BIN) --sim --sim-stagger $(STAGGER) --port $(PORT) \
@@ -99,6 +100,8 @@ endif
 
 .PHONY: clean
 clean: ## Remove the local build (add FULL=1 to also drop the Yocto build tree)
+	@# $(BUILD)-vec is the by-hand tree for vectorization reports:
+	@#   cmake -S $(APP) -B $(BUILD)-vec -DST_VECTORIZE_REPORT=ON
 	@rm -rf $(BUILD) $(BUILD)-vec
 ifdef FULL
 	@rm -rf $(YB)/tmp

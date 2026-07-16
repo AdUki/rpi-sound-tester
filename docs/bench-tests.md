@@ -48,7 +48,7 @@ cat /proc/asound/card*/pcm0c/sub0/hw_params    # capture
 
 Wire **OUT 1 into IN 1 and IN 2** with identical cables. Ping = `tick`, interval 2 s.
 
-- [ ] Freeze, bracket one ping, measure IN 1 → IN 2.
+- [ ] Analyze, bracket one ping, Measure IN 1 → IN 2.
 - [ ] **Lag = 0 ± 1 sample.** Confidence > 3.
 - [ ] `GET /api/pings/recent`: successive samples differ by exactly `2 × 96000 = 192000`.
 

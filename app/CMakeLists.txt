@@ -8,8 +8,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # The audio path is all float32 block loops (int<->float conversion, gain, mix, min/max,
-# FFT butterflies), which the vectorizer handles well.
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -ftree-vectorize -fno-math-errno")
+# FFT butterflies), which the vectorizer handles well. -DNDEBUG must be repeated: overriding
+# the flags drops CMake's default, and without it every assert in the header-only third-party
+# libraries stays live in the shipped binary.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -ftree-vectorize -fno-math-errno")
 
 # On 32-bit ARM, NEON floats are not fully IEEE-754 conformant, so GCC refuses to
 # auto-vectorize float loops with NEON unless unsafe-math is allowed -- without this, -O3
@@ -36,11 +38,13 @@ if(ST_VECTORIZE_REPORT)
 endif()
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(ALSA REQUIRED alsa)
+# IMPORTED_TARGET so the include *and* link directories ride along — plain ${X_LIBRARIES}
+# is just "-lopus" and breaks when the library lives outside the default linker path.
+pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
 # Opus encoder + Ogg muxer for the encoded listen stream. On a dev box:
 #   sudo apt install libopus-dev libogg-dev
-pkg_check_modules(OPUS REQUIRED opus)
-pkg_check_modules(OGG REQUIRED ogg)
+pkg_check_modules(OPUS REQUIRED IMPORTED_TARGET opus)
+pkg_check_modules(OGG REQUIRED IMPORTED_TARGET ogg)
 find_package(Threads REQUIRED)
 
 # third_party/* are git submodules pinned at a tag (pocketfft: a commit — it has no tags). All
@@ -89,11 +93,8 @@ add_library(soundtester_core STATIC
   src/ws_hub.cpp
 )
 target_include_directories(soundtester_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-# Opus headers live under an opus/ subdir the .pc exposes, so the include dirs are required.
-target_include_directories(soundtester_core SYSTEM PUBLIC
-  ${ALSA_INCLUDE_DIRS} ${OPUS_INCLUDE_DIRS} ${OGG_INCLUDE_DIRS})
 target_link_libraries(soundtester_core PUBLIC third_party
-  ${ALSA_LIBRARIES} ${OPUS_LIBRARIES} ${OGG_LIBRARIES} Threads::Threads)
+  PkgConfig::ALSA PkgConfig::OPUS PkgConfig::OGG Threads::Threads)
 target_compile_options(soundtester_core PRIVATE -Wall -Wextra)
 
 add_executable(soundtesterd src/main.cpp)

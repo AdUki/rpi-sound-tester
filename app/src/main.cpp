@@ -3,7 +3,6 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
-#include <memory>
 #include <thread>
 
 #include "analysis.h"
@@ -16,7 +15,6 @@
 #include "ring_buffer.h"
 #include "util/log.h"
 #include "webserver.h"
-#include "ws_hub.h"
 
 namespace {
 st::WebServer* g_server = nullptr;
@@ -124,6 +122,9 @@ int main(int argc, char** argv) {
   st::WebOptions wopt;
   wopt.www_dir = www;
   wopt.port = port;
+  // A simulated run is a developer's workstation: its reboot/shutdown buttons must not
+  // systemctl the host.
+  wopt.allow_reboot = !sim;
 
   st::Deps deps{ctl, ring, engine, analysis, capture, kmsg, store, cfg};
   st::WebServer server(deps, wopt);

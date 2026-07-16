@@ -3,6 +3,7 @@
 #include <pthread.h>
 
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -15,8 +16,6 @@ typedef struct _snd_pcm snd_pcm_t;
 
 namespace st {
 
-inline constexpr double kIdentifySeconds = 0.5;  // 3 x 100 ms bursts, 100 ms apart
-
 struct EngineOptions {
   bool sim = false;
   std::string device = "hw:audioinjectoroc,0";
@@ -24,7 +23,6 @@ struct EngineOptions {
   unsigned period = kDefaultPeriod;
   unsigned periods = kDefaultPeriods;
   unsigned capture_channels = kTdmSlots;  // falls back to kInputs if 8 ch cannot be opened
-  unsigned open_retry_s = 5;   // per attempt; the audio thread retries forever
   // Simulator only: output channel c loops back into input channel c, delayed by
   // period + c*sim_stagger frames.
   unsigned sim_stagger = 0;
@@ -55,12 +53,16 @@ class AudioEngine {
 
   EngineStats stats() const;
   double rate() const { return static_cast<double>(opt_.rate); }
-  unsigned period() const { return opt_.period; }
+  unsigned period() const { return period_.load(std::memory_order_relaxed); }
   uint64_t identify_frames() const { return identify_frames_; }
-  uint64_t counter() const { return ring_.counter(); }
 
  private:
   static void* thread_entry(void* self);
+
+  // last_error_ is written by the audio thread and read by web handlers; a bare std::string
+  // there would be a racing read against a reallocating write.
+  void set_error(std::string msg);
+  std::string error() const;
 
   void wait_before_retry();
   void size_buffers();
@@ -86,7 +88,6 @@ class AudioEngine {
 
   snd_pcm_t* capture_ = nullptr;
   snd_pcm_t* playback_ = nullptr;
-  unsigned cap_ch_ = 0;
   uint64_t identify_frames_ = 0;
 
   pthread_t thread_{};
@@ -95,6 +96,11 @@ class AudioEngine {
   std::atomic<bool> streaming_{false};  // true only while audio is actually flowing
   std::atomic<uint64_t> xruns_{0};
   std::atomic<uint32_t> generation_{0};
+  // Written by the audio thread (channel fallback, period renegotiation), read by stats().
+  std::atomic<unsigned> cap_ch_{0};
+  std::atomic<unsigned> period_{0};
+
+  mutable std::mutex err_m_;
   std::string last_error_;
 
   std::vector<int32_t> raw_in_;

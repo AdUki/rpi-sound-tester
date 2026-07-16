@@ -9,9 +9,14 @@ Inputs are numbered 0–5, outputs 0–7 (the UI shows them as IN 1–6 / OUT 1�
 
 ### `GET /api/state`
 Everything the UI needs to render itself: inputs (gain, meters and tone metrics), outputs
-(routing, gain, mute), generator settings, channel map, capture status, engine stats
-(rate, format, period, xruns, generation), system info (CPU, temperature, IP, sync errors)
-and the spectrum's bin centre frequencies.
+(routing, gain, mute), generator settings, channel map, capture status (including
+`analyze_frames`, the configured freeze length), engine stats (rate, format, period, xruns,
+generation), system info (CPU, temperature, IP, sync errors) and the `limits` object the
+console uses for feature detection and slider ranges.
+
+Each input and output carries a `name`, shown next to its number in the console. Names are
+set only by editing `config.json` on the data partition (or the image default) — there is no
+API to change them.
 
 ## Inputs
 
@@ -51,6 +56,15 @@ Two consequences:
 Plays three 100 ms beeps on that output *only*, overriding whatever is routed there, then
 reverts by itself. Use it to find out which physical socket a channel really comes out of.
 
+### `PUT /api/channel-map`
+```json
+{"input_map": [0,1,2,3,4,5], "output_map": [0,1,2,3,4,5,6,7]}
+```
+`input_map[logical] = physical TDM slot to capture from`, `output_map[logical] = slot to play
+into` — the remedy for the Octo's slot rotation (see
+[octo-known-issues.md](octo-known-issues.md)). Each map must be a permutation: slots in range
+and no duplicates, or the whole request is rejected.
+
 ## Generators
 
 All generator timing is derived from the same absolute sample counter that indexes the
@@ -88,13 +102,26 @@ differ by exactly `round(interval_s × rate)`.
 ## Capture, scope and delay measurement
 
 ### `POST /api/capture/freeze` · `POST /api/capture/resume` · `GET /api/capture/status`
-Freeze copies the ring into a snapshot so measurements cannot shift while you work.
+Freeze copies the ring into a snapshot so measurements cannot shift while you work. (The
+console's **Analyze** button is this call.)
 ```json
 {"frozen": true, "freeze_sample": 2897920, "valid_start": 1857536, "valid_len": 1040384,
  "generation": 0}
 ```
 `valid_start`/`valid_len` bound the samples you may ask for. `generation` increments on every
-xrun: if it changed, the timeline has a discontinuity in it.
+xrun: if it changed, the timeline has a discontinuity in it. The status reply additionally
+carries `live_now` (the write head's sample index) and `live_oldest` (the oldest live sample
+still guaranteed readable).
+
+### `POST /api/capture/config`
+```json
+{"seconds": 20.0}
+```
+How many recent frames the next freeze copies — the console's *Analyze buffer*. Body:
+`{"seconds": N}` (preferred) or `{"frames": N}`, clamped to
+[4096, `limits.capture_max_frames`]. The reply echoes what took effect:
+`{"analyze_frames":…, "analyze_seconds":…, "max_frames":…, "max_seconds":…}`. Not persisted:
+a restart returns to the 20 s default. Advertised by `limits.capture_config: true`.
 
 ### `GET /api/capture/window?ch=&start=&len=&cols=`
 `start` and `len` are **absolute sample indices** on the shared counter axis. Returns
@@ -164,12 +191,14 @@ a bug.
 At most **12** listen streams (WS + WAV + Ogg combined) are served at once; further requests get
 503.
 
-### `POST /api/stream/codec`
+### `POST /api/listen/codec`
 Body: `{"codec":"pcm"|"opus"}` and/or `{"bitrate_kbps":N}`. Sets the daemon's **default** codec
-(what the console prefers and what `stream.ogg` uses) and the per-channel Opus bitrate, which is
-clamped and applied live — active Opus streams follow a bitrate change. The reply echoes what took
-effect: `{"codec":…,"bitrate_kbps":…}`. This never changes the WS wire default: a browser still
-opts into Opus explicitly with `?codec=opus`. Saved by `POST /api/config/save`.
+(the console's preference, advertised as `limits.listen_default_codec`) and the per-channel Opus
+bitrate, which is clamped, applied live — active Opus streams follow a change — and also used by
+`stream.ogg` when no `?bitrate=` is given (`stream.ogg` itself is always Ogg/Opus regardless of
+the codec default). The reply echoes what took effect: `{"codec":…,"bitrate_kbps":…}`. This never
+changes the WS wire default: a browser still opts into Opus explicitly with `?codec=opus`. Saved
+by `POST /api/config/save`.
 
 `GET /api/state` advertises `limits.listen_codecs` (e.g. `["pcm","opus"]`),
 `limits.listen_default_codec`, `limits.listen_bitrate_kbps`, `limits.listen_bitrate_min_kbps` /
@@ -180,33 +209,33 @@ opts into Opus explicitly with `?codec=opus`. Saved by `POST /api/config/save`.
 ### `WS /api/ws` — push only, no client messages
 | rate | message |
 |---|---|
-| 10 Hz | `{"type":"meters","n":…,"rms_db":[6],"peak_db":[6],"dc":[6]}` |
+| 10 Hz | `{"type":"meters","sample":…,"rms_db":[6],"peak_db":[6]}` |
 | 5 Hz | `{"type":"spectrum","channels":[{"ch":0,"bins":[240],"tone":{…}}]}` |
-| 10 Hz | **binary** wave frame (below) |
-| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"cpu_pct":…,"temp_c":…}` |
+| 10 Hz | **binary** envelope frame (below) |
+| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"listen_streams":…,"engine_running":…,"cpu_pct":…,"temp_c":…,"mem":{…},"throttle":{…}}` |
 
 Spectrum bins are quantised to 0.1 dB — finer than any display can resolve, and it keeps one
 spectrum message near 10 kB. Raw floats serialise each bin to full precision
 (`-88.61194610595703`) and cost 27.9 kB per message.
 
-Binary wave frame: `u8 type=1`, `u64 first_sample`, `u16 ncols`, then
+Binary envelope frame: `u8 type=1`, `u64 first_sample`, `u16 ncols`, then
 `ncols × 6 × {i16 min, i16 max}`. One column is 480 frames (200 columns/s at 96 kHz).
 
-The wave frame rate is 10 Hz because that is the rate at which the analysis thread *produces*
-envelope columns (~20 per tick). Frame rate is only a packing choice — the scope's fidelity comes
-from the 200 columns/s. Pushing at 15 Hz finds an empty ring on a third of its ticks and sends
-nothing.
+The envelope frame rate is 10 Hz because that is the rate at which the analysis thread
+*produces* envelope columns (~20 per tick). Frame rate is only a packing choice — the scope's
+fidelity comes from the 200 columns/s. Pushing at 15 Hz finds an empty ring on a third of its
+ticks and sends nothing.
 
-### `POST /api/stream/inputs`
+### `POST /api/telemetry/inputs`
 Body: `{"enabled":[bool ×6]}`. Tells the daemon which inputs the console is watching; inputs set
 `false` are **dropped from the spectrum message**, the widest frame on the wire, so a console
 showing two of six inputs pulls roughly a third of the spectrum bandwidth. The meters message and
-the binary wave frame keep their fixed six-channel shape for compatibility with any console — the
-console hides disabled inputs on its own regardless.
+the binary envelope frame keep their fixed six-channel shape for compatibility with any console —
+the console hides disabled inputs on its own regardless.
 
 The mask is process-global and last-writer-wins: this is a single-operator bench, so two consoles
 disagreeing is out of scope. It resets to all-enabled on daemon restart; the console re-posts it on
-every WebSocket (re)connect. Support is advertised by `limits.stream_mask: true` in
+every WebSocket (re)connect. Support is advertised by `limits.telemetry_mask: true` in
 `GET /api/state`; a console that does not see the flag simply skips the POST and disables inputs
 client-side only.
 
@@ -221,6 +250,13 @@ the write and back to read-only afterwards.
 Removes the saved file; the next boot uses the image defaults.
 
 ### `POST /api/system/reboot`
+Answers `{"ok":true}` first, then runs `systemctl reboot` — the browser needs the response
+before the socket dies.
+
+### `POST /api/system/shutdown`
+Same shape as reboot, running `systemctl poweroff`. The rootfs is read-only, so pulling the
+plug is *usually* survivable — but `/data` is briefly writable during a save, and a hard power
+cut inside that window can corrupt the SD card, which is why a clean shutdown exists at all.
 
 ### `POST /api/system/inject-kmsg`
 Test hook: feeds a line to the kmsg watcher, so the I2S-sync-error banner can be exercised

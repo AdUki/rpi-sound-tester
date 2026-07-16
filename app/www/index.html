@@ -11,8 +11,7 @@
 <header>
   <h1>Sound Tester</h1>
   <div class="status">
-    <button id="feedtoggle" class="feedtoggle"
-      title="Stop the live data feed (waveform, spectrum, meters, telemetry) to save bandwidth. Listen audio keeps playing.">Pause feed</button>
+    <button id="feedtoggle" class="feedtoggle">Pause feed</button>
     <span id="conn" class="pill bad">connecting</span>
     <span id="engine" class="pill"></span>
     <span id="xruns" class="pill"></span>
@@ -74,7 +73,7 @@
 
   <div class="monitor">
     <span class="mlabel">Monitor volume</span>
-    <input type="range" id="monvol" min="-20" max="40" step="0.5">
+    <input type="range" id="monvol" step="0.5">
     <span id="monvolv" class="mono val">unity</span>
     <span class="muted small mnote">
       Applied in the browser, to both ears at once, on everything Listen L / Listen R is playing.
@@ -86,7 +85,7 @@
 
   <div class="monitor">
     <span class="mlabel">Monitor buffer</span>
-    <input type="range" id="monlat" min="50" max="500" step="10">
+    <input type="range" id="monlat" step="10">
     <span id="monlatv" class="mono val">150 ms</span>
     <span class="muted small mnote">
       How far ahead the browser queues the monitor audio before playing it. A larger buffer rides
@@ -96,14 +95,14 @@
     </span>
   </div>
 
-  <div class="monitor" id="codecrow">
+  <div class="monitor">
     <span class="mlabel">Listen codec</span>
     <select id="listencodec" class="mono">
       <option value="pcm">PCM (raw)</option>
       <option value="opus">Opus</option>
     </select>
     <label class="mono val" id="bitratewrap">
-      <input type="range" id="listenbitrate" min="16" max="256" step="8" style="width:120px">
+      <input type="range" id="listenbitrate" min="16" max="256" step="8">
       <span id="listenbitratev">96 kbps</span>
     </label>
     <span class="muted small mnote">
@@ -168,7 +167,7 @@
   <div id="xcorrout" class="result"></div>
   <canvas id="scopecanvas" height="520"></canvas>
   <div id="lanes" class="lanes"></div>
-  <div id="specctl" class="specctl" hidden>
+  <div id="sgctl" class="sgctl" hidden>
     <span class="tglabel">Spectrogram</span>
     <label>FFT
       <select id="sgfft"><option>1024</option><option selected>2048</option><option>4096</option></select>
@@ -201,33 +200,33 @@
   </div>
   <div class="card">
     <h3>Sine</h3>
-    <label>Frequency <input type="number" id="sineFreq" min="1" max="40000" step="1"> Hz</label>
-    <label>Level <input type="range" id="sineLevel" min="-60" max="0" step="0.5">
-      <span id="sineLevelV" class="mono val"></span> dBFS</label>
+    <label>Frequency <input type="number" id="sinefreq" min="1" max="40000" step="1"> Hz</label>
+    <label>Level <input type="range" id="sinelevel" min="-60" max="0" step="0.5">
+      <span id="sinelevelv" class="mono val"></span> dBFS</label>
     <p class="muted small">996.09 Hz is bin-centred at 96 kHz / 8192 — use it for clean THD+N.</p>
   </div>
   <div class="card">
     <h3>Noise</h3>
     <label>Mode
-      <select id="noiseMode"><option value="white">white</option><option value="pink">pink</option></select>
+      <select id="noisemode"><option value="white">white</option><option value="pink">pink</option></select>
     </label>
-    <label>Level <input type="range" id="noiseLevel" min="-60" max="0" step="0.5">
-      <span id="noiseLevelV" class="mono val"></span> dBFS</label>
+    <label>Level <input type="range" id="noiselevel" min="-60" max="0" step="0.5">
+      <span id="noiselevelv" class="mono val"></span> dBFS</label>
     <p class="muted small">Pink uses the Kellett filter, tuned for 44.1 kHz: at 96 kHz the slope
       tilts by a couple of dB across the band.</p>
   </div>
   <div class="card">
     <h3>Ping <span class="muted">(multiroom)</span></h3>
     <label>Variant
-      <select id="pingVariant">
+      <select id="pingvariant">
         <option value="tick">tick — 3 kHz, sharp (use this to measure)</option>
         <option value="bing">bing — 1 kHz, 60 ms</option>
         <option value="bong">bong — 440 Hz, 250 ms</option>
       </select>
     </label>
-    <label>Interval <input type="number" id="pingInterval" min="0.5" max="60" step="0.5"> s</label>
-    <label>Level <input type="range" id="pingLevel" min="-60" max="0" step="0.5">
-      <span id="pingLevelV" class="mono val"></span> dBFS</label>
+    <label>Interval <input type="number" id="pinginterval" min="0.5" max="60" step="0.5"> s</label>
+    <label>Level <input type="range" id="pinglevel" min="-60" max="0" step="0.5">
+      <span id="pinglevelv" class="mono val"></span> dBFS</label>
     <p class="muted small">Only <em>tick</em> decays fast enough to give an unambiguous
       correlation peak. bing and bong ring for many cycles and are meant to be heard, not measured.</p>
     <h4>Recent emissions</h4>

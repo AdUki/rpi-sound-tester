@@ -9,13 +9,14 @@ sample is 10.4 µs, or 3.6 mm of air.
 1. **Generators → Ping**, variant **tick**. Only `tick` is a measurement stimulus (see below).
 2. Route the ping to the outputs under test (Dashboard → OUT *n* → Source: `Gen: ping`).
 3. Feed the signal back into two inputs — by cable, or through a speaker and a microphone.
-4. **Scope → Freeze.** Everything after this point is computed on the frozen snapshot, so the
-   numbers cannot shift under you while you work.
+4. **Scope & sync → Analyze.** This freezes the capture: everything after this point is
+   computed on the frozen snapshot, so the numbers cannot shift under you while you work.
 5. Left-click to place cursor **A**, right-click for **B**, bracketing **one** ping.
-6. **Measure delay A→B**, pick the two input channels.
+6. Pick the two input channels in the Delay selector and press **Measure**.
 
-You get `lag_samples`, `lag_ms` and `lag_m`. Sign convention: **a positive lag means the
-signal arrives *later* on the second channel.**
+The console shows the lag in samples and ms with its confidence; the API response also
+carries `lag_m`. Sign convention: **a positive lag means the signal arrives *later* on the
+second channel.**
 
 The distance is `lag_ms × 0.343` m (343 m/s). It is only meaningful for an acoustic path —
 for a cable, the lag is the device's delay, not a distance.
@@ -61,7 +62,7 @@ offset, not a drift — the same on every channel, every run, until you change t
 Measure it once:
 
 1. Wire **OUT 1 straight into IN 1** with a short cable.
-2. Route the ping to OUT 1 and freeze. Cross-correlation is no help with only one channel:
+2. Route the ping to OUT 1 and press **Analyze**. Cross-correlation is no help with only one channel:
    read the ping's own emission sample from **Generators → Recent emissions**, then find the
    arrival in the scope on IN 1. The difference is the loopback offset.
 3. Store it in `loopback_offset_samples` in the config if you want it recorded. The daemon

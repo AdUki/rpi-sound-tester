@@ -7,6 +7,7 @@
 namespace st {
 
 inline constexpr float kMinDb = -120.0f;
+inline constexpr double kTwoPi = 6.283185307179586476925286766559;
 
 inline float db_to_lin(float db) { return db <= -100.0f ? 0.0f : std::pow(10.0f, db / 20.0f); }
 
@@ -32,5 +33,15 @@ inline int32_t float_to_s32(float v) {
 }
 
 inline float s32_to_float(int32_t v) { return static_cast<float>(v) * (1.0f / 2147483648.0f); }
+
+// xorshift64* white noise; take the top 24 bits so the value maps exactly onto a float
+// mantissa. Shared by the noise generator and the simulator's ADC-noise floor.
+inline float xorshift_white(uint64_t& state) {
+  state ^= state >> 12;
+  state ^= state << 25;
+  state ^= state >> 27;
+  const uint64_t x = state * 0x2545f4914f6cdd1dull;
+  return static_cast<float>(x >> 40) * (1.0f / 8388608.0f) - 1.0f;  // [-1, 1)
+}
 
 }  // namespace st

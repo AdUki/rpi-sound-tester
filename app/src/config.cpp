@@ -85,10 +85,13 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
       for (size_t i = 0; i < arr.size() && i < kOutputs; ++i) {
         const auto& o = arr[i];
         if (o.contains("source")) {
-          c.outputs[i].source_type = o["source"].value("type", std::string("silence"));
-          const auto& idx = o["source"]["index"];
-          c.outputs[i].source_index = idx.is_string() ? idx.get<std::string>()
-                                                      : std::to_string(idx.get<int>());
+          const json& src = o["source"];
+          c.outputs[i].source_type = src.value("type", std::string("silence"));
+          if (src.contains("index")) {
+            const auto& idx = src["index"];
+            c.outputs[i].source_index = idx.is_string() ? idx.get<std::string>()
+                                                        : std::to_string(idx.get<int>());
+          }
         }
         c.outputs[i].gain_db = o.value("gain_db", 0.0f);
         c.outputs[i].mute = o.value("mute", false);
@@ -159,49 +162,40 @@ void Config::apply_to(Control& ctl) const {
       }
     }
     ctl.outputs[i].source.store(pack_source(type, index));
-    ctl.outputs[i].gain_db.store(std::clamp(o.gain_db, -60.0f, 0.0f));
+    ctl.outputs[i].gain_db.store(std::clamp(o.gain_db, kLevelMinDb, kLevelMaxDb));
     ctl.outputs[i].mute.store(o.mute);
   }
 
-  ctl.sine.freq_hz.store(std::clamp(sine_freq_hz, 1.0f, 40000.0f));
-  ctl.sine.level_db.store(std::clamp(sine_level_db, -60.0f, 0.0f));
+  ctl.sine.freq_hz.store(std::clamp(sine_freq_hz, kSineFreqMinHz, kSineFreqMaxHz));
+  ctl.sine.level_db.store(std::clamp(sine_level_db, kLevelMinDb, kLevelMaxDb));
 
-  ctl.noise.mode.store(static_cast<uint8_t>(noise_mode == "pink" ? NoiseMode::Pink
-                                                                 : NoiseMode::White));
-  ctl.noise.level_db.store(std::clamp(noise_level_db, -60.0f, 0.0f));
+  NoiseMode nm = NoiseMode::White;
+  parse_noise(noise_mode, &nm);
+  ctl.noise.mode.store(static_cast<uint8_t>(nm));
+  ctl.noise.level_db.store(std::clamp(noise_level_db, kLevelMinDb, kLevelMaxDb));
 
   PingVariant pv = PingVariant::Tick;
   parse_ping(ping_variant, &pv);
   ctl.ping.variant.store(static_cast<uint8_t>(pv));
-  ctl.ping.interval_s.store(std::clamp(ping_interval_s, 0.5f, 60.0f));
-  ctl.ping.level_db.store(std::clamp(ping_level_db, -60.0f, 0.0f));
+  ctl.ping.interval_s.store(std::clamp(ping_interval_s, kPingIntervalMinS, kPingIntervalMaxS));
+  ctl.ping.level_db.store(std::clamp(ping_level_db, kLevelMinDb, kLevelMaxDb));
   ctl.ping.epoch.fetch_add(1);
 
-  ctl.listen.codec.store(
-      static_cast<uint8_t>(listen_codec == "opus" ? ListenCodec::Opus : ListenCodec::Pcm));
+  ListenCodec lc = ListenCodec::Pcm;
+  parse_codec(listen_codec, &lc);
+  ctl.listen.codec.store(static_cast<uint8_t>(lc));
   ctl.listen.bitrate_kbps.store(
       std::clamp(listen_bitrate_kbps, kListenBitrateMinKbps, kListenBitrateMaxKbps));
 
-  // The audio loop writes each physical slot exactly once, via this map. A duplicate entry
-  // would leave some slot never written (stale audio) and let two logical channels fight
-  // over another, so a map that is not a permutation is rejected wholesale.
-  auto is_permutation = [](const uint8_t* v, size_t n, unsigned limit) {
-    bool seen[kTdmSlots] = {false};
-    for (size_t i = 0; i < n; ++i) {
-      if (v[i] >= limit || seen[v[i]]) return false;
-      seen[v[i]] = true;
-    }
-    return true;
-  };
-
-  if (is_permutation(input_map.data(), kInputs, kTdmSlots)) {
+  // A saved map that is not a permutation (see is_slot_permutation) is rejected wholesale.
+  if (is_slot_permutation(input_map, kTdmSlots)) {
     for (unsigned i = 0; i < kInputs; ++i) ctl.input_map[i].store(input_map[i]);
   } else {
     LOG_WARN("input_map is not a permutation — falling back to identity");
     for (unsigned i = 0; i < kInputs; ++i) ctl.input_map[i].store(static_cast<uint8_t>(i));
   }
 
-  if (is_permutation(output_map.data(), kOutputs, kOutputs)) {
+  if (is_slot_permutation(output_map, kOutputs)) {
     for (unsigned i = 0; i < kOutputs; ++i) ctl.output_map[i].store(output_map[i]);
   } else {
     LOG_WARN("output_map is not a permutation — falling back to identity");
@@ -231,7 +225,7 @@ Config Config::from_control(const Control& ctl, const Config& base) {
 
   c.sine_freq_hz = ctl.sine.freq_hz.load();
   c.sine_level_db = ctl.sine.level_db.load();
-  c.noise_mode = ctl.noise.mode.load() == static_cast<uint8_t>(NoiseMode::Pink) ? "pink" : "white";
+  c.noise_mode = noise_name(static_cast<NoiseMode>(ctl.noise.mode.load()));
   c.noise_level_db = ctl.noise.level_db.load();
   c.ping_variant = ping_name(static_cast<PingVariant>(ctl.ping.variant.load()));
   c.ping_interval_s = ctl.ping.interval_s.load();
@@ -240,8 +234,7 @@ Config Config::from_control(const Control& ctl, const Config& base) {
   for (unsigned i = 0; i < kInputs; ++i) c.input_map[i] = ctl.input_map[i].load();
   for (unsigned i = 0; i < kOutputs; ++i) c.output_map[i] = ctl.output_map[i].load();
 
-  c.listen_codec =
-      ctl.listen.codec.load() == static_cast<uint8_t>(ListenCodec::Opus) ? "opus" : "pcm";
+  c.listen_codec = codec_name(static_cast<ListenCodec>(ctl.listen.codec.load()));
   c.listen_bitrate_kbps = ctl.listen.bitrate_kbps.load();
   return c;
 }

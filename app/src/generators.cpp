@@ -8,9 +8,8 @@
 namespace st {
 
 namespace {
-constexpr double kTwoPi = 6.283185307179586476925286766559;
+
 constexpr float kAttackS = 0.001f;  // 1 ms linear attack on every ping
-}  // namespace
 
 PingShape ping_shape(PingVariant v) {
   switch (v) {
@@ -24,6 +23,8 @@ PingShape ping_shape(PingVariant v) {
   }
 }
 
+}  // namespace
+
 void Generators::init(double rate) {
   rate_ = rate;
   sine_phase_ = 0.0;
@@ -31,14 +32,7 @@ void Generators::init(double rate) {
   burst_active_ = false;
 }
 
-float Generators::white() {
-  // xorshift64*; take the top 24 bits so the value maps exactly onto a float mantissa.
-  prng_ ^= prng_ >> 12;
-  prng_ ^= prng_ << 25;
-  prng_ ^= prng_ >> 27;
-  const uint64_t x = prng_ * 0x2545f4914f6cdd1dull;
-  return static_cast<float>(x >> 40) * (1.0f / 8388608.0f) - 1.0f;  // [-1, 1)
-}
+float Generators::white() { return xorshift_white(prng_); }
 
 void Generators::render_sine(size_t frames, float freq_hz, float amp, float* out) {
   const double step = kTwoPi * static_cast<double>(freq_hz) / rate_;
@@ -127,10 +121,9 @@ void Generators::render(uint64_t n, size_t frames, const Control& ctl, float* si
 }
 
 float Generators::identify_sample(uint64_t elapsed) const {
-  // 3 x 100 ms of 1 kHz separated by 100 ms of silence.
   const double t = static_cast<double>(elapsed) / rate_;
-  const double slot = std::fmod(t, 0.2);
-  if (t >= 0.5 || slot >= 0.1) return 0.0f;
+  const double slot = std::fmod(t, 2.0 * kIdentifyBurstS);
+  if (t >= kIdentifySeconds || slot >= kIdentifyBurstS) return 0.0f;
   return 0.35f * static_cast<float>(std::sin(kTwoPi * 1000.0 * t));
 }
 

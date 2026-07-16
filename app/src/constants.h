@@ -18,6 +18,15 @@ inline constexpr unsigned kTdmSlots = 8;
 inline constexpr float kInputGainMinDb = 0.0f;
 inline constexpr float kInputGainMaxDb = 40.0f;
 
+// Shared clamp ranges, enforced both when a config file is applied (config.cpp) and on the
+// live PUT handlers (webserver.cpp) so the two paths cannot drift.
+inline constexpr float kLevelMinDb = -60.0f;  // output gain and generator levels
+inline constexpr float kLevelMaxDb = 0.0f;
+inline constexpr float kSineFreqMinHz = 1.0f;
+inline constexpr float kSineFreqMaxHz = 40000.0f;
+inline constexpr float kPingIntervalMinS = 0.5f;
+inline constexpr float kPingIntervalMaxS = 60.0f;
+
 inline constexpr unsigned kDefaultRate = 96000;
 inline constexpr unsigned kDefaultPeriod = 1024;
 inline constexpr unsigned kDefaultPeriods = 4;
@@ -25,9 +34,9 @@ inline constexpr unsigned kDefaultPeriods = 4;
 // 2^23 frames = 87.4 s at 96 kHz, 192 MB of float32 x 6ch. Power of two: index by mask.
 // This is the *ceiling*; how much of it a freeze actually copies is set at runtime by
 // CaptureStore::set_analyze_frames (POST /api/capture/config). Note the true RAM cost is
-// ~2x this: the live ring here plus an equally-sized frozen snapshot in CaptureStore. So
-// 192 MB ring + 192 MB snapshot = 384 MB pinned. Raise this exponent only with headroom to
-// spare — 2^24 would be 768 MB total, too tight on a 1 GB Pi.
+// ~2x this: the live ring here plus a nearly ring-sized frozen snapshot in CaptureStore —
+// ~380 MB pinned in total. Raise this exponent only with headroom to spare — 2^24 would be
+// ~760 MB total, too tight on a 1 GB Pi.
 inline constexpr size_t kRingFrames = 1u << 23;
 
 // Freeze copies the ring minus a safety margin, so the copy has room to finish before the
@@ -58,14 +67,11 @@ inline constexpr unsigned kMaxListenStreams = 12;
 
 // Opus listen path. Opus only accepts 8/12/16/24/48 kHz input, so the 96 kHz ring is decimated
 // to 48 kHz and encoded in 20 ms frames. One WebSocket message carries one frame:
-// kOpusInFrames read from the ring -> (rate/kOpusRate):1 decimation -> kOpusFrameFrames -> one
-// opus_encode. 4096 was never a legal Opus frame size; 960 (@48 kHz) is, which is why the
-// encoded path uses its own chunk length rather than kListenChunkFrames.
+// kOpusFrameFrames * (rate / kOpusRate) ring frames -> decimation -> one opus_encode. 4096 was
+// never a legal Opus frame size; 960 (@48 kHz) is, which is why the encoded path uses its own
+// chunk length rather than kListenChunkFrames.
 inline constexpr unsigned kOpusRate = 48000;
 inline constexpr unsigned kOpusFrameFrames = 960;  // 20 ms @ 48 kHz — a legal Opus frame size
-// Ring frames per Opus frame at the default 96 kHz rate (2:1). The encoder recomputes this from
-// the live engine rate; kOpusFrameFrames * (rate / kOpusRate).
-inline constexpr unsigned kOpusInFramesAt96 = kOpusFrameFrames * (kDefaultRate / kOpusRate);
 
 // Per-mono-channel Opus bitrate. The multichannel stream.ogg scales this by the channel count.
 inline constexpr int kListenBitrateDefaultKbps = 96;

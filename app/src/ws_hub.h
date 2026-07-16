@@ -29,7 +29,6 @@ class WsHub {
     std::condition_variable cv;
     std::deque<WsMessagePtr> q;
     bool closed = false;
-    uint64_t dropped = 0;
   };
   using ClientPtr = std::shared_ptr<Client>;
 

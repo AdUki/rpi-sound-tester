@@ -16,6 +16,20 @@ const post = (p, obj) => api(p, {
 const $ = id => document.getElementById(id);
 const NIN = 6, NOUT = 8;
 
+const tabActive = name => $(name).classList.contains('active');
+
+// localStorage access throws, not just returns null, when the origin has storage blocked
+// (browser "block site data", an enterprise policy on this plain-http LAN address). Some of
+// these reads run first in the /state chain, where an unguarded throw would skip building the
+// whole UI and get swallowed as a "cannot reach the daemon" error — a healthy device
+// misreported as dead. So every access goes through these two.
+const lsGet = key => {
+  try { return localStorage.getItem(key); } catch (e) { return null; }
+};
+const lsSet = (key, val) => {
+  try { localStorage.setItem(key, val); } catch (e) { /* storage blocked / private mode */ }
+};
+
 // Non-modal error strip. alert() steals focus and blocks the page — on a bench instrument
 // that interrupts exactly the moment you are watching.
 function toast(msg) {
@@ -81,6 +95,14 @@ window.addEventListener('resize', () => {
 
 const RAMP_S = 0.02;   // stepping a gain from 0 to 1 under a running stream is an audible click
 
+// Every gain move rides this ramp — the monitor volume and the per-ear taps alike.
+function rampGain(gainNode, target) {
+  const g = gainNode.gain, t = monitor.ctx.currentTime;
+  g.cancelScheduledValues(t);
+  g.setValueAtTime(g.value, t);
+  g.linearRampToValueAtTime(target, t + RAMP_S);
+}
+
 // Monitor volume. This is the browser's playback level, not the device's: it hangs off the far
 // end of the graph, downstream of the merger, so it lifts every channel and both ears together
 // and leaves the samples the daemon measures untouched. The per-input Gain slider is the other
@@ -126,13 +148,9 @@ const monitor = {
     return this.ctx;
   },
 
-  // Ramped for the same reason the taps are: a gain stepped under a running stream clicks.
   setVolume(db) {
     if (!this.master) return;   // nothing is playing yet; ensure() will pick monitorDb up
-    const g = this.master.gain, t = this.ctx.currentTime;
-    g.cancelScheduledValues(t);
-    g.setValueAtTime(g.value, t);
-    g.linearRampToValueAtTime(dbToLin(db), t + RAMP_S);
+    rampGain(this.master, dbToLin(db));
   },
 
   // Absolute capture sample -> context play time. Chunks are scheduled monLatency ahead of real
@@ -241,10 +259,17 @@ class Listener {
   // re-times anything: whatever is still playing stays sample-aligned with it.
   setSide(side, on) {
     this.sides[side] = on;
-    const g = this.taps[side].gain, t = monitor.ctx.currentTime;
-    g.cancelScheduledValues(t);
-    g.setValueAtTime(g.value, t);
-    g.linearRampToValueAtTime(on ? 1 : 0, t + RAMP_S);
+    rampGain(this.taps[side], on ? 1 : 0);
+  }
+
+  // Fed to both taps unconditionally; which ears actually hear it is the taps' gains. Scheduled
+  // on the shared timeline by the chunk's absolute capture index.
+  schedule(ab, start) {
+    const src = monitor.ctx.createBufferSource();
+    src.buffer = ab;
+    src.connect(this.taps.l);
+    src.connect(this.taps.r);
+    src.start(monitor.timeFor(start));
   }
 
   // Opus: [u64 capture index][raw Opus packet]. Decode to Float32 @ opusRate and schedule on the
@@ -256,14 +281,9 @@ class Listener {
     try { out = this.dec.decodeFrame(new Uint8Array(buf, 8)); } catch (e) { return; }
     const n = out.samplesDecoded;
     if (!n) return;   // an encoder warm-up frame with nothing to play yet
-    const ctx = monitor.ctx;
-    const ab = ctx.createBuffer(1, n, out.sampleRate);
+    const ab = monitor.ctx.createBuffer(1, n, out.sampleRate);
     ab.getChannelData(0).set(out.channelData[0].subarray(0, n));
-    const src = ctx.createBufferSource();
-    src.buffer = ab;
-    src.connect(this.taps.l);
-    src.connect(this.taps.r);
-    src.start(monitor.timeFor(start));
+    this.schedule(ab, start);
   }
 
   onchunk(buf) {
@@ -290,12 +310,7 @@ class Listener {
       }
     }
 
-    // Fed to both taps unconditionally; which ears actually hear it is the taps' gains.
-    const src = ctx.createBufferSource();
-    src.buffer = ab;
-    src.connect(this.taps.l);
-    src.connect(this.taps.r);
-    src.start(monitor.timeFor(start));
+    this.schedule(ab, start);
   }
 
   stop() {
@@ -347,22 +362,19 @@ function toggleListen(ch, side) {
 // Survives a reload: on a bench you set the monitor level once for the device under test and
 // then stop thinking about it.
 function initMonitorVolume() {
-  // Reading localStorage throws, not just returns null, when the origin has storage blocked
-  // (browser "block site data", an enterprise policy on this plain-http LAN address). This runs
-  // first in the /state chain, so an unguarded throw here would skip building the whole UI and
-  // get swallowed as a "cannot reach the daemon" error — a healthy device misreported as dead.
-  let saved = NaN;
-  try { saved = parseFloat(localStorage.getItem('monitor_db')); } catch (err) { /* storage blocked */ }
+  const saved = parseFloat(lsGet('monitor_db'));
   monitorDb = Number.isFinite(saved) ? Math.min(MON_MAX_DB, Math.max(MON_MIN_DB, saved)) : 0;
 
   const sl = $('monvol');
+  sl.min = MON_MIN_DB;
+  sl.max = MON_MAX_DB;
   sl.value = monitorDb;
   setMonitorLabel(monitorDb);
   sl.oninput = e => {
     monitorDb = parseFloat(e.target.value);
     setMonitorLabel(monitorDb);
     monitor.setVolume(monitorDb);
-    try { localStorage.setItem('monitor_db', String(monitorDb)); } catch (err) { /* private mode */ }
+    lsSet('monitor_db', String(monitorDb));
   };
 }
 
@@ -375,19 +387,20 @@ function setMonitorLabel(db) {
 // Also survives a reload, for the same bench reason. Stored in ms because that is what the slider
 // and the readout speak; monLatency stays in seconds because that is what the scheduler speaks.
 function initMonitorLatency() {
-  let ms = NaN;
-  try { ms = parseFloat(localStorage.getItem('monitor_latency_ms')); } catch (err) { /* storage blocked */ }
+  let ms = parseFloat(lsGet('monitor_latency_ms'));
   ms = Number.isFinite(ms) ? Math.min(MON_LAT_MAX_MS, Math.max(MON_LAT_MIN_MS, ms)) : 150;
   monLatency = ms / 1000;
 
   const sl = $('monlat');
+  sl.min = MON_LAT_MIN_MS;
+  sl.max = MON_LAT_MAX_MS;
   sl.value = ms;
   setLatencyLabel(ms);
   sl.oninput = e => {
     const v = parseFloat(e.target.value);
     monLatency = v / 1000;
     setLatencyLabel(v);
-    try { localStorage.setItem('monitor_latency_ms', String(v)); } catch (err) { /* private mode */ }
+    lsSet('monitor_latency_ms', String(v));
   };
   // Apply the new buffer once, on release: dropping the anchor re-establishes the lead at the new
   // depth on the next chunk. Doing it per input event would re-anchor once per pixel of the drag.
@@ -411,8 +424,8 @@ function initCodec() {
   sel.onchange = () => {
     listenCodec = (sel.value === 'opus' && opusAvailable) ? 'opus' : 'pcm';
     sel.value = listenCodec;
-    try { localStorage.setItem('listen_codec', listenCodec); } catch (e) { /* private mode */ }
-    post('/stream/codec', {codec: listenCodec}).catch(e => toast(e.message));
+    lsSet('listen_codec', listenCodec);
+    post('/listen/codec', {codec: listenCodec}).catch(e => toast(e.message));
     restartListeners();   // move any live listeners onto the new codec
     updateBitrateVisibility();
   };
@@ -424,7 +437,7 @@ function initCodec() {
   setBitrateLabel(listenBitrate);
   sl.oninput = () => setBitrateLabel(parseInt(sl.value, 10));
   sl.onchange = () => {
-    post('/stream/codec', {bitrate_kbps: parseInt(sl.value, 10)})
+    post('/listen/codec', {bitrate_kbps: parseInt(sl.value, 10)})
       .then(r => { listenBitrate = r.bitrate_kbps; sl.value = listenBitrate; setBitrateLabel(listenBitrate); })
       .catch(e => toast(e.message));
   };
@@ -465,21 +478,24 @@ const fmtDb = db => pad(db > -119 ? db.toFixed(1) : '-inf', 6);
 const fmtThd = p => pad(p >= 10 ? p.toFixed(1) : p >= 1 ? p.toFixed(2) : p.toFixed(3), 6);
 
 // Per-input on/off, kept on the client and surviving a reload. Disabling an input stops the page
-// rendering it (meters, spectrum, scope lane) and closes any listen stream on it. The shared
-// /api/ws feed is push-only and carries every channel, so this alone does NOT shrink its
-// bandwidth — sendStreamMask() does, but only once a daemon advertises channel masking. Until then
-// the disable is purely a client-side / CPU saving.
+// rendering it (meters, spectrum, scope lane), closes any listen stream on it, and — via
+// sendTelemetryMask() — tells the daemon to drop it from the spectrum message, the widest frame
+// on the shared push feed.
 const inputEnabled = Array(NIN).fill(true);
 
 function loadInputEnabled() {
   let saved = null;
-  try { saved = JSON.parse(localStorage.getItem('input_enabled')); } catch (e) { /* storage blocked */ }
+  try { saved = JSON.parse(lsGet('input_enabled')); } catch (e) { /* not JSON */ }
   for (let c = 0; c < NIN; c++) inputEnabled[c] = !Array.isArray(saved) || saved[c] !== false;
 }
 
 function saveInputEnabled() {
-  try { localStorage.setItem('input_enabled', JSON.stringify(inputEnabled)); } catch (e) { /* private */ }
+  lsSet('input_enabled', JSON.stringify(inputEnabled));
 }
+
+// The list of enabled input channels, in order — the lanes the scope shows and the windows the
+// frozen view fetches.
+const shownInputs = () => inputEnabled.flatMap((on, i) => (on ? [i] : []));
 
 function clearSpectrumCanvas(ch) {
   const cv = $('spec' + ch);
@@ -523,16 +539,15 @@ function setInputEnabled(ch, on) {
   saveInputEnabled();
   applyInputEnabled(ch);
   invalidateWindows();
-  sendStreamMask();
+  sendTelemetryMask();
 }
 
-// Forward-compatible: a future daemon that advertises limits.stream_mask can be told which inputs
-// to stop sending, so the shared feed actually shrinks. Older daemons omit the flag and this is a
-// no-op — the already-deployed page keeps working, and starts saving bandwidth after a reflash
-// with no second web deploy.
-function sendStreamMask() {
-  if (!(state && state.limits && state.limits.stream_mask)) return;
-  post('/stream/inputs', {enabled: inputEnabled.slice()}).catch(() => { /* best effort */ });
+// Tell the daemon which inputs to keep in the spectrum message so the shared feed actually
+// shrinks. Gated on the limits flag: a deployed daemon from before the endpoint existed omits
+// it, and this page then degrades to a client-side-only disable rather than POSTing into a 404.
+function sendTelemetryMask() {
+  if (!(state && state.limits && state.limits.telemetry_mask)) return;
+  post('/telemetry/inputs', {enabled: inputEnabled.slice()}).catch(() => { /* best effort */ });
 }
 
 function buildInputs() {
@@ -546,28 +561,28 @@ function buildInputs() {
     <div class="card">
       <div class="chan-head">
         <label class="en" title="Enable / disable this input"><input type="checkbox"
-          id="en${i.channel}" ${inputEnabled[i.channel] ? 'checked' : ''}></label>
-        <span class="chan-name">IN ${i.channel + 1}${i.name ? ' — ' + i.name : ''}</span>
+          id="en${i.ch}" ${inputEnabled[i.ch] ? 'checked' : ''}></label>
+        <span class="chan-name">IN ${i.ch + 1}${i.name ? ' — ' + i.name : ''}</span>
         <span class="listen-grp">
-          <button id="listenL${i.channel}" class="lbtn">Listen L</button>
-          <button id="listenR${i.channel}" class="lbtn">Listen R</button>
+          <button id="listenL${i.ch}" class="lbtn">Listen L</button>
+          <button id="listenR${i.ch}" class="lbtn">Listen R</button>
         </span>
       </div>
-      <div class="meter"><div class="rms" id="rms${i.channel}"></div><div class="peak" id="pk${i.channel}"></div></div>
+      <div class="meter"><div class="rms" id="rms${i.ch}"></div><div class="peak" id="pk${i.ch}"></div></div>
       <div class="readout">
-        <span id="rmsv${i.channel}" class="mono">     — dBFS</span>
-        <span id="pkv${i.channel}" class="mono rt">pk      —</span>
-        <span id="tone${i.channel}" class="mono">      — Hz</span>
-        <span id="thd${i.channel}" class="mono rt">THD+N      —%</span>
+        <span id="rmsv${i.ch}" class="mono">     — dBFS</span>
+        <span id="pkv${i.ch}" class="mono rt">pk      —</span>
+        <span id="tone${i.ch}" class="mono">      — Hz</span>
+        <span id="thd${i.ch}" class="mono rt">THD+N      —%</span>
       </div>
-      ${hasGain ? `<label>Gain <input type="range" id="igain${i.channel}"
+      ${hasGain ? `<label>Gain <input type="range" id="igain${i.ch}"
              min="${gainMinDb}" max="${gainMaxDb}" step="0.5">
-        <span id="igainv${i.channel}" class="mono val"></span> dB</label>` : ''}
-      <canvas class="mini" id="spec${i.channel}"></canvas>
+        <span id="igainv${i.ch}" class="mono val"></span> dB</label>` : ''}
+      <canvas class="mini" id="spec${i.ch}"></canvas>
     </div>`).join('');
 
   state.inputs.forEach(i => {
-    const c = i.channel;
+    const c = i.ch;
     $('listenL' + c).onclick = () => toggleListen(c, 'l');
     $('listenR' + c).onclick = () => toggleListen(c, 'r');
     $('en' + c).onchange = e => setInputEnabled(c, e.target.checked);
@@ -608,17 +623,17 @@ function buildOutputs() {
   $('outputs').innerHTML = state.outputs.map(o => `
     <div class="card">
       <div class="chan-head">
-        <span class="chan-name">OUT ${o.channel + 1}${o.name ? ' — ' + o.name : ''}</span>
-        <button id="id${o.channel}">Identify</button>
+        <span class="chan-name">OUT ${o.ch + 1}${o.name ? ' — ' + o.name : ''}</span>
+        <button id="id${o.ch}">Identify</button>
       </div>
-      <label>Source <select id="src${o.channel}">${opts}</select></label>
-      <label>Gain <input type="range" id="gain${o.channel}" min="-60" max="0" step="0.5">
-        <span id="gainv${o.channel}" class="mono val"></span> dB</label>
-      <label><input type="checkbox" id="mute${o.channel}"> Mute</label>
+      <label>Source <select id="src${o.ch}">${opts}</select></label>
+      <label>Gain <input type="range" id="gain${o.ch}" min="-60" max="0" step="0.5">
+        <span id="gainv${o.ch}" class="mono val"></span> dB</label>
+      <label><input type="checkbox" id="mute${o.ch}"> Mute</label>
     </div>`).join('');
 
   state.outputs.forEach(o => {
-    const c = o.channel;
+    const c = o.ch;
     $('src' + c).value = sourceValue(o.source);
     $('gain' + c).value = o.gain_db;
     $('gainv' + c).textContent = o.gain_db.toFixed(1);
@@ -634,10 +649,11 @@ function buildOutputs() {
     };
     $('gain' + c).oninput = e => {
       $('gainv' + c).textContent = parseFloat(e.target.value).toFixed(1);
-      put(`/outputs/${c}`, {gain_db: parseFloat(e.target.value)});
+      put(`/outputs/${c}`, {gain_db: parseFloat(e.target.value)}).catch(err => toast(err.message));
     };
-    $('mute' + c).onchange = e => put(`/outputs/${c}`, {mute: e.target.checked});
-    $('id' + c).onclick = () => post(`/outputs/${c}/identify`);
+    $('mute' + c).onchange = e =>
+      put(`/outputs/${c}`, {mute: e.target.checked}).catch(err => toast(err.message));
+    $('id' + c).onclick = () => post(`/outputs/${c}/identify`).catch(err => toast(err.message));
   });
 }
 
@@ -722,7 +738,7 @@ function redrawSpectra() {
 // toward the latest spectrum targets and repaint. Gated on the tab so it idles elsewhere; targets
 // keep updating in the background via ingestSpectrum, so a return to the tab catches up smoothly.
 function spectraTick() {
-  if (document.getElementById('dash').classList.contains('active')) {
+  if (tabActive('dash')) {
     for (const key of Object.keys(barState)) {
       const ch = Number(key);
       if (!inputEnabled[ch]) continue;
@@ -737,39 +753,40 @@ function spectraTick() {
 
 function bindGenerators() {
   const g = state.generators;
-  $('sineFreq').value = g.sine.freq_hz;
-  $('sineLevel').value = g.sine.level_db;
-  $('sineLevelV').textContent = g.sine.level_db.toFixed(1);
-  $('noiseMode').value = g.noise.mode;
-  $('noiseLevel').value = g.noise.level_db;
-  $('noiseLevelV').textContent = g.noise.level_db.toFixed(1);
-  $('pingVariant').value = g.ping.variant;
-  $('pingInterval').value = g.ping.interval_s;
-  $('pingLevel').value = g.ping.level_db;
-  $('pingLevelV').textContent = g.ping.level_db.toFixed(1);
+  const report = e => toast(e.message);
+  $('sinefreq').value = g.sine.freq_hz;
+  $('sinelevel').value = g.sine.level_db;
+  $('sinelevelv').textContent = g.sine.level_db.toFixed(1);
+  $('noisemode').value = g.noise.mode;
+  $('noiselevel').value = g.noise.level_db;
+  $('noiselevelv').textContent = g.noise.level_db.toFixed(1);
+  $('pingvariant').value = g.ping.variant;
+  $('pinginterval').value = g.ping.interval_s;
+  $('pinglevel').value = g.ping.level_db;
+  $('pinglevelv').textContent = g.ping.level_db.toFixed(1);
 
-  $('sineFreq').onchange = e => put('/generators/sine', {freq_hz: parseFloat(e.target.value)});
-  $('sineLevel').oninput = e => {
-    $('sineLevelV').textContent = parseFloat(e.target.value).toFixed(1);
-    put('/generators/sine', {level_db: parseFloat(e.target.value)});
+  $('sinefreq').onchange = e => put('/generators/sine', {freq_hz: parseFloat(e.target.value)}).catch(report);
+  $('sinelevel').oninput = e => {
+    $('sinelevelv').textContent = parseFloat(e.target.value).toFixed(1);
+    put('/generators/sine', {level_db: parseFloat(e.target.value)}).catch(report);
   };
-  $('noiseMode').onchange = e => put('/generators/noise', {mode: e.target.value});
-  $('noiseLevel').oninput = e => {
-    $('noiseLevelV').textContent = parseFloat(e.target.value).toFixed(1);
-    put('/generators/noise', {level_db: parseFloat(e.target.value)});
+  $('noisemode').onchange = e => put('/generators/noise', {mode: e.target.value}).catch(report);
+  $('noiselevel').oninput = e => {
+    $('noiselevelv').textContent = parseFloat(e.target.value).toFixed(1);
+    put('/generators/noise', {level_db: parseFloat(e.target.value)}).catch(report);
   };
-  $('pingVariant').onchange = e => put('/generators/ping', {variant: e.target.value});
-  $('pingInterval').onchange = e => put('/generators/ping', {interval_s: parseFloat(e.target.value)});
-  $('pingLevel').oninput = e => {
-    $('pingLevelV').textContent = parseFloat(e.target.value).toFixed(1);
-    put('/generators/ping', {level_db: parseFloat(e.target.value)});
+  $('pingvariant').onchange = e => put('/generators/ping', {variant: e.target.value}).catch(report);
+  $('pinginterval').onchange = e => put('/generators/ping', {interval_s: parseFloat(e.target.value)}).catch(report);
+  $('pinglevel').oninput = e => {
+    $('pinglevelv').textContent = parseFloat(e.target.value).toFixed(1);
+    put('/generators/ping', {level_db: parseFloat(e.target.value)}).catch(report);
   };
   // The 1 s ping poll is started (and stopped) with the live feed, not here.
 }
 
 let pings = [];
 function refreshPings() {
-  if (!document.getElementById('config').classList.contains('active') && !document.getElementById('scope').classList.contains('active')) return;
+  if (!tabActive('config') && !tabActive('scope')) return;
   api('/pings/recent').then(list => {
     pings = list;
     const el = $('pinglog');
@@ -829,6 +846,10 @@ let scopeDirty = false;
 
 const srvFrozen = () => !!(state && state.capture && state.capture.frozen);
 
+// The newest envelope column's sample — where "now" is on the scope's axis. Null before the
+// first column arrives.
+const liveEdge = () => (envCols.length ? envCols[envCols.length - 1].sample : null);
+
 // Whether the scope follows is decided by what the view shows: if it contains the live edge, it
 // follows; pan or zoom into history and it holds still, and it picks up again the moment a pan
 // or zoom brings the live edge back in. Do not go back to "any zoom or pan pauses until Fit is
@@ -841,11 +862,11 @@ const srvFrozen = () => !!(state && state.capture && state.capture.frozen);
 // unaffected either way, so zooming a running wave keeps following as before.
 function updateFollow(keepPaused) {
   if (srvFrozen()) return;
+  const last = liveEdge();
   if (held || (keepPaused && paused)) {
     // Latched by Pause, or holding a zoom in history: stay put even if the edge is back in view.
     paused = true;
-  } else if (envCols.length) {
-    const last = envCols[envCols.length - 1].sample;
+  } else if (last !== null) {
     paused = view.start + view.len < last - 20 * envColumnFrames;
   } else {
     paused = false;
@@ -904,15 +925,22 @@ function clearResult() {
 let winCache = {};
 let winTimer = null;
 let winSeq = 0;
-// The zoom the live view had when Freeze was pressed, so Resume returns to it instead of keeping
-// whatever narrow span you zoomed to while inspecting the snapshot. Null when not entered via Freeze.
+// The zoom the live view had when Analyze was pressed, so going back to live returns to it
+// instead of keeping whatever narrow span you zoomed to while inspecting the snapshot. Null
+// when not entered via the Analyze button.
 let frozenReturnLen = null;
 
-// The frozen snapshot is a fixed span — at most the server's ring (~11 s), often less — and its
-// window endpoint 400s outright for any request that reaches past [valid_start, valid_end). Keep
-// the frozen view inside that span: never zoom out wider than the snapshot, never pan off its ends.
-// Without this, widening the scope to 300 s (live-buffer depth) lets a freeze zoom or pan into
-// blank the snapshot can't fill, and the straddling fetch fails instead of returning what it has.
+// How many columns to ask the daemon for: the canvas width, clamped to the daemon's 2048-col
+// cap. clientWidth, not width: the backing store is still the canvas's 300 px default until the
+// Scope tab has been drawn once, and a freeze from another browser can land before that.
+const scopeCols = () => Math.min(2048, Math.max(64, $('scopecanvas').clientWidth || 1024));
+
+// The frozen snapshot is a fixed span — the configured Analyze buffer (default 20 s, up to the
+// ~85 s maximum), often less — and its window endpoint 400s outright for any request that
+// reaches past [valid_start, valid_end). Keep the frozen view inside that span: never zoom out
+// wider than the snapshot, never pan off its ends. Without this, widening the scope to 300 s
+// (live-buffer depth) lets a freeze zoom or pan into blank the snapshot can't fill, and the
+// straddling fetch fails instead of returning what it has.
 function clampFrozenView() {
   if (!srvFrozen()) return;
   const cap = state.capture;
@@ -926,7 +954,33 @@ function invalidateWindows() {
   clampFrozenView();
   clearTimeout(winTimer);
   winTimer = setTimeout(fetchWindows, 120);
-  invalidateSpectros();
+  invalidateSpectrograms();
+}
+
+// The frozen and live states are entered from four places — the Analyze button, Clear, the 5 s
+// poll noticing another browser flipped the shared capture, and the initial load — so the
+// transition lives in one pair of functions. enterLive resets both pause latches: a Pause
+// latched locally must not survive a resume and silently re-pause the view later.
+function enterFrozen(cs) {
+  state.capture = cs;
+  $('freeze').textContent = 'Live';
+  setCapState('frozen', frozenDetail(cs));
+  scopeMsg('');
+  fetchWindows();
+  invalidateSpectrograms();
+  scopeDirty = true;
+}
+
+function enterLive() {
+  state.capture.frozen = false;
+  paused = false;
+  held = false;
+  winCache = {};
+  sgCache = {};
+  $('freeze').textContent = 'Analyze';
+  setCapState('live', '');
+  scopeMsg('');
+  scopeDirty = true;
 }
 
 function fetchWindows() {
@@ -938,13 +992,10 @@ function fetchWindows() {
   if (hi <= lo) { winCache = {}; scopeDirty = true; return; }
 
   const len = Math.floor(hi - lo);
-  // clientWidth, not width: the backing store is still the canvas's 300 px default until the
-  // Scope tab has been drawn once, and a freeze from another browser can land before that.
-  const cols = Math.min(2048, Math.max(64, $('scopecanvas').clientWidth || 1024));
+  const cols = scopeCols();
   const seq = ++winSeq;
-  // A disabled input is not fetched at all — that is the one place a client-side disable does trim
-  // real bytes off the wire today, since these windows are pulled per channel on demand.
-  const shown = inputEnabled.map((on, i) => on ? i : -1).filter(i => i >= 0);
+  // A disabled input is not fetched at all: these windows are pulled per channel on demand.
+  const shown = shownInputs();
 
   Promise.all(shown.map(ch =>
     api(`/capture/window?ch=${ch}&start=${Math.floor(lo)}&len=${len}&cols=${cols}`)
@@ -968,30 +1019,27 @@ function fetchWindows() {
 
 const laneMode = Array(NIN).fill('wave');   // 'wave' | 'spectro' per input, persisted
 try {
-  const saved = JSON.parse(localStorage.getItem('lane_mode') || '[]');
+  const saved = JSON.parse(lsGet('lane_mode') || '[]');
   for (let c = 0; c < NIN; c++) if (saved[c] === 'spectro') laneMode[c] = 'spectro';
-} catch (e) { /* private mode */ }
+} catch (e) { /* not JSON */ }
 function saveLaneMode() {
-  try { localStorage.setItem('lane_mode', JSON.stringify(laneMode)); } catch (e) { /* private */ }
+  lsSet('lane_mode', JSON.stringify(laneMode));
 }
 
 // Live-adjustable display settings. FFT is also the per-column window and must stay <= RAWCAP so a
 // sparse column is one request. Floor is the colour floor (ceiling is 0 dBFS).
-let sgFft = 2048, sgFloorDb = -100, sgMap = 'magma';
-try {
-  sgFft = parseInt(localStorage.getItem('sg_fft'), 10) || sgFft;
-  sgFloorDb = parseInt(localStorage.getItem('sg_floor'), 10) || sgFloorDb;
-  sgMap = localStorage.getItem('sg_map') || sgMap;
-} catch (e) { /* private */ }
+let sgFft = parseInt(lsGet('sg_fft'), 10) || 2048;
+let sgFloorDb = parseInt(lsGet('sg_floor'), 10) || -100;
+let sgMap = lsGet('sg_map') || 'magma';
 
 const RAWCAP = 4096;      // /api/capture/window returns raw only for len <= 2*cols, cols <= 2048
 const SG_BUDGET = 96;     // max raw requests per lane per refresh
 const SG_NBINS = 256;     // offscreen height; blitted to the actual lane height
 const SG_LOW_HZ = 20;     // bottom of the log frequency axis
 
-let specCache = {};       // ch -> {start,len,ncols,nbins,db:Float32Array,off:canvas} | {narrow}|{empty}
-let specTimer = null;
-let specSeq = 0;
+let sgCache = {};       // ch -> {start,len,ncols,nbins,db:Float32Array,off:canvas} | {narrow}|{empty}
+let sgTimer = null;
+let sgSeq = 0;
 
 // --- radix-2 FFT, tables cached per size ---
 const fftCache = {};
@@ -1059,7 +1107,7 @@ function binMap(N) {
 
 const sgScratch = {re: null, im: null};
 // FFT one window of `src` at `off`, reduce to SG_NBINS log dB rows written at out[base..].
-function specColumn(src, off, out, base) {
+function sgColumn(src, off, out, base) {
   const N = sgFft, f = getFFT(N), win = hann(N), map = binMap(N);
   if (!sgScratch.re || sgScratch.re.length !== N) { sgScratch.re = new Float32Array(N); sgScratch.im = new Float32Array(N); }
   const re = sgScratch.re, im = sgScratch.im;
@@ -1093,7 +1141,7 @@ function buildColormap(name) {
 let cmapLut = buildColormap(sgMap);
 
 // Paint sc.db (col-major, row 0 = low freq) into an offscreen canvas ncols x SG_NBINS, top = high.
-function paintSpectro(sc) {
+function paintSpectrogram(sc) {
   const off = sc.off || (sc.off = document.createElement('canvas'));
   off.width = sc.ncols; off.height = SG_NBINS;
   const g = off.getContext('2d'), img = g.createImageData(sc.ncols, SG_NBINS), d = img.data;
@@ -1110,50 +1158,50 @@ function paintSpectro(sc) {
   g.putImageData(img, 0, 0);
 }
 
-function recolorSpectros() {
+function recolorSpectrograms() {
   cmapLut = buildColormap(sgMap);
-  for (const k of Object.keys(specCache)) { const sc = specCache[k]; if (sc && sc.db) paintSpectro(sc); }
+  for (const k of Object.keys(sgCache)) { const sc = sgCache[k]; if (sc && sc.db) paintSpectrogram(sc); }
   scopeDirty = true;
 }
 
 // Recompute every spectro lane for the current frozen view, debounced. Called wherever the frozen
 // view or the lane modes change; clears the cache and bails when live.
-function invalidateSpectros() {
-  if (!srvFrozen()) { specCache = {}; return; }
-  clearTimeout(specTimer);
-  specTimer = setTimeout(fetchSpectros, 150);
+function invalidateSpectrograms() {
+  if (!srvFrozen()) { sgCache = {}; return; }
+  clearTimeout(sgTimer);
+  sgTimer = setTimeout(fetchSpectrograms, 150);
 }
 
-function fetchSpectros() {
-  if (!srvFrozen()) { specCache = {}; return; }
+function fetchSpectrograms() {
+  if (!srvFrozen()) { sgCache = {}; return; }
   clampFrozenView();
   const cap = state.capture;
-  const chans = inputEnabled.map((on, i) => (on && laneMode[i] === 'spectro') ? i : -1).filter(i => i >= 0);
-  for (const k of Object.keys(specCache)) if (!chans.includes(Number(k))) delete specCache[k];
-  updateSpecCtl();
+  const chans = shownInputs().filter(i => laneMode[i] === 'spectro');
+  for (const k of Object.keys(sgCache)) if (!chans.includes(Number(k))) delete sgCache[k];
+  updateSgCtl();
   if (!chans.length) { scopeDirty = true; return; }
 
   const lo = Math.max(view.start, cap.valid_start);
   const hi = Math.min(view.start + view.len, cap.valid_start + cap.valid_len);
   const span = Math.floor(hi - lo), N = sgFft;
-  if (span < N) { chans.forEach(ch => specCache[ch] = {narrow: true}); scopeDirty = true; return; }
+  if (span < N) { chans.forEach(ch => sgCache[ch] = {narrow: true}); scopeDirty = true; return; }
 
-  const w = Math.min(2048, Math.max(64, $('scopecanvas').clientWidth || 1024));
-  const seq = ++specSeq;
+  const w = scopeCols();
+  const seq = ++sgSeq;
   const contiguous = Math.ceil(span / RAWCAP) <= SG_BUDGET;
-  chans.forEach(ch => contiguous ? fetchSpectroContig(ch, lo, span, N, w, seq)
-                                 : fetchSpectroSparse(ch, lo, span, N, seq));
+  chans.forEach(ch => contiguous ? fetchSgContig(ch, lo, span, N, w, seq)
+                                 : fetchSgSparse(ch, lo, span, N, seq));
 }
 
 // Narrow span: pull [lo,lo+span) contiguously (<= SG_BUDGET raw requests), slide a dense STFT.
-function fetchSpectroContig(ch, lo, span, N, w, seq) {
+function fetchSgContig(ch, lo, span, N, w, seq) {
   const nchunks = Math.ceil(span / RAWCAP), reqs = [];
   for (let i = 0; i < nchunks; i++) {
     const s = lo + i * RAWCAP, l = Math.min(RAWCAP, lo + span - s);
     reqs.push(api(`/capture/window?ch=${ch}&start=${s}&len=${l}&cols=2048`).then(r => [s, r]).catch(() => null));
   }
   Promise.all(reqs).then(rs => {
-    if (seq !== specSeq) return;
+    if (seq !== sgSeq) return;
     const buf = new Float32Array(span);
     let ok = false;
     for (const rr of rs) {
@@ -1164,27 +1212,27 @@ function fetchSpectroContig(ch, lo, span, N, w, seq) {
       for (let i = 0; i < r.samples.length && at + i < span; i++) buf[at + i] = r.samples[i];
       ok = true;
     }
-    if (!ok) { specCache[ch] = {empty: true}; scopeDirty = true; return; }
+    if (!ok) { sgCache[ch] = {empty: true}; scopeDirty = true; return; }
     const ncols = Math.max(1, Math.min(w, span - N + 1));
     const hop = ncols > 1 ? (span - N) / (ncols - 1) : 0;
     const db = new Float32Array(ncols * SG_NBINS);
-    for (let c = 0; c < ncols; c++) specColumn(buf, Math.round(c * hop), db, c * SG_NBINS);
+    for (let c = 0; c < ncols; c++) sgColumn(buf, Math.round(c * hop), db, c * SG_NBINS);
     const sc = {start: lo, len: span, ncols, nbins: SG_NBINS, db};
-    paintSpectro(sc);
-    specCache[ch] = sc;
+    paintSpectrogram(sc);
+    sgCache[ch] = sc;
     scopeDirty = true;
   });
 }
 
 // Wide span: SG_BUDGET columns, one FFT window per column (coarser in time, still correct).
-function fetchSpectroSparse(ch, lo, span, N, seq) {
+function fetchSgSparse(ch, lo, span, N, seq) {
   const ncols = SG_BUDGET, reqs = [];
   for (let c = 0; c < ncols; c++) {
     const s = lo + Math.round(c * (span - N) / (ncols - 1));
     reqs.push(api(`/capture/window?ch=${ch}&start=${s}&len=${N}&cols=2048`).then(r => [c, r]).catch(() => null));
   }
   Promise.all(reqs).then(rs => {
-    if (seq !== specSeq) return;
+    if (seq !== sgSeq) return;
     const db = new Float32Array(ncols * SG_NBINS).fill(-120), tmp = new Float32Array(N);
     let ok = false;
     for (const rr of rs) {
@@ -1192,13 +1240,13 @@ function fetchSpectroSparse(ch, lo, span, N, seq) {
       const [c, r] = rr;
       if (!r || !r.raw || !r.samples) continue;
       for (let i = 0; i < N; i++) tmp[i] = r.samples[i] || 0;
-      specColumn(tmp, 0, db, c * SG_NBINS);
+      sgColumn(tmp, 0, db, c * SG_NBINS);
       ok = true;
     }
-    if (!ok) { specCache[ch] = {empty: true}; scopeDirty = true; return; }
+    if (!ok) { sgCache[ch] = {empty: true}; scopeDirty = true; return; }
     const sc = {start: lo, len: span, ncols, nbins: SG_NBINS, db};
-    paintSpectro(sc);
-    specCache[ch] = sc;
+    paintSpectrogram(sc);
+    sgCache[ch] = sc;
     scopeDirty = true;
   });
 }
@@ -1217,9 +1265,9 @@ function buildLanes() {
 function toggleLaneMode(i) {
   laneMode[i] = laneMode[i] === 'spectro' ? 'wave' : 'spectro';
   saveLaneMode();
-  if (laneMode[i] !== 'spectro') delete specCache[i];
+  if (laneMode[i] !== 'spectro') delete sgCache[i];
   syncLaneToggle(i);
-  invalidateSpectros();
+  invalidateSpectrograms();
   scopeDirty = true;
 }
 
@@ -1234,16 +1282,16 @@ function syncLaneToggle(i) {
     : 'Press Analyze first — the spectrogram reads the frozen buffer';
 }
 
-function syncLaneToggles() { inputEnabled.forEach((_, i) => syncLaneToggle(i)); updateSpecCtl(); }
+function syncLaneToggles() { inputEnabled.forEach((_, i) => syncLaneToggle(i)); updateSgCtl(); }
 
 // The shared spectrogram controls (FFT / floor / colour) only matter when a lane is showing one.
-function updateSpecCtl() {
-  const el = $('specctl');
+function updateSgCtl() {
+  const el = $('sgctl');
   if (!el) return;
   el.hidden = !(srvFrozen() && laneMode.some((m, i) => m === 'spectro' && inputEnabled[i]));
 }
 
-function onWave(buf) {
+function onEnvelope(buf) {
   const v = new DataView(buf);
   const first = Number(v.getBigUint64(1, true));
   const n = v.getUint16(9, true);
@@ -1264,9 +1312,9 @@ function onWave(buf) {
 // jumping whenever a WS batch happens to arrive (10 Hz batches lurch 100 ms each, and
 // coalesced batches lurch harder).
 function scopeTick() {
-  if (document.getElementById('scope').classList.contains('active')) {
-    if (!srvFrozen() && !paused && envCols.length) {
-      const target = envCols[envCols.length - 1].sample - view.len;
+  if (tabActive('scope')) {
+    if (!srvFrozen() && !paused && liveEdge() !== null) {
+      const target = liveEdge() - view.len;
       const d = target - view.start;
       if (d !== 0) {
         view.start = Math.abs(d) < envColumnFrames ? target : view.start + d * 0.25;
@@ -1295,7 +1343,7 @@ function drawScope() {
   g.fillStyle = '#0e1014';
   g.fillRect(0, 0, w, h);
 
-  const shown = inputEnabled.map((on, i) => on ? i : -1).filter(i => i >= 0);
+  const shown = shownInputs();
   if (!shown.length) return;
   const lh = h / shown.length;
   const x0 = view.start, x1 = view.start + view.len;
@@ -1345,7 +1393,7 @@ function drawScope() {
     const yOf = s => mid - Math.max(-1, Math.min(1, s)) * half;
 
     if (srvFrozen() && laneMode[ch] === 'spectro') {
-      const sc = specCache[ch];
+      const sc = sgCache[ch];
       if (sc && sc.off) {
         g.imageSmoothingEnabled = true;
         const dx = toX(sc.start), dw = toX(sc.start + sc.len) - dx;
@@ -1495,8 +1543,7 @@ let bufKey = null;
 function updateBufLabel() {
   const el = $('buflevel');
   if (!el) return;
-  const secs = envCols.length >= 2
-    ? (envCols[envCols.length - 1].sample - envCols[0].sample) / rate : 0;
+  const secs = envCols.length >= 2 ? (liveEdge() - envCols[0].sample) / rate : 0;
   const shown = secs >= 1 ? Math.round(secs) + ' s'
     : secs > 0 ? Math.round(secs * 1000) + ' ms' : '—';
   if (shown === bufKey) return;
@@ -1516,13 +1563,12 @@ function initScope() {
   // Right-click sets B; the Clear cursors button clears both.
   cv.addEventListener('contextmenu', e => { e.preventDefault(); cursorB = sampleAt(e); scopeDirty = true; });
 
-  cv.addEventListener('wheel', e => {
-    e.preventDefault();
-    const at = sampleAt(e);
-    const f = e.deltaY > 0 ? 1.25 : 0.8;
-    const len = Math.max(32, Math.min(MAX_SPAN_S * rate, Math.round(view.len * f)));
-    // keep the sample under the pointer pinned
-    view.start = Math.round(at - (at - view.start) * (len / view.len));
+  // The shared tail of every zoom: clamp the span, place the view, keep-paused follow logic,
+  // the min/max-columns hint, and the frozen-window refetch. The wheel pins the sample under
+  // the pointer; the buttons pin the live edge or the centre.
+  const applyZoom = (len, startOf) => {
+    len = Math.max(32, Math.min(MAX_SPAN_S * rate, len));
+    view.start = startOf(len);
     view.len = len;
     if (!srvFrozen()) {
       updateFollow(true);
@@ -1532,6 +1578,14 @@ function initScope() {
     }
     invalidateWindows();
     scopeDirty = true;
+  };
+
+  cv.addEventListener('wheel', e => {
+    e.preventDefault();
+    const at = sampleAt(e);
+    const f = e.deltaY > 0 ? 1.25 : 0.8;
+    // keep the sample under the pointer pinned
+    applyZoom(Math.round(view.len * f), len => Math.round(at - (at - view.start) * (len / view.len)));
   }, {passive: false});
 
   // Press-drag pans; a press that is released without travelling sets cursor A. The decision is
@@ -1564,51 +1618,27 @@ function initScope() {
   $('freeze').onclick = () => {
     if (srvFrozen()) {
       post('/capture/resume').then(() => {
-        state.capture.frozen = false;
-        paused = false;
-        held = false;
-        winCache = {};
-        specCache = {};
-        $('freeze').textContent = 'Analyze';
-        setCapState('live', '');
+        enterLive();
         clearResult();
-        scopeMsg('');
         if (frozenReturnLen != null) { view.len = frozenReturnLen; frozenReturnLen = null; }
-        if (envCols.length) view.start = envCols[envCols.length - 1].sample - view.len;
-        scopeDirty = true;
+        if (liveEdge() !== null) view.start = liveEdge() - view.len;
       }).catch(e => scopeMsg(e.message));
     } else {
       frozenReturnLen = view.len;
-      post('/capture/freeze').then(cs => {
-        state.capture = cs;
-        $('freeze').textContent = 'Live';
-        setCapState('frozen', frozenDetail(cs));
-        scopeMsg('');
-        fetchWindows();
-        invalidateSpectros();
-        scopeDirty = true;
-      }).catch(e => scopeMsg(e.message));
+      post('/capture/freeze').then(enterFrozen).catch(e => scopeMsg(e.message));
     }
   };
 
   $('clear').onclick = () => {
     const done = () => {
+      enterLive();
       envCols = [];
       cursorA = cursorB = null;
       curKey = null;
-      winCache = {};
-      specCache = {};
-      paused = false;
-      held = false;
       clearResult();
-      $('freeze').textContent = 'Analyze';
-      setCapState('live', '');
-      scopeMsg('');
-      scopeDirty = true;
     };
     if (srvFrozen()) {
-      post('/capture/resume').then(() => { state.capture.frozen = false; done(); })
-        .catch(e => scopeMsg(e.message));
+      post('/capture/resume').then(done).catch(e => scopeMsg(e.message));
     } else {
       done();
     }
@@ -1623,21 +1653,10 @@ function initScope() {
   // Zoom by a fixed factor. While following the live edge, keep that edge pinned so a zoom never
   // silently drops the view into history; otherwise pin the centre of what is on screen.
   const zoomView = factor => {
-    const len = Math.max(32, Math.min(MAX_SPAN_S * rate, Math.round(view.len * factor)));
-    if (!srvFrozen() && !paused && envCols.length) {
-      view.start = envCols[envCols.length - 1].sample - len;
-    } else {
-      view.start = Math.round(view.start + view.len / 2 - len / 2);
-    }
-    view.len = len;
-    if (!srvFrozen()) {
-      updateFollow(true);
-      if (len < envColumnFrames * 8) {
-        scopeMsg('The live view is 5 ms min/max columns — press Analyze to zoom down to samples.');
-      }
-    }
-    invalidateWindows();
-    scopeDirty = true;
+    applyZoom(Math.round(view.len * factor), len =>
+      (!srvFrozen() && !paused && liveEdge() !== null)
+        ? liveEdge() - len
+        : Math.round(view.start + view.len / 2 - len / 2));
   };
   $('zoomin').onclick = () => zoomView(0.5);
   $('zoomout').onclick = () => zoomView(2);
@@ -1646,8 +1665,8 @@ function initScope() {
     if (srvFrozen()) {
       view.start = state.capture.freeze_sample - view.len;
       invalidateWindows();
-    } else if (envCols.length) {
-      view.start = envCols[envCols.length - 1].sample - view.len;
+    } else if (liveEdge() !== null) {
+      view.start = liveEdge() - view.len;
     }
     updateFollow();
     scopeDirty = true;
@@ -1659,7 +1678,7 @@ function initScope() {
     if (srvFrozen()) return;
     if (paused) {
       held = false;
-      if (envCols.length) view.start = envCols[envCols.length - 1].sample - view.len;
+      if (liveEdge() !== null) view.start = liveEdge() - view.len;
       updateFollow();
     } else {
       held = true;
@@ -1706,12 +1725,25 @@ function initScope() {
   const fftSel = $('sgfft'), floorInp = $('sgfloor'), floorV = $('sgfloorv'), mapSel = $('sgmap');
   if (fftSel) {
     fftSel.value = String(sgFft);
-    fftSel.onchange = e => { sgFft = parseInt(e.target.value, 10); try { localStorage.setItem('sg_fft', sgFft); } catch (x) {} invalidateSpectros(); };
+    fftSel.onchange = e => {
+      sgFft = parseInt(e.target.value, 10);
+      lsSet('sg_fft', sgFft);
+      invalidateSpectrograms();
+    };
     floorInp.value = String(sgFloorDb);
     floorV.textContent = sgFloorDb + ' dB';
-    floorInp.oninput = e => { sgFloorDb = parseInt(e.target.value, 10); floorV.textContent = sgFloorDb + ' dB'; try { localStorage.setItem('sg_floor', sgFloorDb); } catch (x) {} recolorSpectros(); };
+    floorInp.oninput = e => {
+      sgFloorDb = parseInt(e.target.value, 10);
+      floorV.textContent = sgFloorDb + ' dB';
+      lsSet('sg_floor', sgFloorDb);
+      recolorSpectrograms();
+    };
     mapSel.value = sgMap;
-    mapSel.onchange = e => { sgMap = e.target.value; try { localStorage.setItem('sg_map', sgMap); } catch (x) {} recolorSpectros(); };
+    mapSel.onchange = e => {
+      sgMap = e.target.value;
+      lsSet('sg_map', sgMap);
+      recolorSpectrograms();
+    };
   }
 
   // Hover a spectro lane → frequency (log Y) and level from the cached dB. The scope canvas backing
@@ -1719,12 +1751,12 @@ function initScope() {
   cv.addEventListener('mousemove', e => {
     const el = $('sghover');
     if (!el) return;
-    const shown = inputEnabled.map((on, i) => on ? i : -1).filter(i => i >= 0);
+    const shown = shownInputs();
     const r = cv.getBoundingClientRect();
     const lh = shown.length ? r.height / shown.length : 0;
     const row = lh ? Math.floor((e.clientY - r.top) / lh) : -1;
     const ch = row >= 0 && row < shown.length ? shown[row] : null;
-    const sc = ch != null ? specCache[ch] : null;
+    const sc = ch != null ? sgCache[ch] : null;
     if (!srvFrozen() || ch == null || laneMode[ch] !== 'spectro' || !sc || !sc.db) { el.textContent = '— Hz · — dBFS'; return; }
     const frac = Math.max(0, Math.min(1, 1 - ((e.clientY - r.top) - row * lh) / lh));
     const freq = SG_LOW_HZ * Math.pow((rate / 2) / SG_LOW_HZ, frac);
@@ -1749,9 +1781,9 @@ function renderHost(s) {
   if (host.childElementCount !== cores.length) {
     host.innerHTML = cores.map((_, i) =>
       `<div class="corerow">
-         <span class="corelabel">cpu${i}</span>
+         <span class="corelabel mono">cpu${i}</span>
          <div class="corebar"><div class="corefill" id="corefill${i}"></div></div>
-         <span class="coreval" id="coreval${i}"></span>
+         <span class="coreval mono" id="coreval${i}"></span>
        </div>`).join('');
   }
   cores.forEach((v, i) => {
@@ -1767,10 +1799,10 @@ function renderHost(s) {
     const pct = (100 * m.used_kb / m.total_kb);
     $('mem').innerHTML =
       `<div class="corerow">
-         <span class="corelabel">ram</span>
+         <span class="corelabel mono">ram</span>
          <div class="corebar"><div class="corefill${pct >= 90 ? ' hot' : ''}"
               style="width:${pct.toFixed(1)}%"></div></div>
-         <span class="coreval">${fmtMB(m.used_kb)} / ${fmtMB(m.total_kb)}</span>
+         <span class="coreval mono">${fmtMB(m.used_kb)} / ${fmtMB(m.total_kb)}</span>
        </div>
        <p class="muted">${fmtMB(m.available_kb)} available</p>`;
   }
@@ -1832,13 +1864,17 @@ function buildSystem() {
   };
   $('reboot').onclick = () => {
     if (!confirm('Reboot the device?')) return;
-    post('/system/reboot').then(() => { $('sysmsg').textContent = 'rebooting…'; });
+    post('/system/reboot')
+      .then(() => { $('sysmsg').textContent = 'rebooting…'; })
+      .catch(e => { $('sysmsg').textContent = e.message; });
   };
   $('shutdown').onclick = () => {
     if (!confirm('Shut the device down? It will have to be powered off and on again by hand.')) return;
-    post('/system/shutdown').then(() => {
-      $('sysmsg').textContent = 'shutting down — wait for the green LED to stop blinking before pulling power';
-    });
+    post('/system/shutdown')
+      .then(() => {
+        $('sysmsg').textContent = 'shutting down — wait for the green LED to stop blinking before pulling power';
+      })
+      .catch(e => { $('sysmsg').textContent = e.message; });
   };
 }
 
@@ -1904,7 +1940,7 @@ function connect() {
   ws.onopen = () => {
     $('conn').textContent = 'connected';
     $('conn').className = 'pill good';
-    sendStreamMask();   // re-apply the input mask after every (re)connect, incl. a daemon restart
+    sendTelemetryMask();   // re-apply the input mask after every (re)connect, incl. a daemon restart
   };
   ws.onclose = () => {
     feedWs = null;
@@ -1918,7 +1954,7 @@ function connect() {
     setTimeout(connect, 1000);
   };
   ws.onmessage = e => {
-    if (e.data instanceof ArrayBuffer) { onWave(e.data); return; }
+    if (e.data instanceof ArrayBuffer) { onEnvelope(e.data); return; }
     const msg = JSON.parse(e.data);
     if (msg.type === 'meters') onMeters(msg);
     else if (msg.type === 'spectrum') onSpectrum(msg);
@@ -1935,12 +1971,8 @@ function pollState() {
     state.capture = s2.capture;
     // Another browser (or curl) may have frozen or resumed the shared capture.
     if (srvFrozen() !== wasFrozen) {
-      $('freeze').textContent = srvFrozen() ? 'Live' : 'Analyze';
-      if (srvFrozen()) setCapState('frozen', frozenDetail(state.capture));
-      else setCapState('live', '');
-      if (srvFrozen()) { fetchWindows(); invalidateSpectros(); }
-      else { winCache = {}; specCache = {}; paused = false; }
-      scopeDirty = true;
+      if (srvFrozen()) enterFrozen(s2.capture);
+      else enterLive();
     }
     buildSystem();
   }).catch(() => {});
@@ -1954,7 +1986,7 @@ function stopPingPoll() { clearInterval(pingPoll); pingPoll = null; }
 // Listen audio (its own sockets) keeps playing. The choice persists across reloads.
 function setFeedStopped(stop) {
   feedStopped = stop;
-  try { localStorage.setItem('feed_stopped', stop ? '1' : '0'); } catch (e) { /* storage blocked */ }
+  lsSet('feed_stopped', stop ? '1' : '0');
   updateFeedButton();
   if (stop) {
     $('conn').textContent = 'paused';
@@ -1982,7 +2014,7 @@ function updateFeedButton() {
 }
 
 function initFeedToggle() {
-  try { feedStopped = localStorage.getItem('feed_stopped') === '1'; } catch (e) { feedStopped = false; }
+  feedStopped = lsGet('feed_stopped') === '1';
   const b = $('feedtoggle');
   if (b) b.onclick = () => setFeedStopped(!feedStopped);
   updateFeedButton();
@@ -2028,8 +2060,7 @@ api('/state').then(s => {
   opusAvailable = Array.isArray(s.limits.listen_codecs) &&
                   s.limits.listen_codecs.includes('opus') && !!OpusDecoderClass;
   listenBitrate = s.limits.listen_bitrate_kbps || 96;
-  let savedCodec = null;
-  try { savedCodec = localStorage.getItem('listen_codec'); } catch (e) { /* storage blocked */ }
+  const savedCodec = lsGet('listen_codec');
   listenCodec = (savedCodec === 'opus' || savedCodec === 'pcm')
       ? savedCodec : (s.limits.listen_default_codec || 'pcm');
   if (listenCodec === 'opus' && !opusAvailable) listenCodec = 'pcm';
@@ -2047,16 +2078,14 @@ api('/state').then(s => {
   initScope();
   initBufLen();
   initFeedToggle();
-  // The capture is shared and outlives a reload: pressing Freeze then reloading finds it already
-  // frozen. Reflect that, AND load the snapshot — position the view over the frozen range and
-  // fetch its windows. Without this the lanes sit on "loading…" forever, because on a fresh load
-  // nothing else pulls the frozen data (the poll only fetches on a live→frozen transition).
+  // The capture is shared and outlives a reload: pressing Analyze then reloading finds it
+  // already frozen. Reflect that, AND load the snapshot — position the view over the frozen
+  // range and fetch its windows. Without this the lanes sit on "loading…" forever, because on a
+  // fresh load nothing else pulls the frozen data (the poll only fetches on a live→frozen
+  // transition).
   if (srvFrozen()) {
-    $('freeze').textContent = 'Live';
-    setCapState('frozen', frozenDetail(state.capture));
     view.start = state.capture.freeze_sample - view.len;
-    fetchWindows();
-    invalidateSpectros();
+    enterFrozen(state.capture);
   } else {
     setCapState('live', '');
     updatePlayPause();

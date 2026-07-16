@@ -31,7 +31,7 @@ class OpusMonoEncoder {
  private:
   struct Impl;
   std::unique_ptr<Impl> d_;
-  unsigned in_frames_ = kOpusInFramesAt96;
+  unsigned in_frames_ = 0;  // set from the engine rate before *ok can become true
 };
 
 // Encodes all kInputs channels together as one Ogg/Opus logical stream (mapping family 255,
@@ -57,7 +57,7 @@ class OpusOggMultiEncoder {
  private:
   struct Impl;
   std::unique_ptr<Impl> d_;
-  unsigned in_frames_ = kOpusInFramesAt96;
+  unsigned in_frames_ = 0;  // set from the engine rate before *ok can become true
 };
 
 }  // namespace st

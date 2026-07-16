@@ -20,13 +20,11 @@ class ListenPacer {
   // sample index it starts at. False once `running` goes down.
   bool next(const std::atomic<bool>& running, std::vector<int16_t>* out, uint64_t* start);
 
-  // Same pacing, but hands back the raw float chunk (chunk_frames() samples) owned by the pacer.
-  // `*skipped` is set when the listener had fallen behind and the cursor jumped forward to live —
-  // a signal to reset any stateful encoder before feeding the returned block.
+  // Same pacing, but hands back the raw float chunk owned by the pacer. `*skipped` is set when
+  // the listener had fallen behind and the cursor jumped forward to live — a signal to reset any
+  // stateful encoder before feeding the returned block.
   bool next_float(const std::atomic<bool>& running, const float** out, uint64_t* start,
                   bool* skipped);
-
-  unsigned chunk_frames() const { return chunk_; }
 
  private:
   bool wait_and_read(const std::atomic<bool>& running, uint64_t* start, bool* skipped);
@@ -40,15 +38,13 @@ class ListenPacer {
 
 // Like ListenPacer but reads every input channel at one cursor, so all channels share a single
 // sample clock — the property the multichannel Ogg/Opus stream needs to stay sample-aligned.
-// Hands back kInputs-interleaved float frames (chunk_frames() * kInputs samples).
+// Hands back kInputs-interleaved float frames.
 class MultiListenPacer {
  public:
   explicit MultiListenPacer(const RingBuffer& ring, unsigned chunk_frames = kListenChunkFrames);
 
   bool next_float(const std::atomic<bool>& running, const float** out, uint64_t* start,
                   bool* skipped);
-
-  unsigned chunk_frames() const { return chunk_; }
 
  private:
   const RingBuffer& ring_;
@@ -58,10 +54,12 @@ class MultiListenPacer {
 };
 
 // Caps how many concurrent listeners the server will feed (each holds a worker thread). The
-// multichannel Ogg endpoint reuses this with its own (smaller) counter and limit.
+// multichannel Ogg endpoint reuses this with its own (smaller) counter and limit. `what` names
+// the capped resource in the refusal log.
 class StreamSlot {
  public:
-  explicit StreamSlot(std::atomic<unsigned>& active, unsigned limit = kMaxListenStreams);
+  explicit StreamSlot(std::atomic<unsigned>& active, unsigned limit = kMaxListenStreams,
+                      const char* what = "listen");
   ~StreamSlot();
 
   bool acquired() const { return acquired_; }

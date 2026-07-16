@@ -87,6 +87,22 @@ void test_oldest_tracks_the_safety_margin() {
   CHECK_EQ(ring.oldest(5000), 5000u - (kFrames - kSafety));
 }
 
+// A caller that computes `start = now - window` before the ring holds `window` frames
+// underflows to a start near 2^64. The bounds check must fail it, not wrap around and hand
+// back fabricated samples (this is what the analysis thread's warm-up used to trip over).
+void test_rejects_an_underflowed_start() {
+  RingBuffer ring(kFrames, kCh, kSafety);
+  std::vector<float> block(kFrames * kCh, 1.0f);
+  ring.write(block.data(), 300);
+
+  std::vector<float> out(kFrames * kCh);
+  const uint64_t underflowed = ring.counter() - 400;  // 300 - 400 wraps below zero
+  CHECK(!ring.read_channel(underflowed, 400, 0, out.data()));
+  CHECK(!ring.read_interleaved(underflowed, 400, out.data()));
+  // And a len larger than everything written so far is rejected too.
+  CHECK(!ring.read_channel(0, 400, 0, out.data()));
+}
+
 // Runs a writer and a reader concurrently. The writer stamps sample n with the value n, so
 // any inconsistency in what the reader gets back is detectable. Returns {accepted, torn}.
 std::pair<uint64_t, uint64_t> race(size_t ring_frames, size_t block, size_t read_len,
@@ -155,6 +171,7 @@ int main() {
   test_wraparound_is_seamless();
   test_rejects_future_and_overwritten_ranges();
   test_oldest_tracks_the_safety_margin();
+  test_rejects_an_underflowed_start();
   test_a_hostile_writer_never_produces_a_torn_read();
   test_reads_succeed_against_a_realistically_paced_writer();
   return report("ring_buffer");

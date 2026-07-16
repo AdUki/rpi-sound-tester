@@ -14,7 +14,9 @@ namespace st {
 
 namespace {
 
-constexpr int kMaxMonoPacket = 4000;  // one 20 ms mono Opus frame fits well under this
+// Encoded-packet buffer size per channel. One 20 ms CBR frame at kListenBitrateMaxKbps is
+// well under 1 kB; the mono path and the kInputs-channel multistream path both size from this.
+constexpr int kMaxPacketPerChannel = 4000;
 
 int clamp_kbps(int kbps) {
   return std::clamp(kbps, kListenBitrateMinKbps, kListenBitrateMaxKbps);
@@ -111,7 +113,7 @@ bool OpusMonoEncoder::encode(const float* pcm, int bitrate_kbps, std::vector<uin
     d_->cur_kbps = kbps;
   }
   d_->dec->process(pcm, in_frames_, &d_->down);
-  packet->resize(kMaxMonoPacket);
+  packet->resize(kMaxPacketPerChannel);
   const opus_int32 n = opus_encode_float(d_->enc, d_->down.data(), kOpusFrameFrames, packet->data(),
                                          static_cast<opus_int32>(packet->size()));
   if (n < 0) return false;
@@ -176,7 +178,7 @@ OpusOggMultiEncoder::OpusOggMultiEncoder(unsigned rate, int bitrate_kbps, uint32
   d_->chan.resize(in_frames_);
   d_->downs.assign(kInputs, {});
   d_->down.resize(static_cast<size_t>(kOpusFrameFrames) * kInputs);
-  d_->pkt.resize(static_cast<size_t>(kInputs) * 1500);
+  d_->pkt.resize(static_cast<size_t>(kInputs) * kMaxPacketPerChannel);
 
   if (ogg_stream_init(&d_->os, static_cast<int>(serial)) != 0) return;
   d_->os_init = true;

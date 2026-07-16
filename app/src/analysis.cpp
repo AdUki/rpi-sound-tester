@@ -26,8 +26,7 @@ constexpr float kSpecLowHz = 20.0f;
 Analysis::Analysis(const RingBuffer& ring, double rate) : ring_(ring), rate_(rate) {
   window_.resize(kSpectrumFft);
   for (unsigned i = 0; i < kSpectrumFft; ++i) {
-    window_[i] = 0.5f * (1.0f - std::cos(2.0f * 3.14159265358979f * static_cast<float>(i) /
-                                         static_cast<float>(kSpectrumFft - 1)));
+    window_[i] = 0.5f * (1.0f - static_cast<float>(std::cos(kTwoPi * i / (kSpectrumFft - 1))));
   }
   scratch_.resize(kSpectrumFft);
   spec_.resize(kSpectrumFft / 2 + 1);
@@ -35,13 +34,11 @@ Analysis::Analysis(const RingBuffer& ring, double rate) : ring_(ring), rate_(rat
 
   const double bin_hz = rate_ / kSpectrumFft;
   const double hi = std::min(rate_ * 0.5, 40000.0);
-  bin_freqs_.resize(kSpectrumBins);
   for (unsigned b = 0; b < kSpectrumBins; ++b) {
     const double f0 = kSpecLowHz * std::pow(hi / kSpecLowHz,
                                             static_cast<double>(b) / kSpectrumBins);
     const double f1 = kSpecLowHz * std::pow(hi / kSpecLowHz,
                                             static_cast<double>(b + 1) / kSpectrumBins);
-    bin_freqs_[b] = static_cast<float>(std::sqrt(f0 * f1));
     unsigned k0 = static_cast<unsigned>(std::floor(f0 / bin_hz));
     unsigned k1 = static_cast<unsigned>(std::ceil(f1 / bin_hz));
     k0 = std::max(1u, std::min<unsigned>(k0, kSpectrumFft / 2));
@@ -72,12 +69,10 @@ AnalysisSnapshot Analysis::snapshot() const {
 
 void Analysis::update_meters(unsigned ch, const float* buf, size_t len, uint64_t now) {
   double sum2 = 0.0;
-  double sum = 0.0;
   float peak = 0.0f;
   for (size_t i = 0; i < len; ++i) {
     const float v = buf[i];
     sum2 += static_cast<double>(v) * v;
-    sum += v;
     peak = std::max(peak, std::fabs(v));
   }
   const float rms = static_cast<float>(std::sqrt(sum2 / static_cast<double>(len)));
@@ -90,7 +85,6 @@ void Analysis::update_meters(unsigned ch, const float* buf, size_t len, uint64_t
 
   snap_.meters[ch].rms_db = lin_to_db(rms);
   snap_.meters[ch].peak_db = lin_to_db(peak_hold_[ch]);
-  snap_.meters[ch].dc = static_cast<float>(sum / static_cast<double>(len));
 }
 
 void Analysis::update_spectrum(unsigned ch, const float* buf) {
@@ -153,11 +147,8 @@ void Analysis::update_spectrum(unsigned ch, const float* buf) {
 
     tm.valid = true;
     tm.freq_hz = static_cast<float>((kp + delta) * bin_hz);
-    tm.level_db = 10.0f * std::log10(std::max(fund, 1e-20));
     if (fund > 0.0) {
-      const float ratio = static_cast<float>(std::sqrt(rest / fund));
-      tm.thd_n_pct = 100.0f * ratio;
-      tm.thd_n_db = 20.0f * std::log10(std::max(ratio, 1e-9f));
+      tm.thd_n_pct = 100.0f * static_cast<float>(std::sqrt(rest / fund));
     }
   }
   snap_.tone[ch] = tm;
@@ -195,6 +186,8 @@ void Analysis::run() {
   const size_t rms_frames = static_cast<size_t>(kRmsWindowS * rate_);
   std::vector<float> mbuf(rms_frames);
   std::vector<float> sbuf(kSpectrumFft);
+  // Wait until the widest window fits: `now - rms_frames` below must not go negative.
+  const uint64_t warmup = std::max<uint64_t>(kSpectrumFft, rms_frames);
 
   auto next = std::chrono::steady_clock::now();
   bool spectrum_tick = false;
@@ -204,7 +197,7 @@ void Analysis::run() {
     std::this_thread::sleep_until(next);
 
     const uint64_t now = ring_.counter();
-    if (now < kSpectrumFft) continue;
+    if (now < warmup) continue;
 
     std::lock_guard<std::mutex> lock(m_);
     snap_.sample = now;

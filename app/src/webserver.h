@@ -38,7 +38,9 @@ struct Deps {
   CaptureStore& capture;
   KmsgWatch& kmsg;
   ConfigStore& store;
-  Config& config;  // last loaded/saved config; the source of the non-live fields
+  // Last loaded/saved config; the source of the non-live fields (channel names, loopback
+  // offset). Handlers run on many worker threads: guard every access with config_m_.
+  Config& config;
 };
 
 class WebServer {
@@ -68,8 +70,8 @@ class WebServer {
   std::atomic<uint32_t> ogg_serial_{1};
   // Per-input telemetry mask, bit c set = input c streamed. A console masks the inputs it is not
   // watching so the spectrum message (the widest frame) drops them. Written by POST
-  // /api/stream/inputs, read by the publisher. Process-global: one bench, one operator.
-  std::atomic<uint32_t> stream_mask_{0xffffffffu};
+  // /api/telemetry/inputs, read by the publisher. Process-global: one bench, one operator.
+  std::atomic<uint32_t> telemetry_mask_{0xffffffffu};
 
   // CPU load is a delta measurement with exactly one owner: the 1 Hz publisher samples it and
   // parks the whole SysInfo here, and the /api/state handler — which runs on an arbitrary web
@@ -77,6 +79,10 @@ class WebServer {
   // consume the publisher's baseline and both readings would be garbage (see util/sysinfo.h).
   mutable std::mutex sys_m_;
   SysInfo sys_;
+
+  // Guards d_.config: the save handler replaces it while /api/state handlers on other worker
+  // threads read the channel names and loopback offset out of it.
+  mutable std::mutex config_m_;
 };
 
 }  // namespace st
