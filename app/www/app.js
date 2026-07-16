@@ -1065,6 +1065,8 @@ const RAWCAP = 4096;      // /api/capture/window returns raw only for len <= 2*c
 const SG_BUDGET = 96;     // max raw requests per lane per refresh
 const SG_NBINS = 256;     // offscreen height; blitted to the actual lane height
 const SG_LOW_HZ = 20;     // bottom of the log frequency axis
+// Frequency gridlines the ruler draws across a spectrogram lane (those in [SG_LOW_HZ, Nyquist)).
+const FREQ_TICKS = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 40000];
 
 let sgCache = {};       // ch -> {start,len,ncols,nbins,db:Float32Array,off:canvas} | {narrow}|{empty}
 let sgTimer = null;
@@ -1495,14 +1497,55 @@ function drawScope() {
     g.fillText('5 ms preview — loading samples…', 6, h - 6);
   }
 
-  // Ping emission markers, opt-in: with a short interval they stripe the whole view and bury
-  // the waveform, and when you are not measuring delay they mean nothing.
-  if ($('showpings').checked) {
-    g.strokeStyle = 'rgba(245,166,35,0.7)';
-    for (const p of pings) {
-      if (p.sample < x0 || p.sample > x1) continue;
-      const x = toX(p.sample);
+  // Ruler overlay, opt-in (replacing the old ping-emission markers): a time graticule with units
+  // across every lane, plus — on a spectrogram lane — a log-frequency graticule with its own units.
+  // A gridded scale reads intervals far better than bare markers. Drawn over the lanes (the
+  // spectrogram image is opaque) with dim lines and label chips so it stays legible on either.
+  if ($('showruler').checked) {
+    const chip = (text, tx, ty, right) => {
+      const tw = g.measureText(text).width;
+      const lx = right ? tx - tw : tx;
+      g.fillStyle = 'rgba(14,16,20,0.66)';
+      g.fillRect(lx - 2, ty - 10, tw + 4, 13);
+      g.fillStyle = '#aeb6c4';
+      g.fillText(text, lx, ty);
+    };
+    g.lineWidth = 1;
+    g.strokeStyle = 'rgba(139,147,163,0.22)';
+
+    // Vertical time gridlines, anchored at the left edge (0) so the labels are small offsets.
+    const divs = Math.max(4, Math.min(12, Math.round(w / 90)));
+    const stepSec = niceStep((view.len / rate) / divs);
+    const stepN = stepSec * rate;
+    for (let k = 0, s = x0; s <= x1; k++, s = x0 + k * stepN) {
+      const x = toX(s);
       g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
+    }
+
+    // Horizontal frequency gridlines on spectrogram lanes (Y is the same log axis as the hover
+    // readout: SG_LOW_HZ at the bottom, Nyquist at the top).
+    if (srvFrozen()) {
+      const nyq = rate / 2, span = Math.log(nyq / SG_LOW_HZ);
+      shown.forEach((ch, row) => {
+        if (laneMode[ch] !== 'spectro' || !(sgCache[ch] && sgCache[ch].off)) return;
+        const top = row * lh;
+        // Log spacing crowds the decade lines near the top; draw every gridline but drop a label
+        // that would collide with the last one placed. Walk high freq -> low (top -> bottom, so y
+        // grows) and keep a label only once it clears the previous one by ~a line height.
+        let lastLabelY = -Infinity;
+        for (let i = FREQ_TICKS.length - 1; i >= 0; i--) {
+          const f = FREQ_TICKS[i];
+          if (f <= SG_LOW_HZ || f >= nyq) continue;
+          const y = top + (1 - Math.log(f / SG_LOW_HZ) / span) * lh;
+          g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke();
+          if (y - lastLabelY >= 13) { chip(fmtHz(f), w - 5, y - 2, true); lastLabelY = y; }
+        }
+      });
+    }
+
+    // Time labels last, so every chip sits above the gridlines.
+    for (let k = 0, s = x0; s <= x1; k++, s = x0 + k * stepN) {
+      chip(fmtTime(k * stepSec), toX(s) + 3, h - 4, false);
     }
   }
 
@@ -1556,6 +1599,27 @@ function fmtSpan(samples) {
   if (sec >= 1) return sec.toFixed(2) + ' s';
   if (sec >= 0.001) return (sec * 1000).toFixed(sec >= 0.1 ? 1 : 2) + ' ms';
   return Math.round(sec * 1e6) + ' µs';
+}
+
+// The smallest "nice" tick step (1/2/5 x 10^n) at or above x — gives the ruler round gridline spacing.
+function niceStep(x) {
+  const p = Math.pow(10, Math.floor(Math.log10(x)));
+  const n = x / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
+}
+
+// A ruler tick's time offset (seconds), shown in the unit that reads cleanly. Step is always a nice
+// number, so the trimmed values stay round (0, 2 ms, 500 µs, 1 s).
+function fmtTime(sec) {
+  if (!sec) return '0';
+  const a = Math.abs(sec);
+  if (a >= 1) return +sec.toFixed(3) + ' s';
+  if (a >= 1e-3) return +(sec * 1e3).toFixed(3) + ' ms';
+  return +(sec * 1e6).toFixed(1) + ' µs';
+}
+
+function fmtHz(hz) {
+  return hz >= 1000 ? +(hz / 1000).toFixed(hz % 1000 ? 1 : 0) + ' kHz' : Math.round(hz) + ' Hz';
 }
 
 function updateZoomLabel() {
@@ -1772,7 +1836,7 @@ function initScope() {
     scopeDirty = true;
   };
 
-  $('showpings').onchange = () => { scopeDirty = true; };
+  $('showruler').onchange = () => { scopeDirty = true; };
 
   $('measure').onclick = () => {
     if (!srvFrozen()) {
