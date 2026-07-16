@@ -188,7 +188,10 @@ canvas.mini { width: 100%; height: 54px; display: block; margin-top: 0.5rem; bac
 /* The height must be in CSS as well as on the element. A canvas takes its intrinsic ratio from
    its width/height attributes, and with only height="520" and width:100% the element claims a
    ~2370 px tall box until drawScope() first writes cv.width — the page reflows under you. */
-#scopecanvas { width: 100%; height: 520px; display: block; background: var(--well); border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; }
+/* touch-action:pan-y lets a vertical drag scroll the PAGE while a horizontal drag reaches our
+   pointer handlers to pan the waveform (the JS gates on direction). touch-action:none would eat the
+   page scroll on this tall canvas; the browser's own pinch-zoom stays disabled so ours can run. */
+#scopecanvas { width: 100%; height: 520px; display: block; background: var(--well); border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; touch-action: pan-y; }
 
 label { display: block; margin: 0.5rem 0; color: var(--muted); }
 label input, label select { margin-left: 0.35rem; }

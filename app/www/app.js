@@ -497,6 +497,32 @@ function saveInputEnabled() {
 // frozen view fetches.
 const shownInputs = () => inputEnabled.flatMap((on, i) => (on ? [i] : []));
 
+// The Delay pickers (from-IN / to-IN) only offer enabled inputs: a disabled lane carries no
+// captured audio to correlate against. Rebuild #xa/#xb from the enabled set, keeping each current
+// pick where it still exists and otherwise defaulting a→first enabled, b→a different enabled input.
+// If disabling an input would collapse the pair onto one channel, nudge b to a distinct input (a
+// deliberately equal pair is left alone). Disable Measure when nothing is enabled.
+function syncDelaySelects() {
+  const xa = $('xa'), xb = $('xb');
+  if (!xa || !xb) return;
+  const shown = shownInputs().map(i => i + 1);   // 1-based, matching the option values
+  const prevA = parseInt(xa.value, 10), prevB = parseInt(xb.value, 10);
+  const opts = shown.length
+    ? shown.map(v => `<option value="${v}">IN ${v}</option>`).join('')
+    : '<option value="">—</option>';
+  xa.innerHTML = opts;
+  xb.innerHTML = opts;
+  if (shown.length) {
+    const a = shown.includes(prevA) ? prevA : shown[0];
+    let b = shown.includes(prevB) ? prevB : (shown.find(v => v !== a) || shown[0]);
+    if (a === b && prevA !== prevB && shown.length > 1) b = shown.find(v => v !== a);
+    xa.value = String(a);
+    xb.value = String(b);
+  }
+  const measure = $('measure');
+  if (measure) measure.disabled = !shown.length;
+}
+
 function clearSpectrumCanvas(ch) {
   const cv = $('spec' + ch);
   if (!cv || !cv.width) return;
@@ -538,6 +564,7 @@ function setInputEnabled(ch, on) {
   inputEnabled[ch] = on;
   saveInputEnabled();
   applyInputEnabled(ch);
+  syncDelaySelects();
   invalidateWindows();
   sendTelemetryMask();
 }
@@ -912,7 +939,8 @@ function scopeMsg(text) {
 
 // The result box keeps its place in the layout whether or not it holds a result. Unhiding it
 // used to move the canvas the moment you had finished lining the cursors up on it.
-const XCORR_IDLE = 'Press Analyze, bracket one ping with cursor A and cursor B, then press Measure.';
+const XCORR_IDLE = 'Press Analyze, then Measure. Bracket one ping with cursor A and cursor B first, ' +
+  'or leave the cursors clear to measure across the whole view.';
 
 function clearResult() {
   const el = $('xcorrout');
@@ -1261,6 +1289,7 @@ function buildLanes() {
     $('lm' + i).onclick = () => toggleLaneMode(i);
   });
   syncLaneToggles();
+  syncDelaySelects();
 }
 
 function toggleLaneMode(i) {
@@ -1555,10 +1584,11 @@ function updateBufLabel() {
 
 function initScope() {
   const cv = $('scopecanvas');
-  const sampleAt = e => {
+  const sampleAtX = clientX => {
     const r = cv.getBoundingClientRect();
-    return Math.round(view.start + (e.clientX - r.left) / r.width * view.len);
+    return Math.round(view.start + (clientX - r.left) / r.width * view.len);
   };
+  const sampleAt = e => sampleAtX(e.clientX);
 
   // Cursor A is set on release of a click that did not become a pan — see the drag block below.
   // Right-click sets B; the Clear cursors button clears both.
@@ -1589,32 +1619,85 @@ function initScope() {
     applyZoom(Math.round(view.len * f), len => Math.round(at - (at - view.start) * (len / view.len)));
   }, {passive: false});
 
-  // Press-drag pans; a press that is released without travelling sets cursor A. The decision is
-  // made on release, from whether the pointer actually moved, because the browser also fires a
-  // 'click' at the end of a drag — binding cursor A to that click is what dropped a cursor every
-  // time you finished a pan.
-  let drag = null;
-  cv.addEventListener('mousedown', e => {
-    if (e.button !== 0) return;   // left button pans / sets A; right button is cursor B
-    drag = {x: e.clientX, start: view.start, moved: false};
+  // Pointer-driven pan / tap / pinch, unified across mouse, touch and pen. Touch is direction-gated:
+  // a horizontal drag pans, a vertical drag is left to the browser to scroll the page (#scopecanvas
+  // sets touch-action:pan-y). Without that split, any drag on the tall canvas panned the waveform
+  // and the page could never be scrolled from it. Two pointers pinch to zoom, pinning the sample
+  // under the gesture midpoint. A press with no travel sets cursor A (decided on release, because a
+  // drag also ends in a 'click'). setPointerCapture is taken only once a drag commits to panning, so
+  // it never steals a gesture the browser wants for scrolling.
+  const pointers = new Map();   // active pointerId -> {x, y}
+  let drag = null;              // {x, y, start, moved, axis} — axis: null (deciding) | 'x' | 'scroll'
+  let pinch = null;             // {dist} while two pointers zoom
+  const distOf = p => Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+
+  cv.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;   // right button is cursor B (contextmenu)
+    pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+    if (pointers.size >= 2) {
+      drag = null;
+      for (const id of pointers.keys()) { try { cv.setPointerCapture(id); } catch (_) { /* not active */ } }
+      pinch = {dist: distOf([...pointers.values()])};
+    } else {
+      // Mouse commits to panning at once; touch stays undecided until it travels far enough to tell
+      // a horizontal pan from a vertical page-scroll.
+      drag = {x: e.clientX, y: e.clientY, start: view.start, moved: false,
+              axis: e.pointerType === 'mouse' ? 'x' : null};
+      if (e.pointerType === 'mouse') { try { cv.setPointerCapture(e.pointerId); } catch (_) {} }
+    }
   });
-  window.addEventListener('mousemove', e => {
+
+  cv.addEventListener('pointermove', e => {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pinch && pointers.size >= 2) {
+      const pts = [...pointers.values()];
+      const dist = distOf(pts);
+      if (pinch.dist > 0 && dist > 0) {
+        const at = sampleAtX((pts[0].x + pts[1].x) / 2);   // pin the sample under the midpoint
+        applyZoom(Math.round(view.len * (pinch.dist / dist)),
+                  len => Math.round(at - (at - view.start) * (len / view.len)));
+      }
+      pinch.dist = dist;
+      return;
+    }
     if (!drag) return;
-    if (Math.abs(e.clientX - drag.x) > 3) drag.moved = true;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (drag.axis === null) {                     // touch: decide pan vs page-scroll once it moves
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      drag.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'scroll';
+      if (drag.axis === 'x') { try { cv.setPointerCapture(e.pointerId); } catch (_) {} }
+    }
+    if (drag.axis !== 'x') return;                // vertical drag: hands off to the browser to scroll
+    drag.moved = true;
     const r = cv.getBoundingClientRect();
-    const dx = (e.clientX - drag.x) / r.width * view.len;
-    view.start = Math.round(drag.start - dx);
+    view.start = Math.round(drag.start - dx / r.width * view.len);
     updateFollow();
     invalidateWindows();
     scopeDirty = true;
   });
-  window.addEventListener('mouseup', e => {
-    if (drag && !drag.moved && e.button === 0) {
+
+  const endPointer = e => {
+    if (!pointers.has(e.pointerId)) return;
+    if (drag && !drag.moved && drag.axis !== 'scroll' && pointers.size === 1 &&
+        (e.pointerType !== 'mouse' || e.button === 0)) {
       cursorA = sampleAt(e);
       scopeDirty = true;
     }
-    drag = null;
-  });
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 0) {
+      drag = null;
+    } else {
+      // A finger lifted mid-gesture: resume panning from a remaining pointer, flagged moved so its
+      // eventual release can't drop a cursor.
+      const [q] = [...pointers.values()];
+      drag = {x: q.x, y: q.y, start: view.start, moved: true, axis: 'x'};
+    }
+  };
+  cv.addEventListener('pointerup', endPointer);
+  cv.addEventListener('pointercancel', endPointer);
 
   $('freeze').onclick = () => {
     if (srvFrozen()) {
@@ -1696,11 +1779,18 @@ function initScope() {
       scopeMsg('Press Analyze first — the delay is measured on the captured snapshot.');
       return;
     }
-    if (cursorA === null || cursorB === null) {
-      scopeMsg('Set cursor A (left-click) and cursor B (right-click) to bracket one ping.');
-      return;
+    // Both cursors set: measure the bracketed span. Otherwise fall back to the whole visible
+    // window, so a quick Measure works without placing cursors first — clamped to the snapshot
+    // bounds so a rounded view edge can never spill past [valid_start, valid_end).
+    let lo, hi;
+    if (cursorA !== null && cursorB !== null) {
+      lo = Math.min(cursorA, cursorB);
+      hi = Math.max(cursorA, cursorB);
+    } else {
+      const cap = state.capture;
+      lo = Math.max(cap.valid_start, Math.round(view.start));
+      hi = Math.min(cap.valid_start + cap.valid_len, Math.round(view.start + view.len));
     }
-    const lo = Math.min(cursorA, cursorB), hi = Math.max(cursorA, cursorB);
     const len = Math.max(1024, Math.min(1 << 19, hi - lo));
     const a = parseInt($('xa').value, 10);
     const b = parseInt($('xb').value, 10);
