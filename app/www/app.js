@@ -668,10 +668,11 @@ const BAR_RISE = 0.35;      // fast attack when the level climbs
 const BAR_FALL = 0.12;      // gentler release when it drops
 const PEAK_FALL = 0.006;    // the peak-hold cap sinks this fraction of full scale per frame
 
-// Each whole bar is one flat colour chosen by its height: green when low, amber as it climbs, red
-// near full scale — a level cue at a glance, no per-bar gradient. Thresholds are in normalised
-// height (0..1 over -100..0 dBFS): 0.66 ~= -34 dBFS, 0.85 ~= -15 dBFS.
-const barColor = v => v >= 0.85 ? '#ef5b5b' : v >= 0.66 ? '#f5a623' : '#3ecf8e';
+// Each whole bar is one flat colour chosen by its height, sweeping smoothly green -> yellow ->
+// orange -> red as it climbs — a continuous level cue with no visible steps. v is normalised height
+// (0..1 over -100..0 dBFS); we interpolate the HSL hue linearly from 150 deg (green) down to 0 deg
+// (red), so the colour tracks height gradiently.
+const barColor = v => `hsl(${(1 - Math.max(0, Math.min(1, v))) * 150}, 65%, 52%)`;
 
 // Fold one 240-bin spectrum message into SPEC_BARS bar targets. Max within each group, so a lone
 // tone still lights its whole bar; same dB->height mapping the old trace used (-100..0 dBFS -> 0..1).
