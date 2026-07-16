@@ -353,9 +353,10 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 }
 
 /* Sits above the canvas and holds the measure instructions when idle, the result when measured.
-   Its height is bounded — min-height so an empty box still reserves its space, max-height with an
-   inner scroll so the rare long low-confidence note cannot grow the box and shove the trace down
-   the moment you press Measure. So it is always in flow and effectively fixed in height. */
+   min-height reserves space so an empty box doesn't jump. Only a *result* (.on) is height-capped
+   with an inner scroll, so the rare long low-confidence note can't grow the box and shove the trace
+   down the moment you press Measure. The idle instruction is never capped, so it sizes to its text
+   and never turns into a scrollbar (it wraps to a few lines on a narrow screen instead). */
 .result {
   background: rgba(255, 255, 255, 0.02);
   border: 1px solid var(--line);
@@ -363,14 +364,14 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
   padding: 0.6rem 0.8rem;
   margin: 0 0 0.5rem;
   min-height: 3.4rem;
-  max-height: 5rem;
-  overflow-y: auto;
   color: var(--muted);
 }
 .result.on {
   background: rgba(77, 163, 255, 0.1);
   border-color: var(--accent);
   color: var(--fg);
+  max-height: 5rem;
+  overflow-y: auto;
 }
 
 .lanes { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem; }
