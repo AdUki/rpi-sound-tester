@@ -58,18 +58,35 @@ h4 { margin: 1rem 0 0.5rem; font-size: 0.85rem; color: var(--muted); }
 .feedtoggle { font-size: 0.78rem; padding: 0.2rem 0.6rem; border-radius: 999px; line-height: 1.2; }
 .feedtoggle.paused { border-color: var(--warn); color: var(--warn); }
 
+/* The alert banners live in a fixed overlay pinned to the bottom of the viewport, NOT in the
+   document flow: a dropout or under-voltage warning flicking on and off would otherwise shove every
+   element below it up and down. Hidden banners take no space, so an empty stack has zero height and
+   never intercepts clicks; visible ones stack up from the bottom edge (max-height caps a rare pile).
+   Bottom, not top, so a persistent warning never hides the header's live status pills. */
+#banners {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  max-height: 50vh;
+  overflow-y: auto;
+}
 .banner {
   background: rgba(245, 166, 35, 0.12);
-  border-bottom: 1px solid var(--warn);
+  border-top: 1px solid var(--warn);
   color: var(--warn);
   padding: 0.6rem 1rem;
+  box-shadow: 0 -2px 12px rgba(0, 0, 0, 0.4);
 }
 .banner a { color: var(--warn); }
 /* The connection banner is about the link to the device, not a device fault, so it wears the
    accent colour to read as a different class of problem from the amber under-voltage / sync ones. */
 .banner.conn {
   background: rgba(77, 163, 255, 0.12);
-  border-bottom-color: var(--accent);
+  border-top-color: var(--accent);
   color: var(--accent);
 }
 
@@ -412,7 +429,7 @@ td:first-child { color: var(--muted); width: 40%; }
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.25s;
-  z-index: 10;
+  z-index: 50;   /* above the #banners overlay (40), so action feedback stays readable */
   max-width: 80vw;
 }
 #toast.show { opacity: 1; }
