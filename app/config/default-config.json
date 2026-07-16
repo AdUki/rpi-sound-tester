@@ -32,5 +32,5 @@
   "input_names": ["", "", "", "", "", ""],
   "output_names": ["", "", "", "", "", "", "", ""],
   "loopback_offset_samples": 0,
-  "listen": { "codec": "pcm", "bitrate_kbps": 96 }
+  "listen": { "codec": "opus", "bitrate_kbps": 96 }
 }

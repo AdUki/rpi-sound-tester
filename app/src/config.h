@@ -49,7 +49,7 @@ struct Config {
   // Listen stream: the codec the console defaults to ("pcm" | "opus") and the per-channel Opus
   // bitrate. The wire default is always PCM; this only sets the console's preference and the
   // stream.ogg default.
-  std::string listen_codec = "pcm";
+  std::string listen_codec = "opus";
   int listen_bitrate_kbps = kListenBitrateDefaultKbps;
 
   std::string to_json() const;

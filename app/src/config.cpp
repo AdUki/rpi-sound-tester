@@ -181,7 +181,7 @@ void Config::apply_to(Control& ctl) const {
   ctl.ping.level_db.store(std::clamp(ping_level_db, kLevelMinDb, kLevelMaxDb));
   ctl.ping.epoch.fetch_add(1);
 
-  ListenCodec lc = ListenCodec::Pcm;
+  ListenCodec lc = ListenCodec::Opus;
   parse_codec(listen_codec, &lc);
   ctl.listen.codec.store(static_cast<uint8_t>(lc));
   ctl.listen.bitrate_kbps.store(

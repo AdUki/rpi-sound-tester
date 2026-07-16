@@ -57,10 +57,10 @@ struct PingControl {
 
 // Default listen codec and per-channel Opus bitrate. Not read by the audio thread — these live
 // here (rather than on the web server) only so they ride the Config<->Control save/restore path
-// like every other persisted live setting. The wire default stays PCM regardless: `codec` is the
-// frontend's preference (it opts in with ?codec=opus explicitly) and the stream.ogg default.
+// like every other persisted live setting. `codec` is only the frontend's preference (it opts into
+// Opus explicitly with ?codec=opus); the raw /api/listen wire default stays PCM regardless.
 struct ListenControl {
-  std::atomic<uint8_t> codec{static_cast<uint8_t>(ListenCodec::Pcm)};
+  std::atomic<uint8_t> codec{static_cast<uint8_t>(ListenCodec::Opus)};
   std::atomic<int> bitrate_kbps{kListenBitrateDefaultKbps};
 };
 
