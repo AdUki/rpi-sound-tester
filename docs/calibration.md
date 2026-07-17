@@ -6,7 +6,7 @@ sample is 10.4 µs, or 3.6 mm of air.
 
 ## The measurement
 
-1. **Generators → Ping**, variant **tick**. Only `tick` is a measurement stimulus (see below).
+1. **Generators → Ping**. Any variant measures correctly; `tick` is the most robust (see below).
 2. Route the ping to the outputs under test (Dashboard → OUT *n* → Source: `Gen: ping`).
 3. Feed the signal back into two inputs — by cable, or through a speaker and a microphone.
 4. **Scope & sync → Analyze.** This freezes the capture: everything after this point is
@@ -23,35 +23,33 @@ for a cable, the lag is the device's delay, not a distance.
 
 ## Read the confidence number
 
-`confidence` is the winning correlation peak divided by the best rival peak more than 1 ms
-away:
+`confidence` is the winning correlation peak divided by the tallest **genuinely separate**
+rival peak. (Both are read off the *envelope* of the correlation, so a ringing tone's own
+carrier oscillation does not count as a rival — a lone bing/bong scores high, as it should.)
 
 | confidence | meaning |
 |---|---|
 | > 3 | one clear peak. Trust the lag. |
-| < 2 | **ambiguous.** Something in the window correlates with itself. |
+| < 2 | **ambiguous.** A rival peak is nearly as tall. |
 
-The usual cause of a low number is that your window contains **more than one ping**. A
-repeating stimulus correlates with itself one interval away, so the true delay is only known
-*modulo the ping interval* — the classic cycle-slip trap. Fix it by narrowing the cursors to
-a single ping, or by raising the ping interval.
+Two things drive the number down, and both are real:
 
-## Why `tick` and not `bing`/`bong`
+- **More than one ping in the window.** A repeating stimulus correlates with itself one
+  interval away, so the true delay is only known *modulo the ping interval* — the classic
+  cycle-slip trap. Bracket a single ping with the cursors, or raise the ping interval.
+- **A continuous tone** (the sine generator). Its delay is only known modulo the carrier
+  period, and no windowing fixes that. Use a ping.
 
-A tone burst that rings for many cycles correlates almost as well one carrier period away as
-it does at the true lag. Measured on the loopback:
+## Which variant to measure with
 
-| stimulus | shape | peak-to-rival ratio |
-|---|---|---|
-| **tick** | 3 kHz, 5 ms, τ = 0.4 ms | **4.2** |
-| tick, if it decayed slowly (τ = 2.5 ms) | | 1.3 |
-| bing | 1 kHz, 60 ms, τ = 20 ms | 1.0 |
-| bong | 440 Hz, 250 ms, τ = 80 ms | 1.0 |
-
-`tick` decays in well under one ring-down, which makes it broadband, which makes the
-correlation peak sharp. `bing` and `bong` exist to be *heard* — for finding which speaker is
-which — not to be measured. The measurement still lands on the right sample with them, but
-the confidence will be near 1 and you will not be able to tell a good result from a bad one.
+All three ping variants land on the right sample when one ping is bracketed — measured on
+the loopback, each recovers the simulator's programmed delay exactly. `tick` is still the
+best-practice stimulus: it decays in well under one carrier ring-down, which makes it
+broadband, which makes the correlation peak *sharp*. `bing` and `bong` ring for tens of
+cycles, so in a noisy or reflective environment their correlation crests one carrier cycle
+either side of the truth (≈ 1–2 ms) are only a few percent down — a strong reflection can
+tip the result one cycle over. On a clean bench any variant is fine; when the number matters,
+use `tick`.
 
 ## Loopback offset (the constant you may want to subtract)
 

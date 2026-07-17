@@ -141,8 +141,11 @@ when frozen, otherwise the live ring (best effort).
 zero-padded before the FFT, so the correlation is linear, not circular — without that, every
 lag would alias modulo the transform size.
 
-Check `confidence` before you believe `lag_samples`: below 2, the window contains something
-that repeats and the delay is only known modulo that repeat.
+Check `confidence` before you believe `lag_samples`: it is the winning correlation peak over
+the tallest genuinely separate rival (peaks are picked on the correlation's envelope, so a
+ringing stimulus's own carrier oscillation is not a rival). Below 2, either the window holds
+a repeating stimulus (the delay is only known modulo that repeat — bracket a single ping) or
+the stimulus is a continuous tone (only known modulo the carrier period — use a ping).
 
 ## Listening
 

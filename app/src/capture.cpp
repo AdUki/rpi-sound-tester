@@ -184,8 +184,10 @@ XcorrResult CaptureStore::xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, ui
   fa_.assign(n, 0.0f);
   fb_.assign(n, 0.0f);
   corr_.assign(n, 0.0f);
+  env_.assign(n, 0.0f);
   ca_.assign(n / 2 + 1, {});
   cb_.assign(n / 2 + 1, {});
+  analytic_.assign(n, {});
 
   {
     std::lock_guard<std::mutex> lock(m_);
@@ -233,32 +235,107 @@ XcorrResult CaptureStore::xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, ui
   pocketfft::c2r(shape, sc, sr, 0, pocketfft::BACKWARD, ca_.data(), corr_.data(),
                  1.0f / static_cast<float>(n));
 
+  // Lag and confidence are decided on the ENVELOPE of the correlation (the magnitude of its
+  // analytic signal, which is carrier-free); only the final sample-exact lag is read from the
+  // raw correlation, restricted to the winning lobe. A ringing tone (bing/bong) correlates as
+  // an oscillating carrier under a slowly decaying envelope, whose crests one carrier cycle
+  // from the true lag sit within a percent of the winner — working on the envelope keeps that
+  // oscillation from being read as a separate feature by either the peak pick or the rival
+  // search, so the lag stays on the right cycle and the confidence reflects real ambiguity.
+  const auto wrap = [n](int64_t m) {
+    return static_cast<size_t>((m + static_cast<int64_t>(n)) % static_cast<int64_t>(n));
+  };
+
+  // Envelope via the analytic signal: zero the negative frequencies of the correlation
+  // spectrum (double the positive ones), inverse-transform, take the magnitude.
+  analytic_[0] = ca_[0];
+  for (size_t k = 1; k < n / 2; ++k) analytic_[k] = 2.0f * ca_[k];
+  analytic_[n / 2] = ca_[n / 2];
+  pocketfft::c2c(shape, sc, sc, {0}, pocketfft::BACKWARD, analytic_.data(), analytic_.data(),
+                 1.0f / static_cast<float>(n));
+  for (size_t i = 0; i < n; ++i) env_[i] = std::abs(analytic_[i]);
+
   const int64_t max_lag = static_cast<int64_t>(len) - 1;
-  int64_t best = 0;
-  float best_v = -1.0f;
+  int64_t best_env = 0;
+  float env_best = -1.0f;
   for (int64_t m = -max_lag; m <= max_lag; ++m) {
-    const size_t idx = static_cast<size_t>((m + static_cast<int64_t>(n)) % static_cast<int64_t>(n));
-    const float v = std::fabs(corr_[idx]);
+    const float v = env_[wrap(m)];
+    if (v > env_best) {
+      env_best = v;
+      best_env = m;
+    }
+  }
+
+  // The winning lobe: the contiguous span around the envelope peak still above half its
+  // height. The reported lag is the tallest raw-correlation crest inside it — for a
+  // broadband stimulus that is the envelope peak itself; for a ringing tone it is the
+  // carrier crest nearest the envelope peak, i.e. the right cycle.
+  int64_t lobe_lo = best_env, lobe_hi = best_env;
+  while (lobe_lo > -max_lag && env_[wrap(lobe_lo - 1)] >= 0.5f * env_best) --lobe_lo;
+  while (lobe_hi < max_lag && env_[wrap(lobe_hi + 1)] >= 0.5f * env_best) ++lobe_hi;
+  int64_t best = best_env;
+  float best_v = -1.0f;
+  for (int64_t m = lobe_lo; m <= lobe_hi; ++m) {
+    const float v = std::fabs(corr_[wrap(m)]);
     if (v > best_v) {
       best_v = v;
       best = m;
     }
   }
 
-  // Confidence: how far the winning peak stands above the best competitor outside 1 ms.
-  const int64_t guard = std::max<int64_t>(1, static_cast<int64_t>(rate_ * 0.001));
+  // A continuous tone is the one case the envelope cannot resolve: its envelope is a single
+  // window-wide lobe with no separate rival, yet its lag is only knowable modulo the carrier
+  // period, so the confidence must still be held down. Detect it by a near-equal crest far
+  // from the winner: a decaying burst's crests fall off exponentially with distance (bong,
+  // the slowest, is ~5 % down two cycles out), a continuous tone's stay within a fraction of
+  // a percent across the whole lobe. Crests within 1.5 carrier cycles of the winner are
+  // excluded — the ping's 1 ms attack flattens the peak enough to lift its immediate
+  // neighbours, and they don't distinguish the two cases anyway. The carrier period is read
+  // off the dominant cross-spectrum bin (for a broadband stimulus that radius is tiny and the
+  // lobe holds no distant crests, so the test cannot fire).
+  size_t k_dom = 1;
+  for (size_t k = 2; k < ca_.size(); ++k) {
+    if (std::abs(ca_[k]) > std::abs(ca_[k_dom])) k_dom = k;
+  }
+  const int64_t exclude =
+      static_cast<int64_t>(1.5 * static_cast<double>(n) / static_cast<double>(k_dom));
+  float far_crest = 0.0f;
+  for (int64_t m = lobe_lo; m <= lobe_hi; ++m) {
+    if (std::llabs(m - best) <= exclude) continue;
+    const float v = std::fabs(corr_[wrap(m)]);
+    if (v > far_crest && v >= std::fabs(corr_[wrap(m - 1)]) &&
+        v >= std::fabs(corr_[wrap(m + 1)])) {
+      far_crest = v;
+    }
+  }
+  const bool cycle_unresolved = far_crest > 0.985f * best_v;
+
+  // Confidence: the envelope peak against the tallest genuinely separate rival lobe. A
+  // rival must rise out of a real dip — walking outward from the peak, a sample only
+  // counts by how far it climbs back above the deepest envelope value crossed on the way
+  // (capped at its own height). The main lobe's own skirt climbs nowhere and scores ~0,
+  // so a lone ping scores its noise floor (high ratio), while a stimulus that repeats in
+  // the window puts up a near-equal lobe one interval away (ratio -> 1).
   float second = 0.0f;
-  for (int64_t m = -max_lag; m <= max_lag; ++m) {
-    if (std::llabs(m - best) <= guard) continue;
-    const size_t idx = static_cast<size_t>((m + static_cast<int64_t>(n)) % static_cast<int64_t>(n));
-    second = std::max(second, std::fabs(corr_[idx]));
+  for (const int dir : {-1, +1}) {
+    float dip = env_best;
+    for (int64_t m = best_env + dir; m >= -max_lag && m <= max_lag; m += dir) {
+      const float e = env_[wrap(m)];
+      dip = std::min(dip, e);
+      second = std::max(second, std::min(e, 2.0f * (e - dip)));
+    }
   }
 
   r.ok = true;
   r.lag_samples = best;
   r.lag_ms = 1000.0 * static_cast<double>(best) / rate_;
   r.peak = best_v / std::sqrt(ea * eb);
-  r.confidence = second > 0.0f ? best_v / second : 999.0;
+  r.confidence = second > 0.0f ? env_best / second : 999.0;
+  if (cycle_unresolved) {
+    r.confidence =
+        std::min(r.confidence, static_cast<double>(best_v) / static_cast<double>(far_crest));
+  }
+  r.confidence = std::min(r.confidence, 999.0);
   return r;
 }
 

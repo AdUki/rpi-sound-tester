@@ -1926,13 +1926,18 @@ function initScope() {
       .then(r => {
         const el = $('xcorrout');
         el.classList.add('on');
-        const warn = r.confidence < 2
-          ? ' <span class="muted">— low confidence: the stimulus repeats inside this window, so the delay is only known modulo the ping interval. Narrow the window to one ping, or use the <em>tick</em> variant.</span>'
+        // `confidence` is the winning correlation peak over its best rival, not a 0..1
+        // probability: 1.0× means the runner-up is just as tall (ambiguous), > 3× is one clear
+        // peak. Say so, so the ratio isn't misread as "100% sure".
+        const c = r.confidence;
+        const verdict = c >= 3 ? 'clear' : c < 2 ? 'ambiguous' : 'fair';
+        const warn = c < 2
+          ? ' <span class="muted">— low confidence: a rival peak is nearly as tall. Usually the stimulus repeats inside the window (bracket a single ping with the cursors) or is a continuous tone (use a ping instead).</span>'
           : '';
         el.innerHTML =
           `<strong>IN ${a} &rarr; IN ${b}:</strong> ` +
           `<span class="mono">${r.lag_samples} samples = ${r.lag_ms.toFixed(3)} ms</span> ` +
-          `<span class="muted">(confidence ${r.confidence.toFixed(1)})</span>${warn}`;
+          `<span class="muted">(peak ${c.toFixed(1)}&times; the next rival &mdash; ${verdict})</span>${warn}`;
       })
       .catch(e => scopeMsg(e.message));
   };

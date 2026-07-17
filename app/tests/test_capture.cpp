@@ -17,7 +17,16 @@ namespace {
 constexpr double kRate = 96000.0;
 constexpr unsigned kPeriod = 1024;
 
-enum class Stimulus { Broadband, PingTrain };
+enum class Stimulus { Broadband, PingTrain, BongSingle, BongTrain, ContinuousSine };
+
+// A bong-shaped burst: 440 Hz decaying sine, tau 80 ms — the generator's ringing tone.
+void add_bong(std::vector<float>& src, uint64_t at) {
+  for (unsigned i = 0; i < 24000 && at + i < src.size(); ++i) {
+    const double t = i / kRate;
+    const float env = std::exp(-static_cast<float>(t) / 0.080f);
+    src[at + i] += 0.8f * env * static_cast<float>(std::sin(2 * kPi * 440.0 * t));
+  }
+}
 
 // Fills the ring so that channel 1 carries channel 0's signal delayed by `delay` samples —
 // the multiroom case.
@@ -29,7 +38,7 @@ void fill_with_delayed_copy(RingBuffer& ring, int64_t delay, uint64_t frames, St
   std::vector<float> src(frames + 8192, 0.0f);
   if (stim == Stimulus::Broadband) {
     for (auto& v : src) v = broadband(rng);
-  } else {
+  } else if (stim == Stimulus::PingTrain) {
     // A repeating tick, exactly what the ping generator emits.
     for (uint64_t tick = 5000; tick < frames; tick += 30000) {
       for (unsigned i = 0; i < 600; ++i) {
@@ -38,6 +47,13 @@ void fill_with_delayed_copy(RingBuffer& ring, int64_t delay, uint64_t frames, St
         src[tick + i] += 0.8f * env * static_cast<float>(std::sin(2 * kPi * 3000.0 * t));
       }
     }
+  } else if (stim == Stimulus::BongSingle) {
+    add_bong(src, 60000);
+  } else if (stim == Stimulus::BongTrain) {
+    for (uint64_t at = 20000; at < frames; at += 96000) add_bong(src, at);
+  } else {
+    for (size_t i = 0; i < src.size(); ++i)
+      src[i] = 0.5f * static_cast<float>(std::sin(2 * kPi * 440.0 * (i / kRate)));
   }
 
   std::vector<float> block(kPeriod * kInputs);
@@ -107,6 +123,66 @@ void test_xcorr_reports_low_confidence_on_a_periodic_stimulus() {
             << one.confidence << ")\n";
   CHECK_EQ(one.lag_samples, 500);
   CHECK(one.confidence > 3.0);
+}
+
+// bing/bong are ringing tones: the correlation is a carrier under a slow envelope. A single
+// burst bracketed on its own must read as one clear peak — sample-exact lag, high confidence
+// — with the carrier's own oscillation never counted as a rival.
+void test_xcorr_ringing_tone_single_burst_is_confident() {
+  for (int64_t delay : {137, -960}) {
+    RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
+    CaptureStore cap(ring, kRate, kPeriod);
+    fill_with_delayed_copy(ring, delay, 400000, Stimulus::BongSingle);
+
+    const CaptureStatus cs = cap.freeze(0);
+    CHECK(cs.frozen);
+
+    // One bong, fully inside the window: sample-exact and unambiguous.
+    const XcorrResult r = cap.xcorr(0, 1, cs.valid_start + 5000, 1 << 17);
+    CHECK(r.ok);
+    std::cout << "  single bong, delay " << delay << " -> lag " << r.lag_samples
+              << " (confidence " << r.confidence << ")\n";
+    CHECK_EQ(r.lag_samples, delay);
+    CHECK(r.confidence > 3.0);
+  }
+}
+
+void test_xcorr_ringing_tone_train_stays_on_the_true_interval() {
+  RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
+  CaptureStore cap(ring, kRate, kPeriod);
+  fill_with_delayed_copy(ring, 527, 400000, Stimulus::BongTrain);
+
+  const CaptureStatus cs = cap.freeze(0);
+  CHECK(cs.frozen);
+
+  // Several bongs in the window: the tallest envelope lobe is still the true lag (every
+  // burst pair agrees there), so the lag must NOT slip by a ping interval — but the rival
+  // lobe one interval away is nearly as tall, so the confidence must say ambiguous.
+  const XcorrResult r = cap.xcorr(0, 1, cs.valid_start + 5000, 1 << 18);
+  CHECK(r.ok);
+  std::cout << "  bong train -> lag " << r.lag_samples << " (confidence " << r.confidence
+            << ")\n";
+  CHECK_EQ(r.lag_samples, 527);
+  CHECK(r.confidence < 2.0);
+}
+
+// A continuous tone's delay is genuinely unknowable modulo its period: every carrier crest
+// in the correlation is a hair from the winner, so whatever lag comes out, the confidence
+// must never bless it. (The envelope alone can't catch this — a CW tone's envelope is one
+// window-wide lobe with no rivals — hence the runner-up-crest cap.)
+void test_xcorr_never_blesses_a_continuous_tone() {
+  RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
+  CaptureStore cap(ring, kRate, kPeriod);
+  fill_with_delayed_copy(ring, 137, 400000, Stimulus::ContinuousSine);
+
+  const CaptureStatus cs = cap.freeze(0);
+  CHECK(cs.frozen);
+
+  const XcorrResult r = cap.xcorr(0, 1, cs.valid_start + 5000, 1 << 17);
+  CHECK(r.ok);
+  std::cout << "  continuous sine -> lag " << r.lag_samples << " (confidence " << r.confidence
+            << ")\n";
+  CHECK(r.confidence < 2.0);
 }
 
 void test_xcorr_needs_a_freeze() {
@@ -195,6 +271,9 @@ void test_window_rejects_out_of_range() {
 int main() {
   test_xcorr_recovers_a_known_delay();
   test_xcorr_reports_low_confidence_on_a_periodic_stimulus();
+  test_xcorr_ringing_tone_single_burst_is_confident();
+  test_xcorr_ringing_tone_train_stays_on_the_true_interval();
+  test_xcorr_never_blesses_a_continuous_tone();
   test_xcorr_needs_a_freeze();
   test_window_returns_raw_and_columns();
   test_window_rejects_out_of_range();

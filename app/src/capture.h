@@ -79,8 +79,8 @@ class CaptureStore {
   CaptureStatus status_;
 
   std::mutex fft_m_;
-  std::vector<float> fa_, fb_, corr_;
-  std::vector<std::complex<float>> ca_, cb_;
+  std::vector<float> fa_, fb_, corr_, env_;
+  std::vector<std::complex<float>> ca_, cb_, analytic_;
 };
 
 }  // namespace st
