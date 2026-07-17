@@ -143,7 +143,7 @@
         <option value="3">IN 3</option><option value="4">IN 4</option>
         <option value="5">IN 5</option><option value="6">IN 6</option>
       </select>
-      <button id="measure">Measure</button>
+      <span id="measurewrap"><button id="measure">Measure</button></span>
     </div>
 
     <div class="tgrp tgrp-view">
@@ -152,8 +152,6 @@
       <button id="zoomout">Zoom out</button>
       <button id="zoomfit">Fit</button>
       <span class="zlvl"><span class="zkey">span</span><span id="zoomlevel" class="mono">&mdash;</span></span>
-      <span class="zlvl"><span class="zkey">buffered</span><span id="buflevel" class="mono">&mdash;</span></span>
-      <label title="Overlay a time grid (and, on a spectrogram lane, a frequency grid) with units"><input type="checkbox" id="showruler"> Ruler</label>
     </div>
 
     <div class="tgrp tgrp-cur">
@@ -162,30 +160,40 @@
       <span class="cur"><span class="ckey kb">B</span><span id="curB" class="mono cval">—</span></span>
       <span class="cur"><span class="ckey">&Delta;</span><span id="curD" class="mono cvald">—</span></span>
       <button id="clearcur">Clear cursors</button>
+      <label title="Overlay a time grid (and, on a spectrogram lane, a frequency grid) with units"><input type="checkbox" id="showruler"> Ruler</label>
       <span class="curhint muted">Click sets A &middot; right-click sets B &middot; wheel zooms &middot; drag pans</span>
+    </div>
+  </div>
+  <div class="subbar">
+    <div class="tgrp" id="wavectl">
+      <span class="tglabel">Wave</span>
+      <button id="vzoomout" class="zbtn" title="Vertical zoom out — shrink the waveform amplitude">&minus;</button>
+      <span class="zlvl"><span class="zkey">amp</span><span id="vzoomlevel" class="mono">1&times;</span></span>
+      <button id="vzoomin" class="zbtn" title="Vertical zoom in — magnify the waveform amplitude">+</button>
+      <button id="vzoomreset" title="Back to 1× amplitude">Reset</button>
+    </div>
+    <div class="tgrp" id="sgctl">
+      <span class="tglabel">Spectrogram</span>
+      <label>FFT
+        <select id="sgfft"><option>1024</option><option selected>2048</option><option>4096</option></select>
+      </label>
+      <label>Floor
+        <input type="range" id="sgfloor" min="-120" max="-20" step="5">
+        <span id="sgfloorv" class="mono">-100 dB</span>
+      </label>
+      <label>Colour
+        <select id="sgmap">
+          <option value="magma">magma</option><option value="inferno">inferno</option>
+          <option value="viridis">viridis</option><option value="grey">grey</option>
+        </select>
+      </label>
+      <span id="sghover" class="mono muted">— Hz · — dBFS</span>
     </div>
   </div>
   <div id="scopemsg" class="muted small"></div>
   <div id="xcorrout" class="result"></div>
-  <canvas id="scopecanvas" height="520"></canvas>
   <div id="lanes" class="lanes"></div>
-  <div id="sgctl" class="sgctl" hidden>
-    <span class="tglabel">Spectrogram</span>
-    <label>FFT
-      <select id="sgfft"><option>1024</option><option selected>2048</option><option>4096</option></select>
-    </label>
-    <label>Floor
-      <input type="range" id="sgfloor" min="-120" max="-20" step="5">
-      <span id="sgfloorv" class="mono">-100 dB</span>
-    </label>
-    <label>Colour
-      <select id="sgmap">
-        <option value="magma">magma</option><option value="inferno">inferno</option>
-        <option value="viridis">viridis</option><option value="grey">grey</option>
-      </select>
-    </label>
-    <span id="sghover" class="mono muted">— Hz · — dBFS</span>
-  </div>
+  <canvas id="scopecanvas" height="520"></canvas>
 </section>
 
 <section id="config" class="panel">

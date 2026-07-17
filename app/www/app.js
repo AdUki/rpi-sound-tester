@@ -519,8 +519,23 @@ function syncDelaySelects() {
     xa.value = String(a);
     xb.value = String(b);
   }
-  const measure = $('measure');
-  if (measure) measure.disabled = !shown.length;
+  updateMeasureEnabled();
+}
+
+// Measure only works on a frozen snapshot with at least one input in view, so the button is disabled
+// otherwise. The wrapper span carries the "why" as a title, because a disabled button swallows its
+// own tooltip — pointer-events:none on the button lets the hover fall through to the wrapper.
+function updateMeasureEnabled() {
+  const btn = $('measure'), wrap = $('measurewrap');
+  if (!btn) return;
+  const frozen = srvFrozen();
+  const haveInputs = shownInputs().length > 0;
+  btn.disabled = !(frozen && haveInputs);
+  const why = !frozen ? 'Press Analyze first — the delay is measured on the captured snapshot.'
+            : !haveInputs ? 'Enable at least one input to measure a delay.'
+            : '';
+  if (wrap) wrap.title = why;
+  btn.title = why ? '' : 'Cross-correlate the two selected inputs over the bracketed span (or the whole view when no cursors are set).';
 }
 
 function clearSpectrumCanvas(ch) {
@@ -902,6 +917,11 @@ let paused = false;        // not following the live edge (auto: panned into his
 let held = false;          // Pause was pressed: hold the view until Play, whatever the view shows
 let envCols = [];          // {sample, min[6], max[6]}
 let scopeDirty = false;
+// Waveform amplitude magnification (vertical zoom). 1x = a full-scale sample spans the lane;
+// magnifying flat-tops anything past the lane edge. Purely a display setting — it never touches
+// the captured samples or the spectrogram lanes.
+let vzoom = 1;
+const VZOOM_MIN = 1, VZOOM_MAX = 64;
 
 const srvFrozen = () => !!(state && state.capture && state.capture.frozen);
 
@@ -1026,6 +1046,7 @@ function enterFrozen(cs) {
   $('freeze').textContent = 'Live';
   setCapState('frozen', frozenDetail(cs));
   scopeMsg('');
+  updateMeasureEnabled();
   fetchWindows();
   invalidateSpectrograms();
   scopeDirty = true;
@@ -1040,6 +1061,7 @@ function enterLive() {
   $('freeze').textContent = 'Analyze';
   setCapState('live', '');
   scopeMsg('');
+  updateMeasureEnabled();
   scopeDirty = true;
 }
 
@@ -1347,12 +1369,10 @@ function syncLaneToggle(i) {
 
 function syncLaneToggles() { inputEnabled.forEach((_, i) => syncLaneToggle(i)); updateSgCtl(); }
 
-// The shared spectrogram controls (FFT / floor / colour) only matter when a lane is showing one.
-function updateSgCtl() {
-  const el = $('sgctl');
-  if (!el) return;
-  el.hidden = !(srvFrozen() && laneMode.some((m, i) => m === 'spectro' && inputEnabled[i]));
-}
+// The Spectrogram miniframe sits beside Wave and stays visible at all times — FFT / floor / colour
+// are settings that take hold the moment a lane is switched to a spectrogram, so there is nothing
+// to hide. (It used to appear only while frozen with a spectrogram lane active.)
+function updateSgCtl() {}
 
 function onEnvelope(buf) {
   const v = new DataView(buf);
@@ -1453,7 +1473,7 @@ function drawScope() {
     g.strokeStyle = wave;
     let drew = false;
     const half = lh / 2 - 6;
-    const yOf = s => mid - Math.max(-1, Math.min(1, s)) * half;
+    const yOf = s => mid - Math.max(-1, Math.min(1, s * vzoom)) * half;
 
     if (srvFrozen() && laneMode[ch] === 'spectro') {
       const sc = sgCache[ch];
@@ -1661,6 +1681,16 @@ function updateZoomLabel() {
   el.title = `${view.len} samples across the view`;
 }
 
+function setVZoom(v) {
+  vzoom = Math.max(VZOOM_MIN, Math.min(VZOOM_MAX, v));
+  updateVZoomLabel();
+  scopeDirty = true;
+}
+function updateVZoomLabel() {
+  const el = $('vzoomlevel');
+  if (el) el.textContent = vzoom + '×';
+}
+
 // How much live history is held, so zooming out past it is visibly the buffer's edge, not a bug.
 // The client backfills the server's 60 s on connect and grows toward MAX_SPAN_S while the page
 // stays open. Keyed on the rounded seconds so it writes only when the number moves, not per frame.
@@ -1839,6 +1869,10 @@ function initScope() {
   };
   $('zoomin').onclick = () => zoomView(0.5);
   $('zoomout').onclick = () => zoomView(2);
+  $('vzoomin').onclick = () => setVZoom(vzoom * 2);
+  $('vzoomout').onclick = () => setVZoom(vzoom / 2);
+  $('vzoomreset').onclick = () => setVZoom(1);
+  updateVZoomLabel();
   $('zoomfit').onclick = () => {
     view.len = FIT_SPAN_S * rate;
     if (srvFrozen()) {
@@ -1870,10 +1904,7 @@ function initScope() {
   $('showruler').onchange = () => { scopeDirty = true; };
 
   $('measure').onclick = () => {
-    if (!srvFrozen()) {
-      scopeMsg('Press Analyze first — the delay is measured on the captured snapshot.');
-      return;
-    }
+    if (!srvFrozen()) return;   // the button is disabled off a frozen snapshot; guard defensively
     // Both cursors set: measure the bracketed span. Otherwise fall back to the whole visible
     // window, so a quick Measure works without placing cursors first — clamped to the snapshot
     // bounds so a rounded view edge can never spill past [valid_start, valid_end).

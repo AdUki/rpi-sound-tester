@@ -291,7 +291,10 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 
 /* A little air before Measure so it reads as the action at the end of the Delay row, not a
    fourth part of the IN → IN selector. */
-#measure { margin-left: 0.6rem; }
+#measurewrap { margin-left: 0.6rem; }
+/* A disabled button eats its own title tooltip, so the wrapper carries the "why it's disabled"
+   text and pointer-events:none lets the hover reach it. */
+#measure:disabled { pointer-events: none; }
 
 /* The zoom and buffered readouts — their slots are reserved and the digits tabular, so a value
    changing moves nothing after it (the buffered figure is rewritten ~once a second as history
@@ -404,6 +407,14 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 .sgctl label { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; white-space: nowrap; }
 .sgctl #sghover { margin-left: auto; }
 
+/* The Wave and Spectrogram control miniframes ride in their own row of .tgrp boxes just under the
+   main toolbar; the Spectrogram box collapses out (flex) whenever no lane is showing a spectrogram. */
+.subbar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem; }
+.subbar label { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; white-space: nowrap; }
+
+/* Vertical-zoom steppers on the Wave miniframe: square-ish so − and + read as a matched pair. */
+.zbtn { min-width: 2.1rem; padding: 0.3rem 0.6rem; font-weight: 600; text-align: center; }
+
 .maps { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
 .maps label { display: flex; align-items: center; gap: 0.5rem; }
 
@@ -443,6 +454,9 @@ td:first-child { color: var(--muted); width: 40%; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* With no message to show, collapse the line entirely so the result box below keeps equal spacing
+   above and below instead of an empty reserved line stretching the gap over it. */
+#scopemsg:empty { min-height: 0; margin: 0; }
 .muted { color: var(--muted); }
 .small { font-size: 0.8rem; }
 .hidden { display: none; }
