@@ -635,16 +635,43 @@ function setInputGainLabel(ch, db) {
   el.classList.toggle('active', db > 0);
 }
 
+// The ping generator has one global variant (tick/bing/bong) shared by every output routed to it.
+// We surface those variants directly in each output's Source list — picking one both routes the
+// output to the ping generator and sets that shared variant — so there is no separate control to
+// hunt for. Value form: "ping:<variant>".
+function pingVariant() {
+  return (state.generators && state.generators.ping && state.generators.ping.variant) || 'tick';
+}
+
 function sourceValue(src) {
   if (!src || src.type === 'silence') return 'silence';
   if (src.type === 'input') return 'in' + src.index;
+  if (src.index === 'ping') return 'ping:' + pingVariant();
   return 'gen' + src.index;
+}
+
+// Changing the shared variant re-labels every OTHER output already on a ping, so no dropdown lies
+// about which sound it now emits. DOM-driven so it works even for outputs just routed this session.
+function setPingVariant(variant) {
+  if (state.generators && state.generators.ping) state.generators.ping.variant = variant;
+  const val = 'ping:' + variant;
+  state.outputs.forEach(o => {
+    const el = $('src' + o.ch);
+    if (el && el.value.startsWith('ping:')) el.value = val;
+  });
+  return put('/generators/ping', {variant});
 }
 
 function buildOutputs() {
   const opts = ['<option value="silence">Silence</option>']
     .concat([...Array(NIN).keys()].map(i => `<option value="in${i}">IN ${i + 1}</option>`))
-    .concat(['sine', 'noise', 'ping'].map(g => `<option value="gen${g}">Gen: ${g}</option>`))
+    .concat([
+      '<option value="gensine">Sine</option>',
+      '<option value="gennoise">Noise</option>',
+      '<option value="ping:tick">Test: tick</option>',
+      '<option value="ping:bing">Test: bing</option>',
+      '<option value="ping:bong">Test: bong</option>',
+    ])
     .join('');
 
   $('outputs').innerHTML = state.outputs.map(o => `
@@ -668,6 +695,12 @@ function buildOutputs() {
 
     $('src' + c).onchange = e => {
       const v = e.target.value;
+      if (v.startsWith('ping:')) {
+        // A ping sound: set the shared variant and route this output to the ping generator.
+        setPingVariant(v.slice(5)).catch(err => toast(err.message));
+        put(`/outputs/${c}`, {source: {type: 'gen', index: 'ping'}}).catch(err => toast(err.message));
+        return;
+      }
       let source;
       if (v === 'silence') source = {type: 'silence'};
       else if (v.startsWith('in')) source = {type: 'input', index: parseInt(v.slice(2), 10)};
@@ -788,7 +821,6 @@ function bindGenerators() {
   $('noisemode').value = g.noise.mode;
   $('noiselevel').value = g.noise.level_db;
   $('noiselevelv').textContent = g.noise.level_db.toFixed(1);
-  $('pingvariant').value = g.ping.variant;
   $('pinginterval').value = g.ping.interval_s;
   $('pinglevel').value = g.ping.level_db;
   $('pinglevelv').textContent = g.ping.level_db.toFixed(1);
@@ -803,7 +835,6 @@ function bindGenerators() {
     $('noiselevelv').textContent = parseFloat(e.target.value).toFixed(1);
     put('/generators/noise', {level_db: parseFloat(e.target.value)}).catch(report);
   };
-  $('pingvariant').onchange = e => put('/generators/ping', {variant: e.target.value}).catch(report);
   $('pinginterval').onchange = e => put('/generators/ping', {interval_s: parseFloat(e.target.value)}).catch(report);
   $('pinglevel').oninput = e => {
     $('pinglevelv').textContent = parseFloat(e.target.value).toFixed(1);

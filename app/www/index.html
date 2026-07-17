@@ -219,18 +219,15 @@
   </div>
   <div class="card">
     <h3>Ping <span class="muted">(multiroom)</span></h3>
-    <label>Variant
-      <select id="pingvariant">
-        <option value="tick">tick — 3 kHz, sharp (use this to measure)</option>
-        <option value="bing">bing — 1 kHz, 60 ms</option>
-        <option value="bong">bong — 440 Hz, 250 ms</option>
-      </select>
-    </label>
+    <p class="muted small">Pick the ping sound — <em>tick</em>, <em>bing</em> or <em>bong</em> —
+      straight from an output's <strong>Source</strong> list. Interval and level below apply to
+      whichever one is playing.</p>
     <label>Interval <input type="number" id="pinginterval" min="0.5" max="60" step="0.5"> s</label>
     <label>Level <input type="range" id="pinglevel" min="-60" max="0" step="0.5">
       <span id="pinglevelv" class="mono val"></span> dBFS</label>
-    <p class="muted small">Only <em>tick</em> decays fast enough to give an unambiguous
-      correlation peak. bing and bong ring for many cycles and are meant to be heard, not measured.</p>
+    <p class="muted small"><em>tick</em> (3 kHz, sharp) is the only one that decays fast enough for an
+      unambiguous correlation peak — measure with it. <em>bing</em> (1 kHz, 60 ms) and <em>bong</em>
+      (440 Hz, 250 ms) ring for many cycles and are meant to be heard, not measured.</p>
     <h4>Recent emissions</h4>
     <div id="pinglog" class="mono small"></div>
   </div>
