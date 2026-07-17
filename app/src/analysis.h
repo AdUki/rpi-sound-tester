@@ -84,6 +84,12 @@ class Analysis {
   AnalysisSnapshot snapshot() const;
   EnvelopeRing& envelope() { return env_; }
 
+  // Center frequency (Hz, geometric mid-band) of each of the kSpectrumBins log-spaced spectrum
+  // bins. Fixed at construction — it depends only on the rate — and AnalysisSnapshot::spectrum is
+  // indexed the same way, so a headless client can label GET /api/spectrum without reconstructing
+  // the log mapping. Read-only after the constructor, so no lock is needed.
+  const std::array<float, kSpectrumBins>& bin_hz() const { return bin_hz_; }
+
  private:
   void run();
   void update_meters(unsigned ch, const float* buf, size_t len, uint64_t now);
@@ -108,6 +114,7 @@ class Analysis {
   std::vector<float> power_;  // |X|^2 per FFT bin
 
   std::array<std::pair<unsigned, unsigned>, kSpectrumBins> bin_ranges_{};
+  std::array<float, kSpectrumBins> bin_hz_{};  // center frequency of each spectrum bin
 
   std::array<float, kInputs> peak_hold_{};
   std::array<uint64_t, kInputs> peak_time_{};

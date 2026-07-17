@@ -316,6 +316,37 @@ void WebServer::install_routes() {
     send_json(res, j);
   });
 
+  // The 10 Hz WS "meters" message as a synchronous GET, for headless clients that just want the
+  // current per-input level without opening a WebSocket ("which channel has sound"). Same shape as
+  // the WS frame (type/sample/rms_db/peak_db) so one parser handles both. rms_db is a 100 ms
+  // window; peak_db carries a 3 s hold. Both are post input-gain — see docs/headless.md.
+  svr.Get("/api/meters", [this](const httplib::Request&, httplib::Response& res) {
+    send_json(res, meters_json(d_.analysis.snapshot()));
+  });
+
+  // The WS "spectrum" message as a synchronous GET. Adds `bins_hz` — the center frequency of each
+  // of the 240 log-spaced bins — which the WS frame omits (the console reconstructs it), so a
+  // script can threshold by frequency directly. Full float precision here (one-shot), unlike the
+  // WS frame's 0.1 dB quantisation. `?ch=0..5` returns a single input; omit it for all six.
+  svr.Get("/api/spectrum", [this](const httplib::Request& req, httplib::Response& res) {
+    int only = -1;
+    if (req.has_param("ch")) {
+      only = static_cast<int>(query_u64(req, "ch", kInputs));
+      if (only < 0 || only >= static_cast<int>(kInputs)) {
+        return send_error(res, 400, "ch must be 0..5");
+      }
+    }
+    const AnalysisSnapshot s = d_.analysis.snapshot();
+    json chans = json::array();
+    for (unsigned c = 0; c < kInputs; ++c) {
+      if (only >= 0 && c != static_cast<unsigned>(only)) continue;
+      chans.push_back({{"ch", c}, {"bins_db", s.spectrum[c]}, {"tone", tone_json(s.tone[c])}});
+    }
+    send_json(res, json{{"sample", s.sample},
+                        {"bins_hz", d_.analysis.bin_hz()},
+                        {"channels", chans}});
+  });
+
   svr.Put("/api/inputs/:ch", json_channel_route("ch", kInputs, "no such input",
       [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response&) {
     if (j.contains("gain_db")) {

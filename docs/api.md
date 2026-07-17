@@ -5,6 +5,9 @@ All request and response bodies are JSON, except the audio streams.
 
 Inputs are numbered 0–5, outputs 0–7 (the UI shows them as IN 1–6 / OUT 1–8).
 
+Driving the device from a shell? [headless.md](headless.md) is the `curl` quickref for the common
+tasks — which channel has sound, spectrum, wave, delay — built out of the endpoints below.
+
 ## State
 
 ### `GET /api/state`
@@ -208,6 +211,30 @@ by `POST /api/config/save`.
 `_max_kbps`, and `limits.opus_rate` (48000).
 
 ## Telemetry
+
+The live meters and spectrum are also served as plain synchronous GETs, so a headless client can
+poll them without opening a WebSocket. They read the same analysis snapshot the WS feed publishes.
+
+### `GET /api/meters`
+The 10 Hz WS `meters` message as a one-shot, in the same shape so one parser handles both:
+```json
+{"type":"meters","sample":1488896,"rms_db":[6],"peak_db":[6]}
+```
+`rms_db` is a 100 ms window; `peak_db` carries a 3 s hold. Both are post input-gain. Silence sits
+near −120 dB. (`GET /api/state` carries the same two arrays plus each input's `tone`.)
+
+### `GET /api/spectrum?ch=`
+The 5 Hz WS `spectrum` message as a one-shot, plus the frequency axis the WS frame omits:
+```json
+{"sample": 1488896,
+ "bins_hz": [20.32, …, 39371.6],
+ "channels": [{"ch": 0, "bins_db": [240], "tone": {"valid": true, "freq_hz": 996.09, "thd_n_pct": 0.0032}}]}
+```
+`bins_hz` is the center frequency (Hz) of each of the 240 log-spaced bins (20 Hz →
+min(Nyquist, 40 kHz)), shared by every channel, so a client can threshold by frequency without
+reconstructing the log mapping. `bins_db` is dBFS at full float precision — the WS frame quantises
+to 0.1 dB to save bandwidth; this one-shot does not. `tone` is the same dominant-partial detector
+as `/api/state`. Optional `?ch=0..5` returns a single input; omit it for all six.
 
 ### `WS /api/ws` — push only, no client messages
 | rate | message |

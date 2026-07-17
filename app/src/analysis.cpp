@@ -44,6 +44,9 @@ Analysis::Analysis(const RingBuffer& ring, double rate) : ring_(ring), rate_(rat
     k0 = std::max(1u, std::min<unsigned>(k0, kSpectrumFft / 2));
     k1 = std::max(k0 + 1, std::min<unsigned>(k1, kSpectrumFft / 2 + 1));
     bin_ranges_[b] = {k0, k1};
+    // Geometric mid-band of [f0, f1] — the natural "center" of a log-spaced bin.
+    bin_hz_[b] = static_cast<float>(
+        kSpecLowHz * std::pow(hi / kSpecLowHz, (static_cast<double>(b) + 0.5) / kSpectrumBins));
   }
 
   for (auto& s : snap_.spectrum) s.assign(kSpectrumBins, kMinDb);
