@@ -990,8 +990,9 @@ function scopeMsg(text) {
 
 // The result box keeps its place in the layout whether or not it holds a result. Unhiding it
 // used to move the canvas the moment you had finished lining the cursors up on it.
-const XCORR_IDLE = 'Press Analyze, then Measure. Bracket one ping with cursor A and cursor B first, ' +
-  'or leave the cursors clear to measure across the whole view.';
+const XCORR_IDLE = 'Press Analyze, then Measure. Bracket one ping with cursors A and B ' +
+  '(click sets A, right-click sets B), or leave the cursors clear to measure across the whole ' +
+  'view. The wheel zooms and a drag pans.';
 
 function clearResult() {
   const el = $('xcorrout');
@@ -1600,6 +1601,19 @@ function drawScope() {
     }
   }
 
+  // Ping emission markers, opt-in and independent of the ruler: a vertical line at each ping's
+  // emission sample. With a short interval they stripe the whole view and bury the waveform, and
+  // when you are not measuring delay they mean nothing — so it is off by default.
+  if ($('showpings').checked) {
+    g.lineWidth = 1;
+    g.strokeStyle = 'rgba(245,166,35,0.7)';
+    for (const p of pings) {
+      if (p.sample < x0 || p.sample > x1) continue;
+      const x = toX(p.sample);
+      g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
+    }
+  }
+
   const cursor = (s, color, label) => {
     if (s === null || s < x0 || s > x1) return;
     const x = toX(s);
@@ -1902,6 +1916,7 @@ function initScope() {
   };
 
   $('showruler').onchange = () => { scopeDirty = true; };
+  $('showpings').onchange = () => { scopeDirty = true; };
 
   $('measure').onclick = () => {
     if (!srvFrozen()) return;   // the button is disabled off a frozen snapshot; guard defensively

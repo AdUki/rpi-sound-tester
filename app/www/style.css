@@ -223,7 +223,7 @@ input[type="number"], select {
 }
 input[type="range"] { vertical-align: middle; width: 140px; }
 .buflen { color: var(--muted); white-space: nowrap; }
-.buflen input[type="number"] { width: 3.8em; padding: 0.2rem 0.35rem; }
+.buflen input[type="number"] { width: 5em; padding: 0.2rem 0.35rem; }
 
 button {
   background: var(--panel);
@@ -239,22 +239,23 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 button.danger:hover { border-color: var(--bad); color: var(--bad); }
 button.on { background: var(--good); border-color: var(--good); color: #05170f; font-weight: 600; }
 
-/* The toolbar's shape is a function of the window width and of nothing else. It used to be
-   fifteen siblings on one wrapping flex line, so the wrap point fell wherever the widest
-   reading of the moment put it: setting a cursor swung #curB from one character to forty,
-   which shoved Measure 640 px sideways and wrapped Follow onto a second line — and the canvas,
-   below it, moved out from under the pointer that had just clicked. Named areas fix the
-   arrangement at each width, a group is atomic and cannot split across lines, and every field
-   the data rewrites is given a slot it cannot outgrow. */
+/* The toolbar once was fifteen bare siblings on one wrapping flex line, so the wrap point fell
+   wherever the widest reading of the moment put it: setting a cursor swung #curB from one
+   character to forty, which shoved Measure sideways and wrapped the row — and the canvas below
+   it — out from under the pointer that had just clicked. Two rules keep it still: a group is
+   atomic (it wraps as a whole, never mid-group), and every field the live data rewrites has a
+   slot it cannot outgrow (.cval/.cvald, #zoomlevel, #capdetail's max-width). Groups are flex, not
+   a stretch-to-fill grid, so each hugs its content instead of being padded out to a fixed column
+   width — the slack collects at the end of the row, as in .subbar. The cursor readout, the one
+   field the pointer edits live, sits on its own line below the controls (.tbreak) so editing it
+   can never reflow the row above. */
 .toolbar {
-  display: grid;
+  display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
-  grid-template-columns: 5fr 3fr 4fr;
-  grid-template-areas:
-    "cap del view"
-    "cur cur cur";
   margin-bottom: 0.5rem;
 }
+.tbreak { flex-basis: 100%; height: 0; }
 .tgrp {
   display: flex;
   align-items: center;
@@ -265,11 +266,8 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
   border: 1px solid var(--line);
   border-radius: 6px;
 }
-.tgrp-cap { grid-area: cap; }
-.tgrp-del { grid-area: del; }
-.tgrp-view { grid-area: view; }
 /* The cursor row is a readout, not a control: give it the canvas's own well. */
-.tgrp-cur { grid-area: cur; background: var(--well); }
+.tgrp-cur { background: var(--well); }
 
 .tglabel {
   flex: 0 0 auto;
@@ -312,13 +310,15 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 #capstate.live { color: var(--good); }
 #capstate.paused { color: var(--warn); }
 #capstate.frozen { color: var(--accent); }
-/* flex-basis 0, not auto: a wrapping flex line breaks on the items' pre-flex sizes, so with an
-   auto basis this one's full sentence would claim its own line and make the whole toolbar — and
-   the canvas under it — 28 px taller the moment the capture paused. At zero it simply takes the
-   space that is left and clips. */
+/* flex-basis 0, not auto: with an auto basis this sentence would claim its own line inside the
+   group and make the toolbar — and the canvas under it — taller the moment the capture paused. It
+   collapses to nothing when empty (the live state), so the Capture group is tight then. max-width
+   caps how far a long detail can widen the group, so on a full-width console showing one does not
+   shove View onto a second row; a longer string clips, and its front-loaded facts survive. */
 #capdetail {
   flex: 1 1 0;
   min-width: 0;
+  max-width: 24ch;
   font-size: 0.8rem;
   white-space: nowrap;
   overflow: hidden;
@@ -343,34 +343,6 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
    and, if you set A then pan for a minute before setting B, effectively unbounded: it clips. */
 .cval { min-width: 11ch; }
 .cvald { min-width: 24ch; }
-
-/* Fills the rest of the readout row rather than leaving it empty. Elastic and clipping, so it
-   is incapable of pushing a cursor slot. */
-.curhint {
-  flex: 1 1 0;
-  min-width: 0;
-  text-align: right;
-  font-size: 0.8rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-@media (max-width: 1240px) {
-  .toolbar {
-    grid-template-columns: 1fr 1fr;
-    grid-template-areas:
-      "cap cap"
-      "del view"
-      "cur cur";
-  }
-}
-@media (max-width: 760px) {
-  .toolbar {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: "cap" "del" "view" "cur";
-  }
-}
 
 /* Sits above the canvas and holds the measure instructions when idle, the result when measured.
    min-height reserves space so an empty box doesn't jump. Only a *result* (.on) is height-capped
