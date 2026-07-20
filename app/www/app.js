@@ -868,6 +868,9 @@ function refreshPings() {
     el.innerHTML = list.slice(-8).reverse()
       .map(p => `${p.variant} @ ${p.sample} (${(p.sample / rate).toFixed(3)} s)`).join('<br>')
       || '<span class="muted">none yet</span>';
+    // The in-range pings may only have loaded after the freeze (the list arrives on a 1 s poll);
+    // measure any the snapshot now covers.
+    if (pingDelaysActive()) scheduleMeasurePings();
   }).catch(() => {});
 }
 
@@ -1036,6 +1039,7 @@ function invalidateWindows() {
   clearTimeout(winTimer);
   winTimer = setTimeout(fetchWindows, 120);
   invalidateSpectrograms();
+  scheduleMeasurePings();   // the visible set of pings (and so which need measuring) just changed
 }
 
 // The frozen and live states are entered from four places — the Analyze button, Clear, the 5 s
@@ -1050,6 +1054,7 @@ function enterFrozen(cs) {
   updateMeasureEnabled();
   fetchWindows();
   invalidateSpectrograms();
+  scheduleMeasurePings();   // a fresh snapshot: measure the pings on it if the markers are shown
   scopeDirty = true;
 }
 
@@ -1059,6 +1064,8 @@ function enterLive() {
   held = false;
   winCache = {};
   sgCache = {};
+  clearTimeout(pingDelayTimer);
+  pingDelays.clear();       // per-ping delays belong to the snapshot we just left
   $('freeze').textContent = 'Analyze';
   setCapState('live', '');
   scopeMsg('');
@@ -1089,6 +1096,107 @@ function fetchWindows() {
       rs.filter(Boolean).forEach(([ch, w]) => { winCache[ch] = w; });
       scopeDirty = true;
     });
+}
+
+// ----------------------------------------------------- per-ping delay (auto)
+//
+// With "Ping markers" on over a frozen snapshot, each visible ping's delay for the selected
+// IN a → IN b pair is cross-correlated automatically and printed under the wave — the same
+// measurement the Measure button does, run once per ping with the window auto-bracketed to that
+// single emission (this ping up to just before the next). There is no live path: cross-correlating
+// the running ring would race the writer (the daemon rejects it), so this only runs frozen.
+//
+// Results are cached by {sample, a, b, generation}. The capture counter is an absolute axis, so a
+// ping's audio — and therefore its delay — never changes once captured: panning or zooming reuses
+// the cache and never remeasures, and the same ping seen in a later freeze reuses it too. The
+// generation is in the key so an xrun's timeline discontinuity invalidates stale readings. Every
+// request eventually resolves (a value or 'fail'), so a chip never sticks on '…', and a pass only
+// fires for pings not already measured or in flight — bounded, so a fast pan can't pile up work.
+const PING_WIN_GUARD = 64;       // trim each window off the next emission so it holds exactly one ping
+const PING_LABEL_MIN_PX = 68;    // decimate: never crowd two delay chips closer than this on screen
+const PING_MEASURE_CONC = 4;     // xcorr requests in flight at once, so the daemon's pool isn't swamped
+const PING_MIN_WINDOW = 4096;    // a ping this close to the snapshot end can't be trusted: its arrival
+                                 // may fall past freeze_sample, and too short a window can't correlate
+// The normalised correlation coefficient below which a ping is "no arrival on this pair" rather than
+// a real delay: a clean loopback is ~1.0, a room path well above this, uncorrelated noise ~0.02. The
+// auto pass measures every marker — including pings emitted before the ping was routed, which have no
+// captured arrival — so a bogus lag from pure noise must read as a dash, not a number.
+const PING_MIN_PEAK = 0.05;
+
+let pingDelays = new Map();      // key -> {lag_samples, lag_ms, confidence} | 'pending' | 'fail'
+let pingDelayTimer = null;
+
+const pingGen = () => (state && state.capture && state.capture.generation) || 0;
+const pingDelayKey = (sample, a, b, gen) => `${sample}|${a}|${b}|${gen}`;
+
+function pingDelaysActive() {
+  const cb = $('showpings');
+  return srvFrozen() && cb && cb.checked && shownInputs().length > 0;
+}
+
+// The visible pings we both measure and label, decimated left-to-right so two chips never overlap,
+// each carrying its xcorr window (this emission up to just before the next, clamped to the snapshot).
+// Pure: drawScope and the measurement pass call it with the same view, so they agree on exactly
+// which pings get a number and where.
+function labelablePings(w) {
+  const out = [];
+  if (!srvFrozen() || !state || !state.capture) return out;
+  const cap = state.capture;
+  const x0 = view.start, x1 = view.start + view.len;
+  const loV = Math.max(x0, cap.valid_start), hiV = Math.min(x1, cap.valid_start + cap.valid_len);
+  const snapEnd = cap.valid_start + cap.valid_len;
+  const interval = Math.round(((state.generators && state.generators.ping
+                    && state.generators.ping.interval_s) || 1) * rate);
+  const sorted = pings.map(p => p.sample).sort((a, b) => a - b);
+  let lastX = -Infinity;
+  for (const p of pings) {                       // pings is chronological, so x runs left→right
+    if (p.sample < loV || p.sample > hiV) continue;
+    const x = (p.sample - x0) / view.len * w;
+    if (x - lastX < PING_LABEL_MIN_PX) continue;
+    const idx = sorted.indexOf(p.sample);
+    const gap = idx >= 0 && idx + 1 < sorted.length ? sorted[idx + 1] - p.sample : interval;
+    // The window runs from this emission up to just before the next (so it holds one ping), capped
+    // at the xcorr limit. The snapshot end may cut it short: accept that only down to PING_MIN_WINDOW
+    // (or the natural window, if the interval is tighter than that) — below it the reading is noise.
+    const natural = Math.min(Math.max(1024, gap - PING_WIN_GUARD), 1 << 19);
+    const room = snapEnd - p.sample;
+    if (room < Math.min(natural, PING_MIN_WINDOW)) continue;   // too near the snapshot end to measure
+    out.push({sample: p.sample, x, start: p.sample, len: Math.min(natural, room)});
+    lastX = x;
+  }
+  return out;
+}
+
+function scheduleMeasurePings() {
+  clearTimeout(pingDelayTimer);
+  pingDelayTimer = setTimeout(measurePingDelays, 140);
+}
+
+function measurePingDelays() {
+  if (!pingDelaysActive()) return;
+  const a = parseInt($('xa').value, 10), b = parseInt($('xb').value, 10);
+  if (!a || !b) return;
+  const gen = pingGen();
+  const w = $('scopecanvas').clientWidth || 1024;
+  const todo = [];
+  for (const lp of labelablePings(w)) {
+    const key = pingDelayKey(lp.sample, a, b, gen);
+    if (pingDelays.has(key)) continue;           // already resolved, or a request is in flight
+    pingDelays.set(key, 'pending');
+    todo.push({key, ch_a: a - 1, ch_b: b - 1, start: lp.start, len: lp.len});
+  }
+  if (!todo.length) return;
+  let i = 0;
+  const pump = () => {
+    if (i >= todo.length) return;
+    const t = todo[i++];
+    post('/capture/xcorr', {ch_a: t.ch_a, ch_b: t.ch_b, start: t.start, len: t.len})
+      .then(r => pingDelays.set(t.key, {lag_samples: r.lag_samples, lag_ms: r.lag_ms,
+                                        confidence: r.confidence, peak: r.peak}))
+      .catch(() => pingDelays.set(t.key, 'fail'))
+      .then(() => { scopeDirty = true; pump(); });
+  };
+  for (let k = 0; k < Math.min(PING_MEASURE_CONC, todo.length); k++) pump();
 }
 
 // ---------------------------------------------------------------- spectrogram
@@ -1612,6 +1720,59 @@ function drawScope() {
       const x = toX(p.sample);
       g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
     }
+
+    const a = parseInt($('xa').value, 10), b = parseInt($('xb').value, 10);
+    g.font = '11px ui-monospace, monospace';
+    g.textAlign = 'left';
+
+    // Per-ping delay for the selected IN a → IN b pair, printed under the wave beneath each marker
+    // (decimated by labelablePings so two chips never overlap). Frozen only — measurePingDelays has
+    // nothing to correlate live. A pending reading shows '…', a failed one '—', and a low-confidence
+    // one (a rival correlation peak nearly as tall) is dimmed and flagged '?'.
+    if (srvFrozen() && a && b) {
+      const gen = pingGen();
+      // Chips are drawn left→right and never allowed to overlap the previous one: the rightmost
+      // marker's chip is clamped left to stay on-screen, and if that clamp would land it on its
+      // neighbour it is dropped instead (the edge ping is the least trustworthy anyway).
+      let lastRight = -Infinity;
+      const chip = (lines, cx, color) => {
+        let tw = 0;
+        for (const ln of lines) tw = Math.max(tw, g.measureText(ln).width);
+        let lx = cx + 3;
+        if (lx + tw > w) lx = w - tw - 1;              // keep the rightmost chip on-screen
+        if (lx - 2 < lastRight) return;                // would collide with the previous chip: skip
+        lastRight = lx + tw + 4;
+        const base = h - 4 - (lines.length - 1) * 12;  // stack upward from the bottom edge
+        g.fillStyle = 'rgba(14,16,20,0.72)';
+        g.fillRect(lx - 2, base - 10, tw + 4, lines.length * 12 + 2);
+        g.fillStyle = color;
+        lines.forEach((ln, i) => g.fillText(ln, lx, base + i * 12));
+      };
+      for (const lp of labelablePings(w)) {
+        const d = pingDelays.get(pingDelayKey(lp.sample, a, b, gen));
+        if (d === undefined || d === 'pending') { chip(['…'], lp.x, '#8b93a3'); continue; }
+        // A failed request, or a peak too weak to be a real arrival (a ping with nothing captured
+        // on this pair), reads as a muted dash rather than a made-up lag.
+        if (d === 'fail' || d.peak < PING_MIN_PEAK) { chip(['—'], lp.x, '#8b93a3'); continue; }
+        const low = d.confidence < 2;   // a rival correlation peak nearly as tall — cycle-slip risk
+        chip([`${d.lag_samples} smp`, `${d.lag_ms.toFixed(2)} ms${low ? ' ?' : ''}`],
+             lp.x, low ? '#8b93a3' : '#f5a623');
+      }
+    }
+
+    // A caption naming the pair the chips belong to (and, live, why there are no numbers yet). Top
+    // right, clear of the lane labels (top left) and the delay chips (along the bottom).
+    if (a && b) {
+      const cap = srvFrozen() ? `Δ IN ${a} → IN ${b}`
+                              : `Δ IN ${a} → IN ${b} — Analyze to measure`;
+      g.textAlign = 'right';
+      const tw = g.measureText(cap).width;
+      g.fillStyle = 'rgba(14,16,20,0.72)';
+      g.fillRect(w - tw - 8, 2, tw + 8, 15);
+      g.fillStyle = srvFrozen() ? '#f5a623' : '#8b93a3';
+      g.fillText(cap, w - 4, 13);
+      g.textAlign = 'left';
+    }
   }
 
   const cursor = (s, color, label) => {
@@ -1916,7 +2077,13 @@ function initScope() {
   };
 
   $('showruler').onchange = () => { scopeDirty = true; };
-  $('showpings').onchange = () => { scopeDirty = true; };
+  $('showpings').onchange = () => { scopeDirty = true; scheduleMeasurePings(); };
+
+  // Changing the delay pair re-labels every ping for the new IN a → IN b; show '…' at once and
+  // measure the new pair (cached readings for the old pair stay, so switching back is instant).
+  const onPairChange = () => { scopeDirty = true; scheduleMeasurePings(); };
+  $('xa').onchange = onPairChange;
+  $('xb').onchange = onPairChange;
 
   $('measure').onclick = () => {
     if (!srvFrozen()) return;   // the button is disabled off a frozen snapshot; guard defensively
