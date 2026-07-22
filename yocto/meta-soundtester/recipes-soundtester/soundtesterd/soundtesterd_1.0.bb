@@ -6,7 +6,9 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 # libopus (meta-oe; pulls ne10 transitively on armv7) + libogg (oe-core) for the encoded listen
 # stream. RDEPENDS puts the shared libraries into the read-only image, mirroring alsa-lib.
-DEPENDS = "alsa-lib libopus libogg"
+# md2html-native is the build-time tool that renders docs/api.md to www/api.html for GET /api; it
+# is native-only, so it appears in DEPENDS but not RDEPENDS (nothing of it ships to the device).
+DEPENDS = "alsa-lib libopus libogg md2html-native"
 RDEPENDS:${PN} = "alsa-lib libopus libogg"
 
 # The daemon is built from app/ in this repository: the layer sits at yocto/meta-soundtester,
@@ -15,10 +17,15 @@ RDEPENDS:${PN} = "alsa-lib libopus libogg"
 #
 # app/third_party/* are git submodules, and file://app copies whatever is checked out there —
 # so an uninitialised clone fails in do_configure, where CMake says which command to run.
+#
+# file://docs is staged too (as ${WORKDIR}/docs, i.e. ${S}/../docs) but never installed: the build
+# renders docs/api.md to www/api.html (with md2html-native) so GET /api can serve it, and only that
+# HTML ships. Without it, do_configure fails — see app/CMakeLists.txt.
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:${THISDIR}/../../../../:"
 
 SRC_URI = " \
     file://app \
+    file://docs \
     file://soundtesterd.service \
 "
 

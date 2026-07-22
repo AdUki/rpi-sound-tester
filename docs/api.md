@@ -1,25 +1,20 @@
 # HTTP API
 
-Base URL: `http://soundtester.local` (port 80 on the device, `--port` elsewhere).
-All request and response bodies are JSON, except the audio streams.
+Base URL: `http://soundtester.local` (port 80 on the device; `--port` elsewhere). All bodies are
+JSON except the audio streams. Inputs are 0–5, outputs 0–7 (the UI labels them IN 1–6 / OUT 1–8).
 
-Inputs are numbered 0–5, outputs 0–7 (the UI shows them as IN 1–6 / OUT 1–8).
+Every PUT field is optional — send only what changes. Out-of-range numbers clamp to their limits;
+bad enums and non-permutation maps are rejected.
 
-Driving the device from a shell? [headless.md](headless.md) is the `curl` quickref for the common
-tasks — which channel has sound, spectrum, wave, delay — built out of the endpoints below.
+### `GET /api`
+This document, rendered to HTML (built from `api.md`). Also served as the static `/api.html`.
 
 ## State
 
 ### `GET /api/state`
-Everything the UI needs to render itself: inputs (gain, meters and tone metrics), outputs
-(routing, gain, mute), generator settings, channel map, capture status (including
-`analyze_frames`, the configured freeze length), engine stats (rate, format, period, xruns,
-generation), system info (CPU, temperature, IP, sync errors) and the `limits` object the
-console uses for feature detection and slider ranges.
-
-Each input and output carries a `name`, shown next to its number in the console. Names are
-set only by editing `config.json` on the data partition (or the image default) — there is no
-API to change them.
+The whole device state in one object: `inputs`, `outputs`, `generators`, `channel_map`, `capture`,
+`engine`, `system`, and `limits` (slider ranges and feature flags the console reads). Each input and
+output has a `name`, set only in `config.json` — there is no API to change it.
 
 ## Inputs
 
@@ -27,21 +22,9 @@ API to change them.
 ```json
 {"gain_db": 12.0}
 ```
-Digital make-up gain for a device whose output is too quiet to read, clamped to **0…+40 dB**
-(`limits.input_gain_min_db` / `input_gain_max_db` in `/api/state`).
-
-It is applied on the capture path *before the ring buffer*, so every consumer sees the same
-amplified signal: meters, spectrum, THD+N, envelope columns, `/api/capture/window`,
-`/api/capture/xcorr`, the listen streams, and any output routed from that input. The gained
-sample is clamped to full scale, because the ring's readers all assume |x| ≤ 1 — overdrive
-therefore flat-tops the scope and pins the peak meter at 0.0 dBFS instead of wrapping.
-
-Two consequences:
-
-- **Levels are reported post-gain.** With +20 dB on IN 1, a −40 dBFS source meters at −20 dBFS.
-  Gain is part of the measurement chain, not a display setting.
-- **It cannot undo ADC clipping** — that happened in the codec, upstream of anything software can
-  see. This is why attenuation is not offered: it would only hide a clipped signal from the meters.
+Make-up gain, 0…+40 dB, applied on capture **before the ring buffer** — so every reading (meters,
+spectrum, THD+N, scope, xcorr, listen streams) is post-gain. It cannot undo ADC clipping, which
+already happened in the codec; that is why there is no attenuation.
 
 ## Routing and outputs
 
@@ -51,85 +34,74 @@ Two consequences:
 {"source": {"type": "gen", "index": "ping"}}
 {"source": {"type": "silence"}}
 ```
-`type` is `silence` | `input` | `gen`. For `input`, `index` is 0–5; for `gen` it is
-`sine` | `noise` | `ping`. Every field is optional — send only what you want to change.
-`gain_db` is clamped to −60…0.
+`type` is `silence` | `input` | `gen`. `index` is 0–5 for `input`, or `sine` | `noise` | `ping` for
+`gen`. `gain_db` clamps to −60…0.
 
 ### `POST /api/outputs/{0-7}/identify`
-Plays three 100 ms beeps on that output *only*, overriding whatever is routed there, then
-reverts by itself. Use it to find out which physical socket a channel really comes out of.
+Three 100 ms beeps on that output only, then it reverts. Tells you which physical socket it is.
 
 ### `PUT /api/channel-map`
 ```json
 {"input_map": [0,1,2,3,4,5], "output_map": [0,1,2,3,4,5,6,7]}
 ```
-`input_map[logical] = physical TDM slot to capture from`, `output_map[logical] = slot to play
-into` — the remedy for the Octo's slot rotation (see
-[octo-known-issues.md](octo-known-issues.md)). Each map must be a permutation: slots in range
-and no duplicates, or the whole request is rejected.
+`input_map[logical]` = the TDM slot to capture from; `output_map[logical]` = the slot to play into.
+This corrects the Octo's slot rotation. Each map must be a permutation (in range, no duplicates) or
+the request is rejected.
 
 ## Generators
 
-All generator timing is derived from the same absolute sample counter that indexes the
-capture ring, which is what makes generated audio and captured audio directly comparable.
+Generator timing comes from the same sample counter that indexes the capture ring, so generated and
+captured audio line up to the sample.
 
 ### `PUT /api/generators/sine`
 ```json
 {"freq_hz": 996.09375, "level_db": -20.0}
 ```
-996.09375 Hz = 85 × 96000 / 8192 is bin-centred for the 8192-point analysis FFT, so it
-measures THD+N without windowing leakage inflating the result.
+996.09375 Hz is bin-centred for the 8192-point FFT, so THD+N reads clean with no leakage.
 
 ### `PUT /api/generators/noise`
 ```json
 {"mode": "white", "level_db": -20.0}
 ```
-`mode` is `white` | `pink`. The pink filter's coefficients are tuned for 44.1 kHz; at 96 kHz
-the slope tilts by a couple of dB across the band.
+`mode` is `white` | `pink`.
 
 ### `PUT /api/generators/ping`
 ```json
 {"variant": "tick", "interval_s": 2.0, "level_db": -20.0}
 ```
-`variant` is `tick` | `bing` | `bong`. **Use `tick` to measure** — see
-[calibration.md](calibration.md). Changing any field reschedules the next emission from the
-current sample.
+`variant` is `tick` | `bing` | `bong`. Use `tick` to measure delay — it is broadband, so the
+correlation peak is sharp. Any change reschedules the next ping from now.
 
 ### `GET /api/pings/recent`
 ```json
 [{"sample": 1466240, "variant": "tick"}]
 ```
-The absolute sample index at which each of the last 64 pings was emitted. Successive entries
-differ by exactly `round(interval_s × rate)`.
+The emission sample of the last 64 pings. Use it to bracket one ping for a delay measurement.
 
-## Capture, scope and delay measurement
+## Capture, scope and delay
+
+Capture and playback share one clock, so a sample index is the same instant on every channel.
+`start`/`len` everywhere here are absolute indices on that counter.
 
 ### `POST /api/capture/freeze` · `POST /api/capture/resume` · `GET /api/capture/status`
-Freeze copies the ring into a snapshot so measurements cannot shift while you work. (The
-console's **Analyze** button is this call.)
+Freeze copies the recent ring into a snapshot so measurements cannot shift while you work.
 ```json
-{"frozen": true, "freeze_sample": 2897920, "valid_start": 1857536, "valid_len": 1040384,
- "generation": 0}
+{"frozen": true, "freeze_sample": 2897920, "valid_start": 1857536, "valid_len": 1040384, "generation": 0}
 ```
-`valid_start`/`valid_len` bound the samples you may ask for. `generation` increments on every
-xrun: if it changed, the timeline has a discontinuity in it. The status reply additionally
-carries `live_now` (the write head's sample index) and `live_oldest` (the oldest live sample
-still guaranteed readable).
+Ask only for samples in `[valid_start, valid_start + valid_len)`. `generation` bumps on every xrun —
+if it changed, the timeline has a gap. `status` also returns `live_now` (write head) and
+`live_oldest` (oldest readable live sample).
 
 ### `POST /api/capture/config`
 ```json
 {"seconds": 20.0}
 ```
-How many recent frames the next freeze copies — the console's *Analyze buffer*. Body:
-`{"seconds": N}` (preferred) or `{"frames": N}`, clamped to
-[4096, `limits.capture_max_frames`]. The reply echoes what took effect:
-`{"analyze_frames":…, "analyze_seconds":…, "max_frames":…, "max_seconds":…}`. Not persisted:
-a restart returns to the 20 s default. Advertised by `limits.capture_config: true`.
+How much the next freeze copies. `{"seconds": N}` or `{"frames": N}`, clamped to
+[4096, `limits.capture_max_frames`]. The reply echoes what took effect. Resets to 20 s on restart.
 
 ### `GET /api/capture/window?ch=&start=&len=&cols=`
-`start` and `len` are **absolute sample indices** on the shared counter axis. Returns
-min/max pairs per column, or raw samples when `len ≤ 2 × cols`. Serves the frozen snapshot
-when frozen, otherwise the live ring (best effort).
+The scope. Returns `cols` min/max pairs over the range, or raw samples when `len ≤ 2×cols`. Serves
+the frozen snapshot if frozen, else the live ring.
 
 ### `POST /api/capture/xcorr`
 ```json
@@ -139,158 +111,151 @@ when frozen, otherwise the live ring (best effort).
 ```json
 {"lag_samples": 137, "lag_ms": 1.4271, "lag_m": 0.4895, "confidence": 4.2, "peak": 0.99}
 ```
-**Requires a freeze** (a live read of half a million frames would race the writer).
-`len` ≤ 2^19. A **positive lag means the signal arrives later on `ch_b`**. Both channels are
-zero-padded before the FFT, so the correlation is linear, not circular — without that, every
-lag would alias modulo the transform size.
+Cross-correlates two inputs over a window. **Freeze first** (`len` ≤ 2^19). A **positive lag means
+the signal arrives later on `ch_b`**. `lag_m` is the acoustic distance — meaningful for an air path,
+not a cable.
 
-Check `confidence` before you believe `lag_samples`: it is the winning correlation peak over
-the tallest genuinely separate rival (peaks are picked on the correlation's envelope, so a
-ringing stimulus's own carrier oscillation is not a rival). Below 2, either the window holds
-a repeating stimulus (the delay is only known modulo that repeat — bracket a single ping) or
-the stimulus is a continuous tone (only known modulo the carrier period — use a ping).
+Check `confidence` before trusting `lag_samples`: it is the winning peak over the tallest separate
+rival. Above 3, trust it. Below 2 it is ambiguous — either more than one ping is in the window
+(bracket a single ping) or you used a continuous tone (its delay is only known modulo the carrier —
+use a ping).
+
+## Genie helpers
+
+Shortcuts that turn the primitives above into a single answer.
+
+### `GET /api/genie/sound[?ch=&threshold_db=]`
+Is there sound on an input?
+```json
+{"sample": 1488896, "threshold_db": -60.0,
+ "channels": [{"ch": 0, "sound": true, "rms_db": -20.1, "peak_db": -18.0,
+               "tone": {"valid": true, "freq_hz": 996.09, "thd_n_pct": 0.0032}}]}
+```
+`sound` is `peak_db > threshold_db`. Peak is a 3 s hold, so a tick or ping counts as sound, not just
+a steady tone. `threshold_db` defaults to −60. `?ch=0..5` for one input; omit for all six.
+
+### `GET /api/genie/sync[?ch_a=&ch_b=&cur_x=&cur_y=]`
+Delay between two inputs. A GET, so you can run it from a browser. Every param is optional:
+- `ch_a` / `ch_b` — the pair. Default: the first two inputs that currently have sound. Positive lag
+  = later on `ch_b`.
+- `cur_x` / `cur_y` — two sample indices bracketing **one** window to measure. Omit both to measure
+  **every ping marker in the buffer** instead.
+
+Freeze: if the capture is already frozen (`POST /api/capture/freeze`) it measures on that snapshot
+and leaves it frozen; otherwise it freezes, measures and unfreezes. `frozen` in the reply says which.
+
+With `cur_x`/`cur_y` — one window:
+```json
+{"ch_a": 0, "ch_b": 1, "frozen": true, "start": 1166016, "len": 16384,
+ "lag_samples": 137, "lag_ms": 1.4271, "lag_m": 0.4895, "confidence": 42.0, "peak": 0.99}
+```
+Without them — every ping marker, plus a summary:
+```json
+{"ch_a": 0, "ch_b": 1, "frozen": false,
+ "snapshot": {"freeze_sample": 3018112, "valid_start": 1097728, "valid_len": 1920384, "generation": 0},
+ "measurements": [
+   {"center": 1170112, "variant": "tick", "start": 1166016,
+    "lag_samples": 137, "lag_ms": 1.4271, "lag_m": 0.4895, "confidence": 999.0, "peak": 0.99},
+   {"center": 954112, "variant": "tick", "skipped": "outside buffer"}],
+ "summary": {"n": 27, "lag_samples_median": 137.0, "lag_ms_median": 1.4271, "lag_m_median": 0.4895,
+             "lag_samples_min": 137, "lag_samples_max": 137, "lag_samples_spread": 0,
+             "confidence_median": 999.0}}
+```
+Each ping is bracketed from its emission up to just before the next, so the window holds exactly
+one arrival wherever the loopback delay puts it — the same method the console's Scope uses. A ping
+too near the buffer end is `skipped`; raise the *Analyze buffer* (`POST /api/capture/config`) to
+reach further back. A reading whose `peak` is below 0.05 is flagged `"no_arrival": true` — the pair
+carries no captured arrival for that ping (e.g. it was emitted before routing) — and is left out of
+the summary. `lag_samples_spread` (max−min) is the marker-to-marker jitter. Read each `confidence`:
+below ~2 the lag is ambiguous (a repeating stimulus or a continuous tone). Answers 503 when there is
+not enough captured audio to freeze, 400 when no input has sound and no channels were given.
 
 ## Listening
 
+At most 12 listen streams (WS + WAV + Ogg) at once; more get 503.
+
 ### `WS /api/listen/{0-5}`
-Binary frames: a little-endian `uint64` absolute starting sample index, followed by the audio.
-The index lets a client detect a gap when it falls behind, and — because every channel stamps
-the same instant with the same index — is what keeps channels sample-aligned. This is what the
-browser uses.
-
-Codec is chosen per connection with a query parameter; the default is raw PCM, so a client that
-asks for nothing keeps the original format byte for byte:
-
-- **`?codec=pcm`** (default): the index is followed by 4096 mono **S16_LE** samples at the native
-  rate.
-- **`?codec=opus`**: the index is followed by one raw **Opus** packet — a 20 ms frame of the
-  channel decimated to 48 kHz. Decode it with a stateful Opus decoder (the browser ships one as
-  WASM); frames arrive in order over TCP. `?bitrate=<kbps>` overrides the bitrate for this
-  connection, otherwise the daemon default applies. Opus is only offered when the engine runs at
-  a rate it supports (48 or 96 kHz); see `limits.listen_codecs` in `GET /api/state`.
+Binary frames: a little-endian `uint64` start sample, then the audio. The index lets a client spot a
+gap and keeps channels aligned. Codec per connection:
+- **`?codec=pcm`** (default): 4096 mono **S16_LE** samples at the native rate.
+- **`?codec=opus`**: one raw **Opus** packet — a 20 ms frame decimated to 48 kHz. `?bitrate=<kbps>`
+  overrides. Offered only at 48/96 kHz (`limits.listen_codecs`).
 
 ### `GET /api/stream.ogg`
-An endless chunked **Ogg/Opus** stream carrying **all six inputs interleaved** in one container,
-read from a single ring cursor so every channel shares one clock — the only way an external
-player gets sample-aligned channels (separate per-channel URLs cannot be locked together). The
-channels are independent (Opus mapping family 255, uncoupled), so extract them rather than "play"
-the file — a player rendering to stereo would surround-downmix them:
+One endless Ogg/Opus stream with all six inputs interleaved, from a single ring cursor so they stay
+sample-aligned. Channels are uncoupled (Opus family 255) — extract them, don't play them as surround:
 ```sh
-# split the six inputs into per-channel WAVs, preserving their sample alignment
 ffmpeg -i http://soundtester.local/api/stream.ogg -filter_complex \
   "channelsplit=channel_layout=6.0" -map '[FL]' in0.wav -map '[FR]' in1.wav …
 ```
-`?bitrate=<kbps>` overrides the per-channel bitrate. Capped at **2** concurrent Ogg streams (each
-runs six encoders on one thread). Requires an Opus-capable engine rate.
+`?bitrate=<kbps>` per channel. Max 2 concurrent. Needs a 48/96 kHz rate.
 
 ### `GET /api/inputs/{0-5}/stream.wav`
-An endless chunked WAV, for VLC / curl / ffmpeg:
-```sh
-vlc http://soundtester.local/api/inputs/0/stream.wav
-ffplay http://soundtester.local/api/inputs/0/stream.wav
-```
-The RIFF and data sizes are `0xFFFFFFFF`. FFmpeg (so Chrome) reads that as "unknown length"
-and keeps going; VLC ignores a size larger than the stream. Players that *do* trust the size
-stop after 4 GiB — about **6.2 hours** at 96 kHz mono. That is a property of the format, not
-a bug.
-
-At most **12** listen streams (WS + WAV + Ogg combined) are served at once; further requests get
-503.
+Endless mono WAV for VLC/ffmpeg/curl. The sizes are `0xFFFFFFFF` (unknown length); players that trust
+the size stop at 4 GiB — about 6.2 h at 96 kHz.
 
 ### `POST /api/listen/codec`
-Body: `{"codec":"pcm"|"opus"}` and/or `{"bitrate_kbps":N}`. Sets the daemon's **default** codec
-(the console's preference, advertised as `limits.listen_default_codec`) and the per-channel Opus
-bitrate, which is clamped, applied live — active Opus streams follow a change — and also used by
-`stream.ogg` when no `?bitrate=` is given (`stream.ogg` itself is always Ogg/Opus regardless of
-the codec default). The reply echoes what took effect: `{"codec":…,"bitrate_kbps":…}`. This never
-changes the WS wire default: a browser still opts into Opus explicitly with `?codec=opus`. Saved
-by `POST /api/config/save`.
-
-`GET /api/state` advertises `limits.listen_codecs` (e.g. `["pcm","opus"]`),
-`limits.listen_default_codec`, `limits.listen_bitrate_kbps`, `limits.listen_bitrate_min_kbps` /
-`_max_kbps`, and `limits.opus_rate` (48000).
+```json
+{"codec": "pcm", "bitrate_kbps": 96}
+```
+Sets the default codec and Opus bitrate. Applied live (active Opus streams follow), echoed back,
+saved by `config/save`. The WS wire default stays PCM — a browser opts into Opus with `?codec=opus`.
 
 ## Telemetry
 
-The live meters and spectrum are also served as plain synchronous GETs, so a headless client can
-poll them without opening a WebSocket. They read the same analysis snapshot the WS feed publishes.
+The live meters and spectrum are also plain GETs, so a script can poll without a WebSocket. Both read
+the same analysis snapshot as the WS feed.
 
 ### `GET /api/meters`
-The 10 Hz WS `meters` message as a one-shot, in the same shape so one parser handles both:
 ```json
-{"type":"meters","sample":1488896,"rms_db":[6],"peak_db":[6]}
+{"type": "meters", "sample": 1488896, "rms_db": [6], "peak_db": [6]}
 ```
-`rms_db` is a 100 ms window; `peak_db` carries a 3 s hold. Both are post input-gain. Silence sits
-near −120 dB. (`GET /api/state` carries the same two arrays plus each input's `tone`.)
+`rms_db` is a 100 ms window; `peak_db` a 3 s hold. Both post input-gain. Silence sits near −120 dB.
 
 ### `GET /api/spectrum?ch=`
-The 5 Hz WS `spectrum` message as a one-shot, plus the frequency axis the WS frame omits:
 ```json
-{"sample": 1488896,
- "bins_hz": [20.32, …, 39371.6],
+{"sample": 1488896, "bins_hz": [20.32, …, 39371.6],
  "channels": [{"ch": 0, "bins_db": [240], "tone": {"valid": true, "freq_hz": 996.09, "thd_n_pct": 0.0032}}]}
 ```
-`bins_hz` is the center frequency (Hz) of each of the 240 log-spaced bins (20 Hz →
-min(Nyquist, 40 kHz)), shared by every channel, so a client can threshold by frequency without
-reconstructing the log mapping. `bins_db` is dBFS at full float precision — the WS frame quantises
-to 0.1 dB to save bandwidth; this one-shot does not. `tone` is the same dominant-partial detector
-as `/api/state`. Optional `?ch=0..5` returns a single input; omit it for all six.
+240 log-spaced bins, 20 Hz → min(Nyquist, 40 kHz), in dBFS. `bins_hz` gives each bin's center so you
+can threshold by frequency directly. `?ch=0..5` for one input; omit for all six.
 
-### `WS /api/ws` — push only, no client messages
+### `WS /api/ws` — push only
 | rate | message |
 |---|---|
 | 10 Hz | `{"type":"meters","sample":…,"rms_db":[6],"peak_db":[6]}` |
 | 5 Hz | `{"type":"spectrum","channels":[{"ch":0,"bins":[240],"tone":{…}}]}` |
-| 10 Hz | **binary** envelope frame (below) |
-| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"listen_streams":…,"engine_running":…,"cpu_pct":…,"temp_c":…,"mem":{…},"throttle":{…}}` |
+| 10 Hz | binary envelope frame (below) |
+| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"cpu_pct":…,"temp_c":…,…}` |
 
-Spectrum bins are quantised to 0.1 dB — finer than any display can resolve, and it keeps one
-spectrum message near 10 kB. Raw floats serialise each bin to full precision
-(`-88.61194610595703`) and cost 27.9 kB per message.
+Spectrum bins are quantised to 0.1 dB on the WS to save bandwidth; the GET gives full float precision.
 
 Binary envelope frame: `u8 type=1`, `u64 first_sample`, `u16 ncols`, then
-`ncols × 6 × {i16 min, i16 max}`. One column is 480 frames (200 columns/s at 96 kHz).
-
-The envelope frame rate is 10 Hz because that is the rate at which the analysis thread
-*produces* envelope columns (~20 per tick). Frame rate is only a packing choice — the scope's
-fidelity comes from the 200 columns/s. Pushing at 15 Hz finds an empty ring on a third of its
-ticks and sends nothing.
+`ncols × 6 × {i16 min, i16 max}`. One column = 480 frames (200 columns/s at 96 kHz).
 
 ### `POST /api/telemetry/inputs`
-Body: `{"enabled":[bool ×6]}`. Tells the daemon which inputs the console is watching; inputs set
-`false` are **dropped from the spectrum message**, the widest frame on the wire, so a console
-showing two of six inputs pulls roughly a third of the spectrum bandwidth. The meters message and
-the binary envelope frame keep their fixed six-channel shape for compatibility with any console —
-the console hides disabled inputs on its own regardless.
-
-The mask is process-global and last-writer-wins: this is a single-operator bench, so two consoles
-disagreeing is out of scope. It resets to all-enabled on daemon restart; the console re-posts it on
-every WebSocket (re)connect. Support is advertised by `limits.telemetry_mask: true` in
-`GET /api/state`; a console that does not see the flag simply skips the POST and disables inputs
-client-side only.
+```json
+{"enabled": [true, true, false, false, false, false]}
+```
+Which inputs the console is watching. Disabled ones are dropped from the spectrum message (the widest
+frame). Global, last-writer-wins; resets to all-on at restart.
 
 ## System
 
 ### `POST /api/config/save`
-Writes the current routing, generators and channel map to `/data/config.json` — the only
-thing that survives a reboot. The data partition is remounted read-write for the duration of
-the write and back to read-only afterwards.
+Writes routing, generators and channel map to `/data/config.json` — the only state that survives a
+reboot. `/data` is remounted read-write for the write, then back. If `/data` did not mount the save
+is refused (`data_persistent: false` in `/api/state`).
 
 ### `POST /api/config/reset`
-Removes the saved file; the next boot uses the image defaults.
+Deletes the saved file; the next boot uses the image defaults.
 
-### `POST /api/system/reboot`
-Answers `{"ok":true}` first, then runs `systemctl reboot` — the browser needs the response
-before the socket dies.
-
-### `POST /api/system/shutdown`
-Same shape as reboot, running `systemctl poweroff`. The rootfs is read-only, so pulling the
-plug is *usually* survivable — but `/data` is briefly writable during a save, and a hard power
-cut inside that window can corrupt the SD card, which is why a clean shutdown exists at all.
+### `POST /api/system/reboot` · `POST /api/system/shutdown`
+Answers `{"ok":true}`, then runs `systemctl reboot` / `poweroff`. Disabled in a simulated run.
+Shutdown exists because a power cut during a `/data` save can corrupt the card.
 
 ### `POST /api/system/inject-kmsg`
-Test hook: feeds a line to the kmsg watcher, so the I2S-sync-error banner can be exercised
-without provoking a real sync error.
+Test hook: feed a line to the kmsg watcher to exercise the I2S-sync-error banner.
 ```sh
 curl -X POST http://soundtester.local/api/system/inject-kmsg -d 'bcm2835-i2s: I2S SYNC error!'
 ```

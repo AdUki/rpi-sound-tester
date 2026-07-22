@@ -103,6 +103,10 @@ h4 { margin: 1rem 0 0.5rem; font-size: 0.85rem; color: var(--muted); }
 }
 .tab:hover { color: var(--fg); }
 .tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+/* The API tab is an <a>, not a <button>: strip the underline and push it to the far right so it
+   reads as a link out of the console rather than another panel. */
+a.tab { text-decoration: none; }
+.tab-ext { margin-left: auto; }
 
 main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
 

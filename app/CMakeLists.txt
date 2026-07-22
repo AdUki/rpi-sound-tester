@@ -65,6 +65,41 @@ endif()
 set(CLI11_SHIM ${CMAKE_CURRENT_BINARY_DIR}/cli11-shim)
 file(GENERATE OUTPUT ${CLI11_SHIM}/CLI11.hpp CONTENT "#include <CLI/CLI.hpp>\n")
 
+# Render the API reference (docs/api.md) to HTML at build time and drop it into www/, so GET /api
+# serves a pre-rendered page and only the HTML — no Markdown, no renderer — ships to the device.
+# The converter is the md2html tool: in a Yocto build it comes from md2html-native (on PATH); in a
+# plain desktop build it is the repo script run with python3.
+set(ST_API_MD ${CMAKE_CURRENT_SOURCE_DIR}/../docs/api.md)
+if(NOT EXISTS ${ST_API_MD})
+  # The Yocto recipe stages only app/ by default; docs/ must be in SRC_URI so this read works in
+  # the cross build too. The command goes on its own line: message() hard-wraps.
+  message(FATAL_ERROR "GET /api renders docs/api.md, but it is not at ${ST_API_MD}.\n"
+                      "In a Yocto build, add this to SRC_URI in soundtesterd_1.0.bb:\n"
+                      "    file://docs\n")
+endif()
+
+find_program(MD2HTML NAMES md2html)  # md2html-native puts it on PATH in a Yocto build
+if(MD2HTML)
+  set(MD2HTML_CMD ${MD2HTML})
+  set(MD2HTML_DEP ${MD2HTML})
+else()
+  find_program(PYTHON3 NAMES python3 python REQUIRED)  # desktop build: run the repo script
+  set(MD2HTML_TOOL ${CMAKE_CURRENT_SOURCE_DIR}/../tools/md2html)
+  set(MD2HTML_CMD ${PYTHON3} ${MD2HTML_TOOL})
+  set(MD2HTML_DEP ${MD2HTML_TOOL})
+endif()
+
+# Generated into the source www/ (git-ignored) rather than the build tree, so `make deploy-www`
+# — which copies app/www — carries it to a running board over ssh with no reflash.
+set(ST_API_HTML ${CMAKE_CURRENT_SOURCE_DIR}/www/api.html)
+add_custom_command(
+  OUTPUT ${ST_API_HTML}
+  COMMAND ${MD2HTML_CMD} ${ST_API_MD} ${ST_API_HTML} --title "soundtester HTTP API"
+  DEPENDS ${ST_API_MD} ${MD2HTML_DEP}
+  COMMENT "Rendering docs/api.md -> www/api.html"
+  VERBATIM)
+add_custom_target(api_html ALL DEPENDS ${ST_API_HTML})
+
 add_library(third_party INTERFACE)
 target_include_directories(third_party SYSTEM INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib

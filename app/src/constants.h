@@ -91,4 +91,15 @@ inline constexpr bool opus_rate_supported(unsigned rate) {
 
 inline constexpr size_t kPingLogEntries = 64;
 
+// "Genie" convenience helpers (GET /api/genie/sound, GET /api/genie/sync).
+inline constexpr float kGenieSoundThresholdDb = -60.0f;  // peak_db above this reads as "sound"
+
+// Per-ping xcorr window for GET /api/genie/sync, mirroring the console's Scope auto-measure
+// (app.js PING_* constants): the window runs from a ping's emission up to just before the next, so
+// it holds exactly one arrival wherever the loopback delay lands it — a fixed window centred on the
+// emission misses the arrival once the loopback exceeds it.
+inline constexpr uint64_t kPingWinGuard = 64;      // trim off the next emission -> one ping per window
+inline constexpr uint64_t kPingMinWindow = 4096;   // a ping this near the buffer end can't be trusted
+inline constexpr float kPingMinPeak = 0.05f;       // below this the correlation is noise, not an arrival
+
 }  // namespace st

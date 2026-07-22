@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Minimal Markdown -> HTML for the soundtester API reference (docs/api.md).
+
+Handles exactly the subset that doc uses — ATX headings, fenced code blocks, GitHub pipe tables,
+unordered lists (with wrapped continuation lines), soft-wrapped paragraphs, and inline `code` /
+**bold** — and escapes everything else. Not a general Markdown engine: it exists so the build can
+render docs/api.md to a static www/api.html served at GET /api, with no runtime renderer and no
+external tool. Yocto provides it as md2html-native; a desktop build runs it straight from the repo.
+
+    md2html INPUT.md OUTPUT.html [--title "..."]
+"""
+import argparse
+import sys
+
+
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def inline(s):
+    """Escape HTML, wrap `code` spans in <code> and **bold** in <strong>. A code span is taken
+    verbatim (so * and ** inside it stay literal); a bold span may itself contain a code span, so
+    bold toggles independently of the code scan."""
+    out = []
+    bold = False
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "`":
+            close = s.find("`", i + 1)
+            if close == -1:                       # unbalanced backtick — literal
+                out.append("`")
+                i += 1
+            else:
+                out.append("<code>" + esc(s[i + 1:close]) + "</code>")
+                i = close + 1
+        elif ch == "*" and i + 1 < n and s[i + 1] == "*":
+            out.append("</strong>" if bold else "<strong>")
+            bold = not bold
+            i += 2
+        else:
+            out.append(esc(ch))
+            i += 1
+    if bold:
+        out.append("</strong>")                   # never left open
+    return "".join(out)
+
+
+def is_table_separator(t):
+    """A GitHub table separator row, e.g. |---|:--:| — pipes, dashes, colons, spaces, >=1 dash."""
+    if not t or t[0] != "|":
+        return False
+    dash = False
+    for ch in t:
+        if ch == "-":
+            dash = True
+        elif ch not in "|: ":
+            return False
+    return dash
+
+
+def table_cells(row):
+    r = row.strip()
+    if r.startswith("|"):
+        r = r[1:]
+    if r.endswith("|"):
+        r = r[:-1]
+    return [c.strip() for c in r.split("|")]
+
+
+def render_body(md):
+    lines = md.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = []
+    para = []
+    items = []
+    in_list = False
+
+    def flush_para():
+        if para:
+            out.append("<p>" + inline(" ".join(para)) + "</p>")
+            para.clear()
+
+    def flush_list():
+        nonlocal in_list
+        if in_list:
+            out.append("<ul>")
+            for it in items:
+                out.append("<li>" + inline(it) + "</li>")
+            out.append("</ul>")
+            items.clear()
+            in_list = False
+
+    def flush_all():
+        flush_para()
+        flush_list()
+
+    i, n = 0, len(lines)
+    while i < n:
+        raw = lines[i]
+        t = raw.strip()
+
+        if t.startswith("```"):                    # fenced code block
+            flush_all()
+            lang = t[3:].strip()
+            cls = ' class="language-%s"' % esc(lang) if lang else ""
+            code = []
+            i += 1
+            while i < n and not lines[i].strip().startswith("```"):
+                code.append(esc(lines[i]))
+                i += 1
+            out.append("<pre><code%s>%s</code></pre>" % (cls, "".join(c + "\n" for c in code)))
+            i += 1
+            continue
+
+        if t == "":                                # blank line ends any open block
+            flush_all()
+            i += 1
+            continue
+
+        if t[0] == "#":                            # ATX heading
+            h = 0
+            while h < len(t) and t[h] == "#":
+                h += 1
+            if 1 <= h <= 6 and h < len(t) and t[h] == " ":
+                flush_all()
+                out.append("<h%d>%s</h%d>" % (h, inline(t[h + 1:].strip()), h))
+                i += 1
+                continue
+
+        if t[0] == "|" and i + 1 < n and is_table_separator(lines[i + 1].strip()):
+            flush_all()
+            out.append("<table>")
+            out.append("<thead><tr>" + "".join("<th>%s</th>" % inline(c)
+                                                for c in table_cells(lines[i])) + "</tr></thead>")
+            out.append("<tbody>")
+            i += 2
+            while i < n and lines[i].strip().startswith("|"):
+                out.append("<tr>" + "".join("<td>%s</td>" % inline(c)
+                                            for c in table_cells(lines[i])) + "</tr>")
+                i += 1
+            out.append("</tbody></table>")
+            continue
+
+        if t.startswith("- "):                     # list item
+            flush_para()
+            in_list = True
+            items.append(t[2:].strip())
+            i += 1
+            continue
+        if in_list and raw[:1] in (" ", "\t"):     # wrapped continuation of the last item
+            if items:
+                items[-1] += " " + t
+            i += 1
+            continue
+        if in_list:                                # any other line ends the list
+            flush_list()
+
+        para.append(t)
+        i += 1
+
+    flush_all()
+    return "\n".join(out) + "\n"
+
+
+# A clean, GitHub-ish reading style, light and dark, no external assets.
+CSS = r"""
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #fff; color: #1f2328;
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+h1, h2, h3 { line-height: 1.25; font-weight: 600; }
+h1 { font-size: 1.9rem; margin: 0 0 1rem; }
+h2 { font-size: 1.4rem; margin: 2.4rem 0 .8rem; padding-bottom: .3rem; border-bottom: 1px solid #d8dee4; }
+h3 { font-size: 1.1rem; margin: 1.7rem 0 .5rem; }
+p { margin: .6rem 0; }
+a { color: #0969da; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em;
+  background: #eff1f3; padding: .12em .35em; border-radius: 4px; }
+pre { background: #f6f8fa; border: 1px solid #d8dee4; border-radius: 8px; padding: .9rem 1rem; overflow: auto; }
+pre code { background: none; padding: 0; font-size: .85rem; }
+ul { padding-left: 1.4rem; }
+li { margin: .25rem 0; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+th, td { border: 1px solid #d0d7de; padding: .4rem .6rem; text-align: left; vertical-align: top; }
+th { background: #f6f8fa; }
+strong { font-weight: 600; }
+@media (prefers-color-scheme: dark) {
+  body { background: #0d1117; color: #c9d1d9; }
+  h2 { border-color: #21262d; }
+  a { color: #58a6ff; }
+  code { background: #161b22; }
+  pre { background: #161b22; border-color: #30363d; }
+  th, td { border-color: #30363d; }
+  th { background: #161b22; }
+}
+"""
+
+
+def to_html(md, title):
+    return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+            "<title>%s</title>\n<style>%s</style>\n</head>\n<body>\n<main>\n%s</main>\n</body>\n</html>\n"
+            % (esc(title), CSS, render_body(md)))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Render Markdown to a self-contained HTML page.")
+    ap.add_argument("input", help="Markdown source file")
+    ap.add_argument("output", help="HTML file to write")
+    ap.add_argument("--title", default="API", help="document <title>")
+    args = ap.parse_args()
+
+    with open(args.input, encoding="utf-8") as f:
+        md = f.read()
+    with open(args.output, "w", encoding="utf-8") as f:
+        f.write(to_html(md, args.title))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

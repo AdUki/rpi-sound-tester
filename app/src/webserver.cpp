@@ -6,10 +6,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <vector>
 
 #include "constants.h"
+#include "genie.h"
 #include "listen_encoder.h"
 #include "listen_stream.h"
 #include "util/dsp.h"
@@ -76,6 +79,11 @@ auto json_channel_route(const char* name, unsigned limit, const char* missing, F
 uint64_t query_u64(const httplib::Request& req, const char* key, uint64_t fallback) {
   if (!req.has_param(key)) return fallback;
   return std::strtoull(req.get_param_value(key).c_str(), nullptr, 10);
+}
+
+double query_f64(const httplib::Request& req, const char* key, double fallback) {
+  if (!req.has_param(key)) return fallback;
+  return std::strtod(req.get_param_value(key).c_str(), nullptr);
 }
 
 // A listen stream's ?bitrate= override. When absent, every encode() call re-reads the live
@@ -205,6 +213,19 @@ void WebServer::install_routes() {
   httplib::Server& svr = *svr_;
 
   svr.set_mount_point("/", opt_.www_dir);
+
+  // The API index: GET /api serves docs/api.md rendered to HTML (www/api.html, produced at build
+  // time by the md2html tool). Read from disk per request, like the rest of www, so a deploy-www
+  // refresh takes effect without a restart. Also reachable as the static /api.html.
+  auto api_index = [this](const httplib::Request&, httplib::Response& res) {
+    std::ifstream f(opt_.www_dir + "/api.html", std::ios::binary);
+    if (!f) return send_error(res, 404, "api.html not found");
+    std::stringstream ss;
+    ss << f.rdbuf();
+    res.set_content(ss.str(), "text/html; charset=utf-8");
+  };
+  svr.Get("/api", api_index);
+  svr.Get("/api/", api_index);
 
   svr.Get("/api/state", [this](const httplib::Request&, httplib::Response& res) {
     const EngineStats es = d_.engine.stats();
@@ -581,6 +602,173 @@ void WebServer::install_routes() {
       arr.push_back({{"sample", p.sample}, {"variant", ping_name(static_cast<PingVariant>(p.variant))}});
     }
     send_json(res, arr);
+  });
+
+  // ---- "Genie" helpers -------------------------------------------------------------------
+  // Convenience endpoints that fold the raw telemetry/measurement primitives above into one
+  // direct answer, for headless/scripted use. They add no capability the other endpoints lack:
+  // sound is a thin wrapper over the analysis snapshot, sync over the freeze+xcorr path. See
+  // docs/headless.md.
+
+  // "Is there sound on a channel?" The verdict is peak_db (a 3 s hold, so it catches a transient
+  // tick/ping as well as a sustained tone — an RMS-only test can fall between ticks and miss it)
+  // over a threshold (default kGenieSoundThresholdDb; override with ?threshold_db=). rms_db,
+  // peak_db and the tone detector ride along. ?ch=0..5 returns one input; omit for all six.
+  svr.Get("/api/genie/sound", [this](const httplib::Request& req, httplib::Response& res) {
+    int only = -1;
+    if (req.has_param("ch")) {
+      only = static_cast<int>(query_u64(req, "ch", kInputs));
+      if (only < 0 || only >= static_cast<int>(kInputs)) {
+        return send_error(res, 400, "ch must be 0..5");
+      }
+    }
+    const double threshold = query_f64(req, "threshold_db", kGenieSoundThresholdDb);
+    const AnalysisSnapshot s = d_.analysis.snapshot();
+    json chans = json::array();
+    for (unsigned c = 0; c < kInputs; ++c) {
+      if (only >= 0 && c != static_cast<unsigned>(only)) continue;
+      chans.push_back({{"ch", c},
+                       {"sound", s.meters[c].peak_db > threshold},
+                       {"rms_db", s.meters[c].rms_db},
+                       {"peak_db", s.meters[c].peak_db},
+                       {"tone", tone_json(s.tone[c])}});
+    }
+    send_json(res, json{{"sample", s.sample}, {"threshold_db", threshold}, {"channels", chans}});
+  });
+
+  // "Measure delay/sync between two inputs." A GET, so it runs straight from a browser address
+  // bar. Every query param is optional:
+  //   ch_a, ch_b    the pair; default = the first two inputs that currently have sound
+  //   cur_x, cur_y  two sample indices bracketing ONE window to measure; omit both to measure
+  //                 every ping marker in the buffer instead
+  // Freeze handling follows intent: if the capture is already frozen (you sent POST
+  // /api/capture/freeze) it measures on that snapshot and leaves it frozen; otherwise it freezes,
+  // measures and unfreezes. A positive lag means the signal arrives later on ch_b.
+  svr.Get("/api/genie/sync", [this](const httplib::Request& req, httplib::Response& res) {
+    const AnalysisSnapshot as = d_.analysis.snapshot();
+    std::vector<unsigned> sounding;
+    for (unsigned ch = 0; ch < kInputs; ++ch) {
+      if (as.meters[ch].peak_db > kGenieSoundThresholdDb) sounding.push_back(ch);
+    }
+    // Each channel: the query value if given, else the first sounding input that isn't `exclude`.
+    auto pick = [&](const char* key, int exclude, int* out) -> const char* {
+      if (req.has_param(key)) {
+        const long v = std::strtol(req.get_param_value(key).c_str(), nullptr, 10);
+        if (v < 0 || v >= static_cast<long>(kInputs)) return "ch_a/ch_b must be 0..5";
+        *out = static_cast<int>(v);
+        return nullptr;
+      }
+      for (const unsigned ch : sounding) {
+        if (static_cast<int>(ch) != exclude) {
+          *out = static_cast<int>(ch);
+          return nullptr;
+        }
+      }
+      return "need two inputs with sound, or pass ch_a and ch_b";
+    };
+    int a = 0, b = 0;
+    if (const char* e = pick("ch_a", -1, &a)) return send_error(res, 400, e);
+    if (const char* e = pick("ch_b", a, &b)) return send_error(res, 400, e);
+
+    // Keep an existing freeze; otherwise freeze for this call only.
+    const CaptureStatus pre = d_.capture.status();
+    const bool was_frozen = pre.frozen;
+    const CaptureStatus cs = was_frozen ? pre : d_.capture.freeze(d_.engine.stats().generation);
+    if (!cs.frozen) return send_error(res, 503, "not enough captured audio to freeze yet");
+
+    const double c = 343.0;  // speed of sound, m/s
+    json out{{"ch_a", a}, {"ch_b", b}, {"frozen", was_frozen}};
+
+    // Two cursors -> one window between them.
+    if (req.has_param("cur_x") && req.has_param("cur_y")) {
+      const uint64_t x = query_u64(req, "cur_x", 0), y = query_u64(req, "cur_y", 0);
+      const uint64_t start = std::min(x, y), len = std::max(x, y) - std::min(x, y);
+      const XcorrResult r = d_.capture.xcorr(a, b, start, len);
+      if (!was_frozen) d_.capture.resume();
+      if (!r.ok) return send_error(res, 400, r.error);
+      out.update({{"start", start},
+                  {"len", len},
+                  {"lag_samples", r.lag_samples},
+                  {"lag_ms", r.lag_ms},
+                  {"lag_m", r.lag_ms * c / 1000.0},
+                  {"confidence", r.confidence},
+                  {"peak", r.peak}});
+      return send_json(res, out);
+    }
+
+    // No cursors -> every ping marker in the frozen buffer. Bracket each ping the way the console's
+    // Scope auto-measure does (app.js labelablePings): the window runs from this emission up to just
+    // before the next, so it holds exactly one ping *arrival* wherever the loopback delay lands it.
+    // A fixed window centred on the emission would miss the arrival once loopback exceeds it — the
+    // cause of the large bogus lags a narrow window reports.
+    const auto pings = d_.ctl.ping_log.recent();  // chronological (oldest -> newest)
+    const uint64_t interval =
+        static_cast<uint64_t>(std::llround(d_.ctl.ping.interval_s.load() * d_.engine.rate()));
+    const uint64_t snap_end = cs.valid_start + cs.valid_len;
+    json meas = json::array();
+    std::vector<SyncMeasurement> good;
+    for (size_t i = 0; i < pings.size(); ++i) {
+      const uint64_t sample = pings[i].sample;
+      json e{{"center", sample}, {"variant", ping_name(static_cast<PingVariant>(pings[i].variant))}};
+      if (sample < cs.valid_start || sample >= snap_end) {
+        e["skipped"] = "outside buffer";
+        meas.push_back(e);
+        continue;
+      }
+      const uint64_t gap = (i + 1 < pings.size()) ? pings[i + 1].sample - sample : interval;
+      const uint64_t natural = std::min<uint64_t>(
+          std::max<uint64_t>(1024, gap > kPingWinGuard ? gap - kPingWinGuard : 1024), kXcorrMaxLen);
+      const uint64_t room = snap_end - sample;
+      if (room < std::min<uint64_t>(natural, kPingMinWindow)) {
+        e["skipped"] = "too near buffer end";
+        meas.push_back(e);
+        continue;
+      }
+      const uint64_t len = std::min(natural, room);
+      const XcorrResult r = d_.capture.xcorr(a, b, sample, len);
+      if (!r.ok) {
+        e["skipped"] = r.error;
+        meas.push_back(e);
+        continue;
+      }
+      e.update({{"start", sample},
+                {"len", len},
+                {"lag_samples", r.lag_samples},
+                {"lag_ms", r.lag_ms},
+                {"lag_m", r.lag_ms * c / 1000.0},
+                {"confidence", r.confidence},
+                {"peak", r.peak}});
+      // Below the peak floor the correlation is noise, not a captured arrival on this pair — flag
+      // it and keep it out of the summary (the console shows these as a dash).
+      if (r.peak < kPingMinPeak) {
+        e["no_arrival"] = true;
+      } else {
+        good.push_back({r.lag_samples, r.confidence});
+      }
+      meas.push_back(e);
+    }
+    if (!was_frozen) d_.capture.resume();
+
+    const SyncSummary sum = summarize_sync(good);
+    json summary{{"n", sum.n}};
+    if (sum.n > 0) {
+      const double lag_ms = 1000.0 * sum.lag_samples_median / d_.engine.rate();
+      summary.update({{"lag_samples_median", sum.lag_samples_median},
+                      {"lag_ms_median", lag_ms},
+                      {"lag_m_median", lag_ms * c / 1000.0},
+                      {"lag_samples_min", sum.lag_samples_min},
+                      {"lag_samples_max", sum.lag_samples_max},
+                      {"lag_samples_spread", sum.lag_samples_spread},
+                      {"confidence_median", sum.confidence_median}});
+    }
+    out.update({{"snapshot",
+                 {{"freeze_sample", cs.freeze_sample},
+                  {"valid_start", cs.valid_start},
+                  {"valid_len", cs.valid_len},
+                  {"generation", cs.generation}}},
+                {"measurements", meas},
+                {"summary", summary}});
+    send_json(res, out);
   });
 
   svr.Post("/api/config/save", [this](const httplib::Request&, httplib::Response& res) {
