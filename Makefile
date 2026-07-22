@@ -108,6 +108,41 @@ ifdef FULL
 	@echo "Yocto tmp removed; downloads/ and sstate-cache/ kept, so a rebuild is much faster."
 endif
 
+## ─── deploy ──────────────────────────────────────────────────────────────────
+
+# Push a local change to a running board over ssh, without a reflash. The rootfs is a
+# writable ext4 mounted read-only, so both targets remount it rw, write, sync, then remount
+# ro again (the change persists on the SD card). Override the ssh destination with TARGET=.
+#   make deploy-www                              # to root@soundtester.local
+#   make deploy-daemon TARGET=root@192.168.1.42
+TARGET    ?= root@soundtester.local
+WWW_DEST  := /usr/share/soundtester/www
+BIN_DEST  := /usr/bin/soundtesterd
+# The stripped ARM binary from `make bitbake ARGS="soundtesterd"`. The daemon reads its www
+# from disk per request, so a frontend swap needs no restart; a binary swap does.
+YOCTO_BIN := $(YB)/tmp/work/cortexa7t2hf-neon-vfpv4-poky-linux-gnueabi/soundtesterd/1.0/packages-split/soundtesterd/usr/bin/soundtesterd
+
+.PHONY: deploy-www
+deploy-www: ## Copy app/www to a running board over ssh (no restart; TARGET=root@host)
+	@echo -e "$(BOLD)app/www → $(TARGET):$(WWW_DEST)$(OFF)"
+	@ssh $(TARGET) 'mount -o remount,rw /'
+	@scp -r $(APP)/www/* $(TARGET):$(WWW_DEST)/
+	@ssh $(TARGET) 'sync && mount -o remount,ro /'
+	@echo -e "Done. Hard-refresh the browser $(DIM)(Ctrl+Shift+R)$(OFF)."
+
+.PHONY: deploy-daemon
+deploy-daemon: ## Copy the cross-compiled daemon to a board, stop+restart it (TARGET=root@host)
+	@if [ ! -e $(YOCTO_BIN) ]; then \
+	  echo -e "$(BOLD)No cross-compiled daemon.$(OFF) $(YOCTO_BIN) is missing."; \
+	  echo -e "Build it first:  $(BOLD)make bitbake ARGS=\"soundtesterd\"$(OFF)"; exit 1; fi
+	@echo -e "$(BOLD)$(YOCTO_BIN) → $(TARGET):$(BIN_DEST)$(OFF)"
+	@ssh $(TARGET) 'systemctl stop soundtesterd'
+	@ssh $(TARGET) 'mount -o remount,rw /'
+	@scp $(YOCTO_BIN) $(TARGET):$(BIN_DEST)
+	@ssh $(TARGET) 'sync && mount -o remount,ro /'
+	@ssh $(TARGET) 'systemctl start soundtesterd'
+	@echo "Done. Daemon restarted with the new binary."
+
 ## ─── configure ───────────────────────────────────────────────────────────────
 
 # Everything here can equally well be done by editing the two files by hand; this target just
@@ -318,4 +353,4 @@ help:
 	     /^## ─/ { gsub(/## /,""); printf "\n\033[2m%s\033[0m\n", $$0; next } \
 	     /^[a-zA-Z_-]+:.*?## / { printf "  \033[1m%-11s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo -e "\n$(DIM)Flags:  DEV=1 (dev image)  FULL=1 (deeper clean)  ARGS=\"...\" (bitbake)$(OFF)"
-	@echo -e "$(DIM)Vars:   DISK=/dev/...  DEVICE=hw:...  PORT=$(PORT)$(OFF)\n"
+	@echo -e "$(DIM)Vars:   DISK=/dev/...  DEVICE=hw:...  PORT=$(PORT)  TARGET=root@host$(OFF)\n"
