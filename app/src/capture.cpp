@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <new>
 
 #include "util/log.h"
 
@@ -18,31 +19,84 @@ size_t next_pow2(size_t n) {
   return p;
 }
 
+std::string mb_str(size_t floats) {
+  const double mb = static_cast<double>(floats) * sizeof(float) / (1024.0 * 1024.0);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%.0f", mb);
+  return buf;
+}
+
 }  // namespace
 
 CaptureStore::CaptureStore(const RingBuffer& ring, double rate, unsigned period)
     : ring_(ring), rate_(rate), period_(period) {
   // The copy margin scales with the ring: a fixed period count is fine at 24 MB but far too
   // thin once a 192 MB memcpy needs room to finish before the writer laps its start.
-  const size_t margin = std::max<size_t>(kFreezeHeadroomPeriods * period_, kRingFrames / 32);
-  max_frames_ = kRingFrames - margin;
-  // A freeze can never copy more than max_frames_, so the margin's worth of snapshot memory
-  // would be pinned for nothing.
-  snap_.assign(max_frames_ * kInputs, 0.0f);
-  mlock(snap_.data(), snap_.size() * sizeof(float));
+  const size_t margin = std::max<size_t>(kFreezeHeadroomPeriods * period_, ring.frames() / 32);
+  max_frames_ = ring.frames() - margin;
   // Default to a modest window, capped at the maximum, so a fresh freeze is quick out of the box.
   analyze_frames_ =
       std::min<uint64_t>(max_frames_, static_cast<uint64_t>(kCaptureDefaultSeconds * rate_));
+  pending_frames_ = analyze_frames_;
+  // The snapshot is sized to the analyze length, not to max_frames_. Pinning the ceiling here
+  // regardless of the setting made the console's "longer means more RAM" promise a fiction and
+  // cost ~150 MB that the default 20 s window never touches.
+  std::string err;
+  if (!resize_snapshot(analyze_frames_, &err)) {
+    LOG_ERROR("capture: cannot pin the snapshot buffer: {}", err);
+  }
 }
 
-void CaptureStore::set_analyze_frames(uint64_t frames) {
+bool CaptureStore::resize_snapshot(uint64_t frames, std::string* err) {
+  const size_t want = static_cast<size_t>(frames) * kInputs;
+  if (snap_.size() == want) return true;
+
+  std::vector<float> next;
+  try {
+    next.assign(want, 0.0f);
+  } catch (const std::bad_alloc&) {
+    if (err) *err = "not enough memory for a " + mb_str(want) + " MB snapshot";
+    return false;
+  }
+  if (mlock(next.data(), next.size() * sizeof(float)) != 0) {
+    if (err) *err = "cannot pin " + mb_str(want) + " MB — check RLIMIT_MEMLOCK";
+    return false;
+  }
+
+  if (!snap_.empty()) munlock(snap_.data(), snap_.size() * sizeof(float));
+  snap_ = std::move(next);
+  // The old samples are gone with the old buffer; a stale "frozen" flag would hand out zeros.
+  status_ = CaptureStatus{};
+  LOG_INFO("capture: snapshot buffer now {} frames ({} MB pinned)", frames, mb_str(want));
+  return true;
+}
+
+bool CaptureStore::set_analyze_frames(uint64_t frames, std::string* err) {
   std::lock_guard<std::mutex> lock(m_);
-  analyze_frames_ = std::clamp<uint64_t>(frames, kCaptureMinFrames, max_frames_);
+  const uint64_t want = std::clamp<uint64_t>(frames, kCaptureMinFrames, max_frames_);
+
+  // A frozen snapshot is somebody's in-flight measurement: record the new size and apply it
+  // on resume() or at the next freeze(), both of which discard the data anyway.
+  if (status_.frozen) {
+    analyze_frames_ = want;
+    pending_frames_ = want;
+    return true;
+  }
+
+  if (!resize_snapshot(want, err)) return false;
+  analyze_frames_ = want;
+  pending_frames_ = want;
+  return true;
 }
 
 uint64_t CaptureStore::analyze_frames() const {
   std::lock_guard<std::mutex> lock(m_);
   return analyze_frames_;
+}
+
+uint64_t CaptureStore::pinned_bytes() const {
+  std::lock_guard<std::mutex> lock(m_);
+  return static_cast<uint64_t>(snap_.size()) * sizeof(float);
 }
 
 CaptureStatus CaptureStore::freeze(uint32_t generation) {
@@ -52,11 +106,25 @@ CaptureStatus CaptureStore::freeze(uint32_t generation) {
   // out (max_frames_ keeps a margin below the write head so the copy finishes before the
   // writer laps the oldest sample). The ring's post-copy validation is the backstop, and a
   // lapped copy is discarded, not handed out as mixed data.
+  // Apply a resize deferred while the previous snapshot was frozen. A failure here keeps the
+  // old buffer, so the freeze still succeeds — just at the old length.
+  if (pending_frames_ != 0 && pending_frames_ * kInputs != snap_.size()) {
+    std::string err;
+    if (!resize_snapshot(pending_frames_, &err)) {
+      LOG_WARN("capture: keeping the {}-frame snapshot buffer: {}", snap_.size() / kInputs, err);
+    }
+  }
+
   const size_t span = static_cast<size_t>(std::min<uint64_t>(analyze_frames_, max_frames_));
+  if (span * kInputs > snap_.size()) {
+    LOG_WARN("capture: snapshot buffer holds fewer frames than requested — freezing short");
+  }
 
   for (int attempt = 0; attempt < 2; ++attempt) {
     const uint64_t n1 = ring_.counter();
-    const uint64_t start = n1 > span ? n1 - span : 0;
+    const uint64_t cap = snap_.size() / kInputs;  // the buffer is the hard bound on the copy
+    const uint64_t want = std::min<uint64_t>(span, cap);
+    const uint64_t start = n1 > want ? n1 - want : 0;
     const uint64_t len = n1 - start;
     if (len == 0) break;
 
@@ -83,6 +151,10 @@ CaptureStatus CaptureStore::freeze(uint32_t generation) {
 void CaptureStore::resume() {
   std::lock_guard<std::mutex> lock(m_);
   status_ = CaptureStatus{};
+  if (pending_frames_ != 0 && pending_frames_ * kInputs != snap_.size()) {
+    std::string err;
+    if (!resize_snapshot(pending_frames_, &err)) LOG_WARN("capture: deferred resize failed: {}", err);
+  }
 }
 
 CaptureStatus CaptureStore::status() const {
@@ -112,7 +184,7 @@ WindowResult CaptureStore::window(unsigned ch, uint64_t start, uint64_t len, uns
     r.error = "channel out of range";
     return r;
   }
-  if (len == 0 || len > kRingFrames) {
+  if (len == 0 || len > ring_.frames()) {
     r.error = "len out of range";
     return r;
   }

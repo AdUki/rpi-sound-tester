@@ -33,6 +33,11 @@ class RingBuffer {
 
   uint64_t counter() const { return n_.load(std::memory_order_acquire); }
 
+  size_t frames() const { return frames_; }
+  unsigned channels() const { return channels_; }
+  // Pinned footprint, for the memory figure reported by /api/state.
+  uint64_t pinned_bytes() const { return static_cast<uint64_t>(buf_.size()) * sizeof(float); }
+
   // Oldest sample index a reader may still ask for, given the current write head.
   uint64_t oldest(uint64_t head) const {
     const size_t span = frames_ - safety_;

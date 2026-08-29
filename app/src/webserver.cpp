@@ -541,13 +541,17 @@ void WebServer::install_routes() {
     } else {
       frames = j.at("frames").get<uint64_t>();
     }
-    d_.capture.set_analyze_frames(frames);
+    // The snapshot buffer is resized to match, so an over-large request can fail on memory
+    // rather than silently pinning more than the board has. Refuse it visibly.
+    std::string err;
+    if (!d_.capture.set_analyze_frames(frames, &err)) return send_error(res, 507, err);
     const uint64_t now = d_.capture.analyze_frames();
     const uint64_t max = d_.capture.max_frames();
     send_json(res, json{{"analyze_frames", now},
                         {"analyze_seconds", now / rate},
                         {"max_frames", max},
-                        {"max_seconds", max / rate}});
+                        {"max_seconds", max / rate},
+                        {"pinned_mb", d_.capture.pinned_bytes() / (1024 * 1024)}});
   }));
 
   svr.Get("/api/capture/status", [this](const httplib::Request&, httplib::Response& res) {

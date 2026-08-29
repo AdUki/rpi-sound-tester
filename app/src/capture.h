@@ -52,10 +52,19 @@ class CaptureStore {
   // max_frames()]. Live-settable; not persisted, so it resets to the kCaptureDefaultSeconds
   // default (capped at max_frames()) on restart. Changing it does not affect an
   // already-frozen snapshot.
-  void set_analyze_frames(uint64_t frames);
+  //
+  // This is also the snapshot's *allocation* size, which is what makes it a real memory
+  // control rather than just a copy length: the buffer is resized to match. Returns false
+  // with *err set when the new size cannot be allocated or pinned, leaving the existing
+  // snapshot untouched — a refused change must not cost the operator the capture they had.
+  // While frozen the resize is deferred (see pending_frames_) so an in-flight measurement
+  // keeps its data.
+  bool set_analyze_frames(uint64_t frames, std::string* err = nullptr);
   uint64_t analyze_frames() const;
   // The largest a freeze can be: the ring minus the copy safety margin. Fixed at construction.
   uint64_t max_frames() const { return max_frames_; }
+  // Currently pinned snapshot bytes. The ring's own footprint is reported separately.
+  uint64_t pinned_bytes() const;
 
   // start/len are absolute sample indices on the shared counter axis. Serves the frozen
   // snapshot when frozen, otherwise best-effort from the live ring.
@@ -67,6 +76,10 @@ class CaptureStore {
  private:
   bool snapshot_read(unsigned ch, uint64_t start, uint64_t len, float* out) const;
   std::string frozen_range_error() const;  // caller holds m_
+  // Reallocates and re-pins snap_ to `frames`. Caller holds m_. Allocates the replacement
+  // before releasing the old buffer, so a failure is recoverable — at the cost of both being
+  // resident for the moment of the swap.
+  bool resize_snapshot(uint64_t frames, std::string* err);
 
   const RingBuffer& ring_;
   const double rate_;
@@ -76,6 +89,7 @@ class CaptureStore {
   std::vector<float> snap_;  // interleaved, kInputs channels; snap_[0] is at valid_start
   uint64_t max_frames_ = 0;      // ring minus copy safety margin
   uint64_t analyze_frames_ = 0;  // recent frames the next freeze copies (<= max_frames_)
+  uint64_t pending_frames_ = 0;  // resize requested while frozen; applied on resume/freeze
   CaptureStatus status_;
 
   std::mutex fft_m_;

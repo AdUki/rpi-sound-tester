@@ -250,6 +250,65 @@ void test_analyze_length_is_configurable() {
   CHECK_EQ(cap.analyze_frames(), cap.max_frames());
 }
 
+// The analyze length is the snapshot's *allocation*, not just its copy length: the console
+// tells the operator that a longer buffer costs RAM, and on a 1 GB Pi that has to be true.
+void test_analyze_length_drives_the_allocation() {
+  RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
+  CaptureStore cap(ring, kRate, kPeriod);
+
+  const uint64_t at_default = cap.pinned_bytes();
+  CHECK_EQ(at_default, cap.analyze_frames() * kInputs * sizeof(float));
+  // Nowhere near the ceiling, which is what used to be pinned unconditionally.
+  CHECK(at_default < cap.max_frames() * kInputs * sizeof(float) / 2);
+
+  CHECK(cap.set_analyze_frames(static_cast<uint64_t>(5 * kRate)));
+  const uint64_t at_five = cap.pinned_bytes();
+  CHECK(at_five < at_default);
+  CHECK_EQ(at_five, cap.analyze_frames() * kInputs * sizeof(float));
+
+  CHECK(cap.set_analyze_frames(static_cast<uint64_t>(40 * kRate)));
+  CHECK(cap.pinned_bytes() > at_five);
+}
+
+// A resize while frozen must not pull the snapshot out from under an in-flight measurement.
+void test_resize_while_frozen_is_deferred() {
+  RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
+  CaptureStore cap(ring, kRate, kPeriod);
+  fill_with_delayed_copy(ring, 137, 400000, Stimulus::PingTrain);
+
+  const CaptureStatus cs = cap.freeze(0);
+  CHECK(cs.frozen);
+  const uint64_t pinned_before = cap.pinned_bytes();
+
+  CHECK(cap.set_analyze_frames(static_cast<uint64_t>(2 * kRate)));
+  // Setting took effect; the buffer did not move, so the frozen window still reads.
+  CHECK_EQ(cap.analyze_frames(), static_cast<uint64_t>(2 * kRate));
+  CHECK_EQ(cap.pinned_bytes(), pinned_before);
+  CHECK(cap.status().frozen);
+  const WindowResult w = cap.window(0, cs.valid_start + 10, 1024, 512);
+  CHECK(w.ok);
+
+  // Resuming releases the measurement, and the deferred shrink lands.
+  cap.resume();
+  CHECK(!cap.status().frozen);
+  CHECK(cap.pinned_bytes() < pinned_before);
+  CHECK_EQ(cap.pinned_bytes(), static_cast<uint64_t>(2 * kRate) * kInputs * sizeof(float));
+}
+
+// A freeze may never copy more frames than the buffer holds, however the two got out of step.
+void test_freeze_never_overruns_the_snapshot() {
+  RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
+  CaptureStore cap(ring, kRate, kPeriod);
+  CHECK(cap.set_analyze_frames(static_cast<uint64_t>(1 * kRate)));
+  fill_with_delayed_copy(ring, 0, 400000, Stimulus::Broadband);
+
+  const CaptureStatus cs = cap.freeze(0);
+  CHECK(cs.frozen);
+  CHECK(cs.valid_len <= cap.pinned_bytes() / (kInputs * sizeof(float)));
+  const WindowResult w = cap.window(0, cs.valid_start, 1024, 512);
+  CHECK(w.ok);
+}
+
 void test_window_rejects_out_of_range() {
   RingBuffer ring(kRingFrames, kInputs, 2 * kPeriod);
   CaptureStore cap(ring, kRate, kPeriod);
@@ -278,5 +337,8 @@ int main() {
   test_window_returns_raw_and_columns();
   test_window_rejects_out_of_range();
   test_analyze_length_is_configurable();
+  test_analyze_length_drives_the_allocation();
+  test_resize_while_frozen_is_deferred();
+  test_freeze_never_overruns_the_snapshot();
   return report("capture");
 }
