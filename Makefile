@@ -12,6 +12,14 @@ APP    := app
 BUILD  := $(APP)/build
 BIN    := $(BUILD)/soundtesterd
 
+# The ALSA plugin runs on the machine that SENDS audio — a laptop, a build box, anything on the
+# bench — not on the Pi, so it is built for this host and is deliberately not in the image.
+PLUGIN       := alsa-plugin
+PLUGIN_BUILD := $(PLUGIN)/build
+PLUGIN_SO    := $(PLUGIN_BUILD)/libasound_module_pcm_soundtester.so
+# VORBIS=0 builds the plugin without the encoder, and without any libvorbis dependency.
+VORBIS  ?=
+
 # Plain poky + bitbake. No kas, no pip: the layers are three git clones and two conf files.
 YOCTO   := yocto
 LAYERS  := $(YOCTO)/layers
@@ -98,11 +106,30 @@ else
 	        --www $(APP)/www --config $(APP)/config/default-config.json --data-dir /tmp/soundtester
 endif
 
+.PHONY: plugin
+plugin: ## Build the ALSA plugin for THIS machine (VORBIS=0 to leave out the encoder)
+	@cmake -S $(PLUGIN) -B $(PLUGIN_BUILD) \
+	       -DST_VORBIS=$(if $(filter 0,$(VORBIS)),OFF,ON) >/dev/null
+	@cmake --build $(PLUGIN_BUILD) -j$$(nproc)
+	@echo -e "$(BOLD)$(PLUGIN_SO)$(OFF)"
+	@echo -e "$(DIM)Try it without installing anything:$(OFF)"
+	@echo -e "  ALSA_PLUGIN_DIR=$(CURDIR)/$(PLUGIN_BUILD) aplay -D soundtester:soundtester.local x.wav"
+
+.PHONY: plugin-install
+plugin-install: plugin ## Install the plugin and its .conf system-wide (needs sudo)
+	@set -e; 	  plugdir=$$(pkg-config --variable=libdir alsa)/alsa-lib; 	  echo "installing into $$plugdir and /usr/share/alsa/alsa.conf.d"; 	  sudo install -d "$$plugdir" /usr/share/alsa/alsa.conf.d /etc/alsa/conf.d; 	  sudo install -m 0755 $(PLUGIN_SO) "$$plugdir/"; 	  sudo ln -sf libasound_module_pcm_soundtester.so "$$plugdir/libasound_module_ctl_soundtester.so"; 	  sudo install -m 0644 $(PLUGIN)/50-soundtester.conf /usr/share/alsa/alsa.conf.d/; 	  sudo ln -sf /usr/share/alsa/alsa.conf.d/50-soundtester.conf /etc/alsa/conf.d/50-soundtester.conf
+	@echo -e "$(BOLD)aplay -D soundtester:soundtester.local x.wav$(OFF)"
+
+.PHONY: plugin-uninstall
+plugin-uninstall: ## Remove the installed plugin and its .conf (needs sudo)
+	@set -e; 	  plugdir=$$(pkg-config --variable=libdir alsa)/alsa-lib; 	  sudo rm -f "$$plugdir/libasound_module_pcm_soundtester.so" 	             "$$plugdir/libasound_module_ctl_soundtester.so" 	             /usr/share/alsa/alsa.conf.d/50-soundtester.conf 	             /etc/alsa/conf.d/50-soundtester.conf
+	@echo "removed"
+
 .PHONY: clean
 clean: ## Remove the local build (add FULL=1 to also drop the Yocto build tree)
 	@# $(BUILD)-vec is the by-hand tree for vectorization reports:
 	@#   cmake -S $(APP) -B $(BUILD)-vec -DST_VECTORIZE_REPORT=ON
-	@rm -rf $(BUILD) $(BUILD)-vec
+	@rm -rf $(BUILD) $(BUILD)-vec $(PLUGIN_BUILD)
 ifdef FULL
 	@rm -rf $(YB)/tmp
 	@echo "Yocto tmp removed; downloads/ and sstate-cache/ kept, so a rebuild is much faster."

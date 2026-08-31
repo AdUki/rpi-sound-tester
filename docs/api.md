@@ -278,6 +278,73 @@ machine cannot be told apart by address — pin those with a port or a channel.
 Changing the port rebinds the listener and drops any connected sender. A bind that fails still
 answers 200 — check `listening` and `error`.
 
+### On the sending machine
+```sh
+make plugin plugin-install                       # builds and installs both plugin halves
+aplay -D soundtester:192.168.1.42 tone.wav
+aplay -D 'plug:"soundtester:192.168.1.42"' any.wav
+aplay -D soundtester:HOST=192.168.1.42,PORT=4013 tone.wav   # pin this machine to NET 3
+aplay -D soundtester:HOST=192.168.1.42,CHANNELS=2 st.wav    # stereo -> two adjacent inputs
+aplay -D soundtester:HOST=192.168.1.42,ENCODING=vorbis f.wav # compress on the way
+alsamixer -D soundtester:192.168.1.42                       # volume and mute
+```
+There is a control plugin as well as a PCM one, because a PCM device with no mixer is only half a
+sound card. It exposes **one** Master Playback Volume and Switch over **every** channel this
+machine is streaming, so a stereo sender is turned down as one source. They are the inputs' own
+`gain_db` and `mute`, so a slider moved in the web console appears in an open `alsamixer`, and the
+other way about.
+
+With no `channel` it follows the same address memory the audio side uses, and keeps following it:
+alsamixer is normally open before anything plays, when that machine's run is one channel wide, and
+the volume widens to cover both when its stereo stream takes NET 1+2. A pinned `CHANNEL` or port
+stays where it was put, still covering the whole run that channel belongs to. Arguments are
+`HOST`, `PORT`, `CHANNEL` and `CHANNELS`, positional or named:
+`soundtester:HOST=bench.local,CHANNELS=2`.
+
+`alsa-plugin/examples/` has a working `/etc/asound.conf` that makes the tester a machine's default
+output and mixer, and a PipeWire sink.
+
+### A PCM the mixer does not touch
+`mixer off` sends a stream the device will not level: neither alsamixer nor the web console can
+attenuate or mute it. For a reference stimulus, which must not be turned down by a slider left at
+40% in either of the two interfaces that share the value. Define one device each way:
+
+```
+pcm.soundtester_ref {
+        type soundtester
+        host "soundtester.local"
+        mixer off
+}
+```
+```sh
+aplay -D soundtester_ref sweep.wav       # never attenuated
+aplay -D soundtester:MIXER=0 sweep.wav   # the same, without a second device
+```
+While it runs, its inputs report `"bypass": true` and the mixer's elements go **inactive**;
+`amixer cset` on them answers `Operation not permitted`.
+
+The plugin behaves like a sound card rather than a file copier. Frames leave it at a steady rate
+measured against the sender's own monotonic clock — audio flows, it is never queued up and then
+flushed — so the sending application sees its buffer drain as it would from hardware, and the
+network sees an even packet flow. The position follows that clock rather than the plugin's poll
+descriptors, so a client that schedules on its own timer drives it too: PipeWire's default `tsched`
+needs no `api.alsa.disable-tsched`.
+
+**The device does not have to be there.** Opening the PCM does not connect: playback starts, keeps
+time and drains with nothing listening while a background thread keeps trying. Audio starts
+arriving the moment the device answers — a stream is anchored where its first packet lands — and a
+device that goes away mid-stream leaves a gap rather than an error. Both transitions are reported
+once on stderr.
+
+Holding the two machines' clocks together is the **device's** job, not the plugin's, and it does it
+by trimming the converter's ratio rather than by asking the sender to do anything. So the plugin
+holds no jitter buffer, tracks no clock and runs no servo. `GET /api/net` reports `lead_frames`
+against `target_lead_frames`, which is the loop's error term — watch it sit still.
+
+Vorbis is a build option on the plugin (`cmake -DST_VORBIS=OFF`, or `make plugin VORBIS=0`).
+Off, the plugin has no libvorbis dependency at all — which is what you want on a machine that will
+only ever send PCM — and asking for `ENCODING=vorbis` there says so plainly.
+
 ## Listening
 
 At most 12 listen streams (WS + WAV + Ogg) at once; more get 503.
