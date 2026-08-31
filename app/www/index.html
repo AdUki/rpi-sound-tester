@@ -52,6 +52,7 @@
 <nav class="tabs">
   <button class="tab active" data-tab="dash">Dashboard</button>
   <button class="tab" data-tab="scope">Scope &amp; sync</button>
+  <button class="tab" data-tab="net">Network</button>
   <button class="tab" data-tab="config">Configuration</button>
   <button class="tab" data-tab="sys">System</button>
   <!-- A real link, not a panel: no data-tab, so app.js leaves its click alone and it navigates
@@ -118,6 +119,20 @@
   </div>
 
   <div id="inputs" class="grid"></div>
+
+  <!-- Its own section rather than more cards in the grid above: these arrive over the network
+       rather than from the card's ADCs, they come and go, and the thing an operator most needs
+       to know about them is that they nonetheless share one sample axis with the inputs above. -->
+  <div id="netsec" hidden>
+    <h2>Network inputs</h2>
+    <p class="muted small">Sent over the network by a machine running the
+      <span class="mono">soundtester</span> ALSA plugin. They sit on the same sample axis as the
+      inputs above, so a delay measured between a network channel and a real input is the true
+      path delay — the alignment buffer does not appear in it.
+      <a href="#" data-tab="net">Network settings ↗</a></p>
+    <div id="netinputs" class="grid"></div>
+  </div>
+
   <h2>Outputs</h2>
   <div id="outputs" class="grid"></div>
 </section>
@@ -198,6 +213,41 @@
   <div id="xcorrout" class="result"></div>
   <div id="lanes" class="lanes"></div>
   <canvas id="scopecanvas" height="520"></canvas>
+</section>
+
+<section id="net" class="panel">
+  <div class="card wide">
+    <h3>Network inputs</h3>
+    <p class="muted small">Any Linux machine on the network can feed audio in through the
+      <span class="mono">soundtester</span> ALSA plugin, and it arrives as an ordinary input
+      channel: metered, visible in the scope, routable to an output, and a valid operand for a
+      delay measurement against a real input.</p>
+    <p class="muted small">Each packet names the exact sample it is to be played at, so the
+      tester places it on the same sample axis as its own ADCs. Local capture is held back by the
+      <em>alignment delay</em> below to make room for the network to deliver in time — which is why
+      that number is a whole second by default rather than as small as possible. It costs nothing
+      in accuracy: a delay measured between a network channel and a real input is the true path
+      delay, with the alignment removed.</p>
+    <label class="en" title="Accept network senders"><input type="checkbox" id="neten"> Enable network input</label>
+    <label>Alignment delay <input id="netdelay" type="number" min="0" max="2000" step="50"> ms</label>
+    <label>Port <input id="netport" type="number" min="1" max="65535" step="1"></label>
+    <span id="netmsg" class="muted small"></span>
+    <p id="netna" class="muted small" hidden>This device's firmware has no network input —
+      reflash to enable it.</p>
+  </div>
+  <div class="card wide">
+    <h3>Senders</h3>
+    <div id="netchans" class="grid" style="--cols:2"></div>
+  </div>
+  <div class="card wide">
+    <h3>On the sending machine</h3>
+    <p class="muted small">Build and install the plugin from the project's
+      <span class="mono">alsa-plugin/</span> directory (<span class="mono">make plugin
+      plugin-install</span>), then play to it. It advertises only what this device can really do,
+      exactly as <span class="mono">hw</span> does, so wrap it in <span class="mono">plug:</span>
+      for arbitrary files.</p>
+    <pre id="netsnippet" class="mono small"></pre>
+  </div>
 </section>
 
 <section id="config" class="panel">

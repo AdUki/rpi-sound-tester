@@ -14,7 +14,21 @@ const post = (p, obj) => api(p, {
 });
 
 const $ = id => document.getElementById(id);
-const NIN = 6, NOUT = 8;
+// NIN counts every input channel the ring carries: the card's ADCs plus any network channels.
+// NIN_LOCAL counts only the ADCs, and is what the channel map is about — TDM slots are physical,
+// so a network channel has no slot to be mapped to. Both are replaced from state.limits at
+// startup; the values here are only what an older daemon that reports neither would imply.
+let NIN = 6, NIN_LOCAL = 6;
+const NOUT = 8;
+const isNetInput = ch => ch >= NIN_LOCAL;
+
+// A network channel's ring slot is permanent — it has to be, or a freeze taken after the sender
+// disconnected would have nothing to analyse — but there is no reason to SHOW one nobody has ever
+// used. This is the daemon's fact about the channel, deliberately kept apart from inputEnabled,
+// which is the user's own show/hide preference and must not be overwritten by a sender appearing.
+const netAvailable = [];
+const inputAvailable = ch => !isNetInput(ch) || netAvailable[ch - NIN_LOCAL] === true;
+const inputLabel = ch => (isNetInput(ch) ? `NET ${ch - NIN_LOCAL + 1}` : `IN ${ch + 1}`);
 
 const tabActive = name => $(name).classList.contains('active');
 
@@ -61,6 +75,7 @@ document.querySelectorAll('[data-tab]').forEach(el => {
     // A canvas in a display:none panel measures zero, so neither could draw until now.
     if (name === 'scope') drawScope();
     else if (name === 'dash') redrawSpectra();
+    else if (name === 'net') refreshNet();
   });
 });
 
@@ -481,11 +496,12 @@ const fmtThd = p => pad(p >= 10 ? p.toFixed(1) : p >= 1 ? p.toFixed(2) : p.toFix
 // rendering it (meters, spectrum, scope lane), closes any listen stream on it, and — via
 // sendTelemetryMask() — tells the daemon to drop it from the spectrum message, the widest frame
 // on the shared push feed.
-const inputEnabled = Array(NIN).fill(true);
+const inputEnabled = [];
 
 function loadInputEnabled() {
   let saved = null;
   try { saved = JSON.parse(lsGet('input_enabled')); } catch (e) { /* not JSON */ }
+  inputEnabled.length = NIN;
   for (let c = 0; c < NIN; c++) inputEnabled[c] = !Array.isArray(saved) || saved[c] !== false;
 }
 
@@ -495,7 +511,8 @@ function saveInputEnabled() {
 
 // The list of enabled input channels, in order — the lanes the scope shows and the windows the
 // frozen view fetches.
-const shownInputs = () => inputEnabled.flatMap((on, i) => (on ? [i] : []));
+const shownInputs = () =>
+    inputEnabled.flatMap((on, i) => (on && inputAvailable(i) ? [i] : []));
 
 // The Delay pickers (from-IN / to-IN) only offer enabled inputs: a disabled lane carries no
 // captured audio to correlate against. Rebuild #xa/#xb from the enabled set, keeping each current
@@ -508,7 +525,7 @@ function syncDelaySelects() {
   const shown = shownInputs().map(i => i + 1);   // 1-based, matching the option values
   const prevA = parseInt(xa.value, 10), prevB = parseInt(xb.value, 10);
   const opts = shown.length
-    ? shown.map(v => `<option value="${v}">IN ${v}</option>`).join('')
+    ? shown.map(v => `<option value="${v}">${inputLabel(v - 1)}</option>`).join('')
     : '<option value="">—</option>';
   xa.innerHTML = opts;
   xb.innerHTML = opts;
@@ -597,14 +614,18 @@ function buildInputs() {
   // A daemon built before input gain existed sends no gain_db; render no slider rather than
   // a control wired to a 404.
   const hasGain = state.inputs.length && state.inputs[0].gain_db !== undefined;
+  const hasMute = !!(state.limits && state.limits.input_mute);
   $('gainnote').classList.toggle('hidden', !hasGain);
 
-  $('inputs').innerHTML = state.inputs.map(i => `
-    <div class="card">
+  // Rendered for every ring channel, then shown or hidden by applyNetAvailability(); an unused
+  // network channel is present in the DOM but out of sight. Network channels render into their
+  // own grid so they read as a separate class of input rather than as IN 7 and IN 8.
+  const card = i => `
+    <div class="card" id="card${i.ch}"${inputAvailable(i.ch) ? '' : ' hidden'}>
       <div class="chan-head">
         <label class="en" title="Enable / disable this input"><input type="checkbox"
           id="en${i.ch}" ${inputEnabled[i.ch] ? 'checked' : ''}></label>
-        <span class="chan-name">IN ${i.ch + 1}${i.name ? ' — ' + i.name : ''}</span>
+        <span class="chan-name">${inputLabel(i.ch)}${i.name ? ' — ' + i.name : ''}</span>
         <span class="listen-grp">
           <button id="listenL${i.ch}" class="lbtn">Listen L</button>
           <button id="listenR${i.ch}" class="lbtn">Listen R</button>
@@ -618,10 +639,17 @@ function buildInputs() {
         <span id="thd${i.ch}" class="mono rt">THD+N      —%</span>
       </div>
       ${hasGain ? `<label>Gain <input type="range" id="igain${i.ch}"
-             min="${gainMinDb}" max="${gainMaxDb}" step="0.5">
-        <span id="igainv${i.ch}" class="mono val"></span> dB</label>` : ''}
+             min="${i.gain_min_db !== undefined ? i.gain_min_db : gainMinDb}"
+             max="${gainMaxDb}" step="0.5">
+        <span id="igainv${i.ch}" class="mono val"></span>
+        <span id="igainu${i.ch}"> dB</span></label>` : ''}
+      ${hasMute ? `<label><input type="checkbox" id="imute${i.ch}"> Mute</label>` : ''}
       <canvas class="mini" id="spec${i.ch}"></canvas>
-    </div>`).join('');
+    </div>`;
+
+  $('inputs').innerHTML = state.inputs.filter(i => !isNetInput(i.ch)).map(card).join('');
+  $('netinputs').innerHTML = state.inputs.filter(i => isNetInput(i.ch)).map(card).join('');
+  syncNetSection();
 
   state.inputs.forEach(i => {
     const c = i.ch;
@@ -629,8 +657,16 @@ function buildInputs() {
     $('listenR' + c).onclick = () => toggleListen(c, 'r');
     $('en' + c).onchange = e => setInputEnabled(c, e.target.checked);
     applyInputEnabled(c);   // reflect the persisted state on this fresh card
-    const nm = document.querySelector(`#inputs .card:nth-child(${c + 1}) .chan-name`);
-    if (nm) nm.title = nm.textContent;   // the name now ellipsises, so keep it readable on hover
+    // By id, not by position: the network cards live in their own grid, so an index into
+    // #inputs stopped meaning channel c the moment they moved out of it.
+    const card_el = $('card' + c);
+    const nm = card_el && card_el.querySelector('.chan-name');
+    if (nm) nm.title = nm.textContent;   // the name ellipsises, so keep it readable on hover
+    if (hasMute && $('imute' + c)) {
+      $('imute' + c).checked = !!i.mute;
+      $('imute' + c).onchange = e =>
+        put(`/inputs/${c}`, {mute: e.target.checked}).catch(err => toast(err.message));
+    }
     if (!hasGain) return;
     setInputGainLabel(c, i.gain_db);
     $('igain' + c).value = i.gain_db;
@@ -639,15 +675,47 @@ function buildInputs() {
       setInputGainLabel(c, db);
       put(`/inputs/${c}`, {gain_db: db}).catch(err => toast(err.message));
     };
+    applyInputBypass(i);
   });
 }
 
-// +0.0 dB is the untouched signal; say "unity" so zero is not misread as muted.
+// `mixer off` on the sender: the device plays that stream exactly as it arrived, so the gain and
+// the mute are connected to nothing while it runs. Disable them and say why.
+function applyInputBypass(i) {
+  const on = !!i.bypass;
+  const g = $('igain' + i.ch);
+  const m = $('imute' + i.ch);
+  const v = $('igainv' + i.ch);
+  const why = 'This sender asked for its stream to be left alone (mixer off)';
+  if (g) {
+    g.disabled = on;
+    g.title = on ? why : '';
+  }
+  if (m) {
+    m.disabled = on;
+    m.title = on ? why : '';
+  }
+  const u = $('igainu' + i.ch);  // the unit goes with the number: "bypass dB" is not a reading
+  if (u) u.hidden = on;
+  if (!v) return;
+  v.classList.toggle('bypassed', on);
+  if (on) {
+    v.classList.remove('active');  // not "boosted" either: that gain is not being applied
+    v.textContent = 'bypass';
+    v.title = why;
+  } else {
+    v.title = '';
+    setInputGainLabel(i.ch, i.gain_db);
+  }
+}
+
+// +0.0 dB is the untouched signal; say "unity" so zero is not misread as muted. Attenuation is
+// spelled out — a network channel can go below unity, and calling -30 dB "unity" would be a lie.
 function setInputGainLabel(ch, db) {
   const el = $('igainv' + ch);
   if (!el) return;
-  el.textContent = db > 0 ? '+' + db.toFixed(1) : 'unity';
-  el.classList.toggle('active', db > 0);
+  el.textContent = db > 0 ? '+' + db.toFixed(1) : db < 0 ? db.toFixed(1) : 'unity';
+  el.classList.toggle('active', db !== 0);
 }
 
 // The ping generator has one global variant (tick/bing/bong) shared by every output routed to it.
@@ -677,9 +745,14 @@ function setPingVariant(variant) {
   return put('/generators/ping', {variant});
 }
 
-function buildOutputs() {
-  const opts = ['<option value="silence">Silence</option>']
-    .concat([...Array(NIN).keys()].map(i => `<option value="in${i}">IN ${i + 1}</option>`))
+// An unused network channel is not offered as a source. It is still added back for an output
+// already routed to it, so a saved routing keeps showing the truth instead of silently
+// collapsing to the first option.
+function optsFor(sel) {
+  return ['<option value="silence">Silence</option>']
+    .concat([...Array(NIN).keys()]
+      .filter(i => inputAvailable(i) || sel === 'in' + i)
+      .map(i => `<option value="in${i}">${inputLabel(i)}</option>`))
     .concat([
       '<option value="gensine">Sine</option>',
       '<option value="gennoise">Noise</option>',
@@ -688,14 +761,16 @@ function buildOutputs() {
       '<option value="ping:bong">Test: bong</option>',
     ])
     .join('');
+}
 
+function buildOutputs() {
   $('outputs').innerHTML = state.outputs.map(o => `
     <div class="card">
       <div class="chan-head">
         <span class="chan-name">OUT ${o.ch + 1}${o.name ? ' — ' + o.name : ''}</span>
         <button id="id${o.ch}">Identify</button>
       </div>
-      <label>Source <select id="src${o.ch}">${opts}</select></label>
+      <label>Source <select id="src${o.ch}">${optsFor(sourceValue(o.source))}</select></label>
       <label>Gain <input type="range" id="gain${o.ch}" min="-60" max="0" step="0.5">
         <span id="gainv${o.ch}" class="mono val"></span> dB</label>
       <label><input type="checkbox" id="mute${o.ch}"> Mute</label>
@@ -874,6 +949,147 @@ function refreshPings() {
   }).catch(() => {});
 }
 
+// Shows or hides the network channels to match what the daemon reports. Cards are built once and
+// toggled rather than re-rendered: rebuilding would tear down the listen buttons and the spectrum
+// canvases of every input on the page each time a sender came or went.
+function applyNetAvailability(active) {
+  if (!Array.isArray(active)) return;
+  let changed = false;
+  for (let i = 0; i < active.length; i++) {
+    if (netAvailable[i] !== !!active[i]) { netAvailable[i] = !!active[i]; changed = true; }
+  }
+  if (!changed) return;
+  for (let c = NIN_LOCAL; c < NIN; c++) {
+    const el = $('card' + c);
+    if (el) el.hidden = !inputAvailable(c);
+    const lane = $('lanewrap' + c);
+    if (lane) lane.hidden = !inputAvailable(c);
+  }
+  syncNetSection();
+  syncDelaySelects();          // the xcorr pair pickers follow shownInputs()
+  refreshOutputSourceOptions();  // a routable NET source appears or goes
+  scopeDirty = true;
+}
+
+// Re-offers the source lists without rebuilding the output cards. buildOutputs() would redraw
+// them from state.outputs, which is only fetched at boot, so any routing the operator has changed
+// since would visibly snap back to its old value while the daemon kept the new one.
+function refreshOutputSourceOptions() {
+  for (let c = 0; c < NOUT; c++) {
+    const sel = $('src' + c);
+    if (!sel) continue;
+    const cur = sel.value;
+    sel.innerHTML = optsFor(cur);
+    sel.value = cur;
+  }
+}
+
+// The heading and its explanation belong to the cards under it: with no sender there is nothing
+// for them to introduce, and the Dashboard should read exactly as it did before this existed.
+function syncNetSection() {
+  const sec = $('netsec');
+  if (!sec) return;
+  let any = false;
+  for (let c = NIN_LOCAL; c < NIN; c++) if (inputAvailable(c)) any = true;
+  sec.hidden = !any;
+}
+
+// ---------------------------------------------------------------- network inputs
+
+let netState = null;
+// Once the user types in the box, the 5 s poll stops overwriting the message under them.
+let netPollOwnsMsg = true;
+
+function buildNet() {
+  // Feature-detect, the same way initBufLen does: an older daemon has no /api/net at all, and a
+  // control wired to a 404 is worse than no control.
+  const have = !!(state.limits && state.limits.net);
+  $('netna').hidden = have;
+  ['neten', 'netdelay', 'netport'].forEach(id => { $(id).closest('label').hidden = !have; });
+  if (!have) return;
+
+  $('netdelay').min = state.limits.net_delay_min_ms;
+  $('netdelay').max = state.limits.net_delay_max_ms;
+
+  const push = () => {
+    put('/net', {
+      enabled: $('neten').checked,
+      delay_ms: parseInt($('netdelay').value, 10),
+      port: parseInt($('netport').value, 10),
+    }).then(r => {
+      netState = Object.assign(netState || {}, r);
+      // A bind that failed still returns 200 with the reason in `error`; say so rather than
+      // leaving the checkbox looking as though it took.
+      $('netmsg').textContent = r.error ? r.error
+                              : r.enabled ? `listening on ${r.port}` : 'off';
+      renderNetSnippet();
+    }).catch(e => { $('netmsg').textContent = e.message; });
+  };
+  $('neten').onchange = push;
+  $('netdelay').onchange = push;
+  $('netport').onchange = push;
+
+  refreshNet();
+}
+
+function renderNetSnippet() {
+  const host = location.hostname || 'soundtester.local';
+  const port = netState && netState.port ? netState.port : 4010;
+  const extra = port === 4010 ? '' : `,PORT=${port}`;
+  $('netsnippet').textContent =
+    `aplay -D soundtester:${host}${extra} tone.wav\n` +
+    `aplay -D 'plug:"soundtester:${host}${extra}"' anything.wav\n` +
+    `alsamixer -D soundtester:${host}${extra}          # volume and mute\n\n` +
+    `# port ${port} takes any free channel; ${port + 1}..${port + (netState ? netState.channels.length : 6)} pin NET 1..${netState ? netState.channels.length : 6}\n` +
+    `aplay -D soundtester:HOST=${host},PORT=${port + 3} tone.wav   # always NET 3\n` +
+    `aplay -D soundtester:HOST=${host},CHANNELS=2 stereo.wav    # two adjacent inputs\n\n` +
+    `# or in ~/.asoundrc\n` +
+    `pcm.bench {\n  type soundtester\n  host ${host}\n  port ${port}\n}`;
+}
+
+function refreshNet() {
+  if (!(state.limits && state.limits.net)) return;
+  api('/net').then(n => {
+    netState = n;
+    if (document.activeElement !== $('neten')) $('neten').checked = n.enabled;
+    if (document.activeElement !== $('netdelay')) $('netdelay').value = n.delay_ms;
+    if (document.activeElement !== $('netport')) $('netport').value = n.port;
+    if (!$('netmsg').textContent || netPollOwnsMsg) {
+      netPollOwnsMsg = true;
+      $('netmsg').textContent = n.error ? n.error : n.enabled ? `listening on ${n.port}` : 'off';
+    }
+    renderNetSnippet();
+
+    $('netchans').innerHTML = n.channels.map(c => {
+      const label = `NET ${c.channel + 1}`;
+      // Who is on it, or — once they have gone — who was, since the channel is kept for them and
+      // any routing set up against it still refers to that machine.
+      const part = c.stream_count > 1 ? ` <span class="muted">${c.stream_index}/${c.stream_count}</span>` : '';
+      const state_ = c.connected
+        ? `<strong>${c.device || 'unidentified'}</strong>${part} <span class="mono muted">${c.peer}</span>`
+        : c.last_device
+          ? `<span class="muted">no sender — last used by ${c.last_device}</span>`
+          : '<span class="muted">free</span>';
+      // Drops are the number that matters: frames arriving after their slot has played cannot be
+      // placed anywhere truthful, so they are discarded rather than shifted.
+      const drops = c.late_drops + c.range_drops;
+      return `<div class="card">
+        <div class="chan-head"><span class="chan-name">${label}</span>
+          <span class="muted small">route as <span class="mono">index ${c.input}</span></span></div>
+        <div class="small">${state_}</div>
+        <div class="readout small">
+          <span class="mono">${(c.frames_received / (rate || 96000)).toFixed(1)} s received</span>
+          <span class="mono rt">${drops ? drops + ' dropped' : 'no drops'}</span>
+        </div>
+        <div class="readout small">
+          <span class="mono">peak ${c.peak > 0 ? fmtDb(20 * Math.log10(c.peak)) : '—'} dBFS</span>
+          <span class="mono rt">${c.underruns} underruns</span>
+        </div>
+      </div>`;
+    }).join('');
+  }).catch(() => { /* the poll retries */ });
+}
+
 // ---------------------------------------------------------------- channel map
 
 function buildMap() {
@@ -888,7 +1104,7 @@ function buildMap() {
     </label>`).join('');
 
   $('savemap').onclick = () => {
-    const input_map = [...Array(NIN).keys()].map(i => parseInt($('im' + i).value, 10));
+    const input_map = [...Array(NIN_LOCAL).keys()].map(i => parseInt($('im' + i).value, 10));
     const output_map = [...Array(NOUT).keys()].map(i => parseInt($('om' + i).value, 10));
     put('/channel-map', {input_map, output_map})
       .then(() => { $('mapmsg').textContent = 'applied'; })
@@ -1208,11 +1424,16 @@ function measurePingDelays() {
 // a contiguous fetch + dense STFT while the span is narrow, one window per column (sparse) once it
 // is wide. Time on X (shares the scope's view), log frequency on Y, colour is level in dBFS.
 
-const laneMode = Array(NIN).fill('wave');   // 'wave' | 'spectro' per input, persisted
-try {
-  const saved = JSON.parse(lsGet('lane_mode') || '[]');
-  for (let c = 0; c < NIN; c++) if (saved[c] === 'spectro') laneMode[c] = 'spectro';
-} catch (e) { /* not JSON */ }
+const laneMode = [];   // 'wave' | 'spectro' per input, persisted
+// Sized from the bootstrap, not at load: NIN is not known until /api/state has answered.
+function loadLaneMode() {
+  laneMode.length = NIN;
+  laneMode.fill('wave');
+  try {
+    const saved = JSON.parse(lsGet('lane_mode') || '[]');
+    for (let c = 0; c < NIN; c++) if (saved[c] === 'spectro') laneMode[c] = 'spectro';
+  } catch (e) { /* not JSON */ }
+}
 function saveLaneMode() {
   lsSet('lane_mode', JSON.stringify(laneMode));
 }
@@ -1446,7 +1667,8 @@ function fetchSgSparse(ch, lo, span, N, seq) {
 
 function buildLanes() {
   $('lanes').innerHTML = inputEnabled.map((on, i) =>
-    `<span class="lane"><label><input type="checkbox" id="lane${i}" ${on ? 'checked' : ''}> IN ${i + 1}</label>` +
+    `<span class="lane${i === NIN_LOCAL ? ' net-first' : ''}" id="lanewrap${i}"${inputAvailable(i) ? '' : ' hidden'}>` +
+    `<label><input type="checkbox" id="lane${i}" ${on ? 'checked' : ''}> ${inputLabel(i)}</label>` +
     `<button class="lm" id="lm${i}">wave</button></span>`).join('');
   inputEnabled.forEach((_, i) => {
     $('lane' + i).onchange = e => setInputEnabled(i, e.target.checked);
@@ -1485,12 +1707,16 @@ function updateSgCtl() {}
 
 function onEnvelope(buf) {
   const v = new DataView(buf);
+  // Frame type 2 carries its own channel count. Type 1 was a fixed six channels wide; refusing it
+  // outright beats reading a wider frame at the old stride and drawing convincing nonsense.
+  if (v.getUint8(0) !== 2) return;
   const first = Number(v.getBigUint64(1, true));
   const n = v.getUint16(9, true);
+  const nch = v.getUint8(11);
   for (let c = 0; c < n; c++) {
     const col = {sample: first + c * envColumnFrames, min: [], max: []};
-    for (let ch = 0; ch < NIN; ch++) {
-      const off = 11 + (c * NIN + ch) * 4;
+    for (let ch = 0; ch < nch; ch++) {
+      const off = 12 + (c * nch + ch) * 4;
       col.min.push(v.getInt16(off, true) / 32768);
       col.max.push(v.getInt16(off + 2, true) / 32768);
     }
@@ -1763,8 +1989,8 @@ function drawScope() {
     // A caption naming the pair the chips belong to (and, live, why there are no numbers yet). Top
     // right, clear of the lane labels (top left) and the delay chips (along the bottom).
     if (a && b) {
-      const cap = srvFrozen() ? `Δ IN ${a} → IN ${b}`
-                              : `Δ IN ${a} → IN ${b} — Analyze to measure`;
+      const pair = `${inputLabel(a - 1)} → ${inputLabel(b - 1)}`;
+      const cap = srvFrozen() ? `Δ ${pair}` : `Δ ${pair} — Analyze to measure`;
       g.textAlign = 'right';
       const tw = g.measureText(cap).width;
       g.fillStyle = 'rgba(14,16,20,0.72)';
@@ -2117,7 +2343,7 @@ function initScope() {
           ? ' <span class="muted">— low confidence: a rival peak is nearly as tall. Usually the stimulus repeats inside the window (bracket a single ping with the cursors) or is a continuous tone (use a ping instead).</span>'
           : '';
         el.innerHTML =
-          `<strong>IN ${a} &rarr; IN ${b}:</strong> ` +
+          `<strong>${inputLabel(a - 1)} &rarr; ${inputLabel(b - 1)}:</strong> ` +
           `<span class="mono">${r.lag_samples} samples = ${r.lag_ms.toFixed(3)} ms</span> ` +
           `<span class="muted">(peak ${c.toFixed(1)}&times; the next rival &mdash; ${verdict})</span>${warn}`;
       })
@@ -2314,6 +2540,7 @@ function onSpectrum(msg) {
 }
 
 function onSystem(s) {
+  applyNetAvailability(s.net_active);
   $('xruns').textContent = `xruns ${s.xruns}`;
   $('xruns').className = 'pill ' + (s.xruns ? 'warn' : 'good');
   $('cpu').textContent = `cpu ${s.cpu_pct.toFixed(0)}%` + (s.temp_c > 0 ? ` · ${s.temp_c.toFixed(0)}°C` : '');
@@ -2379,7 +2606,28 @@ function pollState() {
       else enterLive();
     }
     buildSystem();
+    syncInputLevels(s2.inputs);
   }).catch(() => {});
+  // Only while the panel is on screen — the same discipline refreshPings() uses, so a background
+  // tab costs the daemon nothing.
+  if (tabActive('net')) refreshNet();
+}
+
+// Gain and mute are not ours alone: alsamixer on a sending machine drives the same two values
+// through the control plugin, and a sender can take them out of play altogether. Follow all
+// three, but never yank a control out from under a hand that is currently on it.
+function syncInputLevels(inputs) {
+  if (!Array.isArray(inputs)) return;
+  inputs.forEach(i => {
+    const g = $('igain' + i.ch);
+    if (g && document.activeElement !== g && parseFloat(g.value) !== i.gain_db) {
+      g.value = i.gain_db;
+      setInputGainLabel(i.ch, i.gain_db);
+    }
+    const m = $('imute' + i.ch);
+    if (m && document.activeElement !== m && m.checked !== !!i.mute) m.checked = !!i.mute;
+    applyInputBypass(i);  // after the two above, or restoring the label would undo what it says
+  });
 }
 function startStatePoll() { if (!statePoll) statePoll = setInterval(pollState, 5000); }
 function stopStatePoll() { clearInterval(statePoll); statePoll = null; }
@@ -2470,10 +2718,21 @@ api('/state').then(s => {
   if (listenCodec === 'opus' && !opusAvailable) listenCodec = 'pcm';
   view.len = FIT_SPAN_S * rate;
 
+  // Channel counts come from the daemon: an older one reports neither and keeps the six-ADC
+  // shape the constants above already assume.
+  NIN = s.limits.inputs_total || s.inputs.length || 6;
+  NIN_LOCAL = s.limits.inputs_local || NIN;
+  for (let c = NIN_LOCAL; c < NIN; c++) {
+    const inp = s.inputs[c];
+    netAvailable[c - NIN_LOCAL] = !inp || inp.active !== false;
+  }
+  loadLaneMode();
+
   initMonitorVolume();
   initMonitorLatency();
   initCodec();
   buildInputs();
+  buildNet();
   buildOutputs();
   bindGenerators();
   buildMap();

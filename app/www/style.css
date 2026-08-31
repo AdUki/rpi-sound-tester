@@ -105,6 +105,11 @@ h4 { margin: 1rem 0 0.5rem; font-size: 0.85rem; color: var(--muted); }
 .tab.active { color: var(--fg); border-bottom-color: var(--accent); }
 /* The API tab is an <a>, not a <button>: strip the underline and push it to the far right so it
    reads as a link out of the console rather than another panel. */
+/* In-prose links — the tab jumps in the banner and the panel intros. Without this they take the
+   browser's default dark blue, which is nearly unreadable on this background. The nav tabs are
+   excluded; they have their own treatment below. */
+a:not(.tab) { color: var(--accent); }
+
 a.tab { text-decoration: none; }
 .tab-ext { margin-left: auto; }
 
@@ -118,15 +123,17 @@ main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
 
 /* The column count is always a divisor of the card count, so the last row is never a ragged
    orphan: six inputs lay out 1/2/3 wide, eight outputs 1/2/4 (both counts are fixed in app.js).
+   The network grid tracks #inputs rather than its own count, so a network card is exactly the
+   width of an input card — they are the same kind of thing, just in their own section.
    auto-fill did the arithmetic on its own and picked five, which left one input stranded on a
    second row. A count fits when cols*260 + (cols-1)*12 <= min(viewport, 1400) - 32, and that is
    where these three breakpoints come from; 260 px is the width at which a channel name and both
    Listen buttons still share one line. Six across would need 1620 px of content and main stops
    at 1368, so it is not reachable without widening main. */
-#inputs, #outputs           { --cols: 1; }
-@media (min-width: 564px)  { #inputs, #outputs { --cols: 2; } }
-@media (min-width: 836px)  { #inputs           { --cols: 3; } }
-@media (min-width: 1108px) { #outputs          { --cols: 4; } }
+#inputs, #netinputs, #outputs { --cols: 1; }
+@media (min-width: 564px)  { #inputs, #netinputs, #outputs { --cols: 2; } }
+@media (min-width: 836px)  { #inputs, #netinputs           { --cols: 3; } }
+@media (min-width: 1108px) { #outputs                      { --cols: 4; } }
 
 .card {
   background: var(--panel);
@@ -153,6 +160,7 @@ main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
 .card.disabled > label { opacity: 0.3; }
 .card.disabled .chan-name { color: var(--muted); }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
+input:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* The card can be as narrow as 260 px: trim the padding so "IN 3 — living room" plus both
    buttons still fit on one line. */
@@ -376,6 +384,9 @@ button.on { background: var(--good); border-color: var(--good); color: #05170f; 
 /* Each lane control pairs the enable checkbox with a small waveform/spectrogram toggle; the toggle
    goes green (button.on) while that lane is a spectrogram, and greys out until Analyze is pressed. */
 .lane { display: inline-flex; align-items: center; gap: 0.4rem; }
+/* Sets the network lanes apart from the card's own inputs in the scope's lane row, which is
+   otherwise one undifferentiated list of channels. */
+.lane.net-first { border-left: 1px solid var(--line); margin-left: 0.35rem; padding-left: 0.85rem; }
 .lm { padding: 0.1rem 0.45rem; font-size: 0.72rem; line-height: 1.5; }
 
 /* Shared spectrogram controls, shown below the lanes only while at least one lane is a spectrogram. */
@@ -401,6 +412,8 @@ td:first-child { color: var(--muted); width: 40%; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 /* A boosted input is not showing what the device under test actually sent, so colour the readout. */
 .mono.active { color: var(--accent); }
+/* A network channel whose sender asked to be left alone: its gain and mute do nothing. */
+.mono.bypassed { color: var(--warn); }
 
 /* Non-modal replacement for alert(): visible, ignorable, gone in four seconds. */
 #toast {
