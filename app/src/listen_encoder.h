@@ -34,7 +34,7 @@ class OpusMonoEncoder {
   unsigned in_frames_ = 0;  // set from the engine rate before *ok can become true
 };
 
-// Encodes all kInputs channels together as one Ogg/Opus logical stream (mapping family 255,
+// Encodes all kTotalInputs channels together as one Ogg/Opus logical stream (mapping family 255,
 // uncoupled), so every channel shares a single granulepos clock and stays sample-aligned — the
 // only shape a generic external player (ffmpeg) can consume without cross-channel drift. Emits
 // Ogg pages: headers() once at stream start, then audio pages from each encode().
@@ -50,7 +50,7 @@ class OpusOggMultiEncoder {
   // The OpusHead + OpusTags pages, to write once before any audio.
   std::string headers();
 
-  // Encode in_frames()*kInputs interleaved float frames, appending any Ogg pages produced.
+  // Encode in_frames()*kTotalInputs interleaved float frames, appending any Ogg pages produced.
   bool encode(const float* interleaved, int bitrate_kbps, std::string* out);
   void reset();
 

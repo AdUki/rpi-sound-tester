@@ -50,7 +50,7 @@ Analysis::Analysis(const RingBuffer& ring, double rate) : ring_(ring), rate_(rat
   }
 
   for (auto& s : snap_.spectrum) s.assign(kSpectrumBins, kMinDb);
-  env_buf_.resize(kEnvColumnFrames * kInputs);
+  env_buf_.resize(kEnvColumnFrames * kTotalInputs);
 }
 
 Analysis::~Analysis() { stop(); }
@@ -170,10 +170,10 @@ void Analysis::update_envelope(uint64_t now) {
       break;
     }
     EnvColumn col{};
-    for (unsigned c = 0; c < kInputs; ++c) {
+    for (unsigned c = 0; c < kTotalInputs; ++c) {
       float lo = 1.0f, hi = -1.0f;
       for (unsigned i = 0; i < kEnvColumnFrames; ++i) {
-        const float v = env_buf_[i * kInputs + c];
+        const float v = env_buf_[i * kTotalInputs + c];
         lo = std::min(lo, v);
         hi = std::max(hi, v);
       }
@@ -205,7 +205,7 @@ void Analysis::run() {
     std::lock_guard<std::mutex> lock(m_);
     snap_.sample = now;
 
-    for (unsigned ch = 0; ch < kInputs; ++ch) {
+    for (unsigned ch = 0; ch < kTotalInputs; ++ch) {
       if (ring_.read_channel(now - rms_frames, rms_frames, ch, mbuf.data())) {
         update_meters(ch, mbuf.data(), rms_frames, now);
       }

@@ -66,7 +66,7 @@ void Generators::render_noise(size_t frames, NoiseMode mode, float amp, float* o
 }
 
 void Generators::render_ping(uint64_t n, size_t frames, const Control& ctl, float* out,
-                             PingLog& log) {
+                             PingLog& log, uint64_t log_offset) {
   std::fill(out, out + frames, 0.0f);
 
   const uint32_t epoch = ctl.ping.epoch.load(std::memory_order_relaxed);
@@ -91,7 +91,7 @@ void Generators::render_ping(uint64_t n, size_t frames, const Control& ctl, floa
       burst_amp_ = db_to_lin(ctl.ping.level_db.load(std::memory_order_relaxed));
       burst_active_ = true;
       burst_start_ = t;
-      log.push(t, static_cast<uint8_t>(variant));
+      log.push(t + log_offset, static_cast<uint8_t>(variant));
       next_ping_ = t + interval;
     }
 
@@ -111,13 +111,13 @@ void Generators::render_ping(uint64_t n, size_t frames, const Control& ctl, floa
 }
 
 void Generators::render(uint64_t n, size_t frames, const Control& ctl, float* sine, float* noise,
-                        float* ping, PingLog& log) {
+                        float* ping, PingLog& log, uint64_t log_offset) {
   const float sine_freq = std::clamp(ctl.sine.freq_hz.load(std::memory_order_relaxed), 1.0f,
                                      static_cast<float>(rate_ * 0.45));
   render_sine(frames, sine_freq, db_to_lin(ctl.sine.level_db.load(std::memory_order_relaxed)), sine);
   render_noise(frames, static_cast<NoiseMode>(ctl.noise.mode.load(std::memory_order_relaxed)),
                db_to_lin(ctl.noise.level_db.load(std::memory_order_relaxed)), noise);
-  render_ping(n, frames, ctl, ping, log);
+  render_ping(n, frames, ctl, ping, log, log_offset);
 }
 
 float Generators::identify_sample(uint64_t elapsed) const {

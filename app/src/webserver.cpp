@@ -26,6 +26,11 @@ namespace st {
 
 namespace {
 
+// Input indices span the card's ADCs plus the network channels, so this bound is derived
+// rather than spelled out — the literal "0..5" was wrong the moment kTotalInputs stopped being 6.
+const std::string kChannelRangeMsg = "ch must be 0.." + std::to_string(kTotalInputs - 1);
+const std::string kSyncRangeMsg = "ch_a/ch_b must be 0.." + std::to_string(kTotalInputs - 1);
+
 constexpr int kThreadsMin = 8;
 constexpr int kThreadsMax = 64;
 
@@ -106,7 +111,7 @@ int effective_kbps(const BitrateOverride& b, const Control& ctl) {
 
 json meters_json(const AnalysisSnapshot& s) {
   json rms = json::array(), peak = json::array();
-  for (unsigned c = 0; c < kInputs; ++c) {
+  for (unsigned c = 0; c < kTotalInputs; ++c) {
     rms.push_back(s.meters[c].rms_db);
     peak.push_back(s.meters[c].peak_db);
   }
@@ -178,20 +183,25 @@ class WsReadPump {
 };
 
 // Binary envelope frame: u8 type=1, u64 first column's sample index, u16 column count, then
-// ncols x 6 x {i16 min, i16 max}.
+// [u8 type=2][u64 first sample][u16 ncols][u8 nchan] then ncols x nchan x {i16 min, i16 max}.
+//
+// The channel count is on the wire, and the type byte moved from 1 to 2, because the frame used
+// to be a fixed six channels wide. A cached copy of app.js parsing the old layout would not fail
+// — it would silently read every column at the wrong offset and draw plausible nonsense.
 std::string envelope_frame(uint64_t first_col, const std::vector<EnvColumn>& cols) {
   std::string out;
-  out.resize(11 + cols.size() * kInputs * 4);
+  out.resize(12 + cols.size() * kTotalInputs * 4);
   char* p = out.data();
-  *p++ = 1;
+  *p++ = 2;
   const uint64_t sample = first_col * kEnvColumnFrames;
   std::memcpy(p, &sample, 8);
   p += 8;
   const uint16_t n = static_cast<uint16_t>(cols.size());
   std::memcpy(p, &n, 2);
   p += 2;
+  *p++ = static_cast<char>(kTotalInputs);
   for (const auto& c : cols) {
-    for (unsigned ch = 0; ch < kInputs; ++ch) {
+    for (unsigned ch = 0; ch < kTotalInputs; ++ch) {
       std::memcpy(p, &c.min[ch], 2);
       p += 2;
       std::memcpy(p, &c.max[ch], 2);
@@ -274,11 +284,32 @@ void WebServer::install_routes() {
                       {"name", out_names[i]}});
     }
 
+    // A network channel with no name in config.json takes the sender's: the dashboard card then
+    // reads "NET 1 — thinkpad.local" with nothing to configure, which is the whole point of
+    // resolving the sender on this end.
+    const std::vector<NetChannelStatus> net = d_.net.status();
+    auto input_name = [&](unsigned i) -> std::string {
+      if (!in_names[i].empty() || !is_net_input(i)) return in_names[i];
+      const NetChannelStatus& c = net[i - kInputs];
+      const std::string who = c.device.empty() ? c.last_device : c.device;
+      if (who.empty() || c.stream_count <= 1) return who;
+      // A stereo sender puts the same name on two cards; say which half each one is.
+      return who + " (" + std::to_string(c.stream_index) + "/" + std::to_string(c.stream_count) +
+             ")";
+    };
+
     json ins = json::array();
-    for (unsigned i = 0; i < kInputs; ++i) {
+    for (unsigned i = 0; i < kTotalInputs; ++i) {
       ins.push_back({{"ch", i},
-                     {"name", in_names[i]},
+                     {"name", input_name(i)},
+                     {"kind", is_net_input(i) ? "net" : "local"},
+                     {"active", !is_net_input(i) || d_.net.channel_in_use(i - kInputs)},
                      {"gain_db", d_.ctl.inputs[i].gain_db.load()},
+                     {"mute", d_.ctl.inputs[i].mute.load()},
+                     // The sender on this channel asked for its stream to be left alone: gain and
+                     // mute are ignored here and in alsamixer until it disconnects.
+                     {"bypass", d_.ctl.inputs[i].bypass.load()},
+                     {"gain_min_db", input_gain_min_db(i)},
                      {"rms_db", as.meters[i].rms_db},
                      {"peak_db", as.meters[i].peak_db},
                      {"tone", tone_json(as.tone[i])}});
@@ -325,6 +356,8 @@ void WebServer::install_routes() {
           {"capture_config", true},
           {"input_gain_min_db", kInputGainMinDb},
           {"input_gain_max_db", kInputGainMaxDb},
+          {"net_gain_min_db", kNetGainMinDb},
+          {"input_mute", true},
           {"telemetry_mask", true},
           {"listen_codecs",
            opus_rate_supported(es.rate) ? json::array({"pcm", "opus"}) : json::array({"pcm"})},
@@ -332,7 +365,16 @@ void WebServer::install_routes() {
           {"listen_bitrate_kbps", d_.ctl.listen.bitrate_kbps.load()},
           {"listen_bitrate_min_kbps", kListenBitrateMinKbps},
           {"listen_bitrate_max_kbps", kListenBitrateMaxKbps},
-          {"opus_rate", kOpusRate}}},
+          {"opus_rate", kOpusRate},
+          {"inputs_total", kTotalInputs},
+          {"inputs_local", kInputs},
+          {"net_inputs", kNetInputs},
+          {"net_port", d_.net.port()},
+          {"net_delay_ms", d_.ctl.net.delay_ms.load()},
+          {"net_delay_min_ms", kNetDelayMinMs},
+          {"net_delay_max_ms", kNetDelayMaxMs},
+          {"net", true},
+          {"pinned_mb", (d_.ring.pinned_bytes() + d_.capture.pinned_bytes()) / (1024 * 1024)}}},
     };
     send_json(res, j);
   });
@@ -348,18 +390,18 @@ void WebServer::install_routes() {
   // The WS "spectrum" message as a synchronous GET. Adds `bins_hz` — the center frequency of each
   // of the 240 log-spaced bins — which the WS frame omits (the console reconstructs it), so a
   // script can threshold by frequency directly. Full float precision here (one-shot), unlike the
-  // WS frame's 0.1 dB quantisation. `?ch=0..5` returns a single input; omit it for all six.
+  // WS frame's 0.1 dB quantisation. `?ch=N` returns a single input; omit it for every channel.
   svr.Get("/api/spectrum", [this](const httplib::Request& req, httplib::Response& res) {
     int only = -1;
     if (req.has_param("ch")) {
-      only = static_cast<int>(query_u64(req, "ch", kInputs));
-      if (only < 0 || only >= static_cast<int>(kInputs)) {
-        return send_error(res, 400, "ch must be 0..5");
+      only = static_cast<int>(query_u64(req, "ch", kTotalInputs));
+      if (only < 0 || only >= static_cast<int>(kTotalInputs)) {
+        return send_error(res, 400, kChannelRangeMsg);
       }
     }
     const AnalysisSnapshot s = d_.analysis.snapshot();
     json chans = json::array();
-    for (unsigned c = 0; c < kInputs; ++c) {
+    for (unsigned c = 0; c < kTotalInputs; ++c) {
       if (only >= 0 && c != static_cast<unsigned>(only)) continue;
       chans.push_back({{"ch", c}, {"bins_db", s.spectrum[c]}, {"tone", tone_json(s.tone[c])}});
     }
@@ -368,12 +410,13 @@ void WebServer::install_routes() {
                         {"channels", chans}});
   });
 
-  svr.Put("/api/inputs/:ch", json_channel_route("ch", kInputs, "no such input",
+  svr.Put("/api/inputs/:ch", json_channel_route("ch", kTotalInputs, "no such input",
       [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response&) {
     if (j.contains("gain_db")) {
       d_.ctl.inputs[ch].gain_db.store(
-          std::clamp(j["gain_db"].get<float>(), kInputGainMinDb, kInputGainMaxDb));
+          std::clamp(j["gain_db"].get<float>(), input_gain_min_db(ch), kInputGainMaxDb));
     }
+    if (j.contains("mute")) d_.ctl.inputs[ch].mute.store(j["mute"].get<bool>());
   }));
 
   // Per-input telemetry mask. The console posts which inputs it is watching; disabled inputs are
@@ -384,11 +427,11 @@ void WebServer::install_routes() {
   svr.Post("/api/telemetry/inputs", json_route([this](const json& j, const httplib::Request&,
                                                       httplib::Response& res) {
     const auto& en = j.at("enabled");
-    if (!en.is_array() || en.size() != kInputs) {
+    if (!en.is_array() || en.size() != kTotalInputs) {
       return send_error(res, 400, "enabled must be an array of 6 booleans");
     }
     uint32_t mask = 0;
-    for (unsigned c = 0; c < kInputs; ++c) {
+    for (unsigned c = 0; c < kTotalInputs; ++c) {
       if (en[c].get<bool>()) mask |= (1u << c);
     }
     telemetry_mask_.store(mask, std::memory_order_relaxed);
@@ -425,7 +468,7 @@ void WebServer::install_routes() {
       if (type == "input") {
         const auto& iv = j["source"].at("index");
         const int i = iv.is_string() ? std::atoi(iv.get<std::string>().c_str()) : iv.get<int>();
-        if (i < 0 || i >= static_cast<int>(kInputs)) return send_error(res, 400, "bad input index");
+        if (i < 0 || i >= static_cast<int>(kTotalInputs)) return send_error(res, 400, "bad input index");
         t = SourceType::Input;
         index = static_cast<uint8_t>(i);
       } else if (type == "gen") {
@@ -516,6 +559,94 @@ void WebServer::install_routes() {
     }
   }));
 
+  // ---- network audio input --------------------------------------------------------------
+  //
+  // A network channel is an input like any other once it is here: it is metered, it appears in
+  // the scope, it can be routed to an output with {"type":"input","index":N}, and it is a legal
+  // xcorr operand against an ADC channel. This endpoint is only about the link itself.
+  svr.Get("/api/net", [this](const httplib::Request&, httplib::Response& res) {
+    const double rate = d_.engine.rate();
+    json chans = json::array();
+    for (const NetChannelStatus& c : d_.net.status()) {
+      chans.push_back({{"channel", c.channel},
+                       {"input", kInputs + c.channel},
+                       {"connected", c.connected},
+                       {"peer", c.peer},
+                       {"name", c.name},
+                       {"host", c.host},
+                       {"device", c.device},
+                       {"last_device", c.last_device},
+                       {"stream_index", c.stream_index},
+                       {"stream_count", c.stream_count},
+                       {"frames_received", c.frames_received},
+                       {"late_drops", c.late_drops},
+                       {"range_drops", c.range_drops},
+                       {"underruns", c.underruns},
+                       {"resyncs", c.resyncs},
+                       {"last_target", c.last_target},
+                       {"write_end", c.write_end},
+                       {"lead_frames", c.lead_frames},
+                       {"lead_valid", c.lead_valid},
+                       {"target_lead_frames", c.target_lead_frames},
+                       {"lead_error_ms", c.lead_valid && rate > 0
+                            ? 1000.0 * (c.lead_frames - static_cast<int64_t>(c.target_lead_frames)) / rate
+                            : 0.0},
+                       {"peak", c.peak}});
+    }
+    const uint64_t delay = d_.ctl.net.delay_frames.load();
+    send_json(res, json{{"enabled", d_.ctl.net.enabled.load()},
+                        {"listening", d_.net.listening()},
+                        {"port", d_.net.port()},
+                        {"delay_ms", d_.ctl.net.delay_ms.load()},
+                        {"delay_frames", delay},
+                        {"rate", d_.engine.rate()},
+                        {"n_now", d_.ring.counter()},
+                        {"lead_seconds", delay / rate},
+                        {"error", d_.net.last_error()},
+                        {"channels", chans}});
+  });
+
+  // Body: {"enabled": bool, "delay_ms": N, "port": N}. Changing the port rebinds the listener,
+  // which drops any connected sender — there is no way to move a listening socket without that.
+  svr.Put("/api/net", json_route([this](const json& j, const httplib::Request&,
+                                        httplib::Response& res) {
+    const double rate = d_.engine.rate();
+
+    if (j.contains("delay_ms")) {
+      const unsigned ms = static_cast<unsigned>(std::clamp<int>(
+          j["delay_ms"].get<int>(), static_cast<int>(kNetDelayMinMs),
+          static_cast<int>(kNetDelayMaxMs)));
+      d_.ctl.net.delay_ms.store(ms);
+    }
+    if (j.contains("enabled")) d_.ctl.net.enabled.store(j["enabled"].get<bool>());
+
+    // Derived in exactly one expression, matching Config::apply_to, so the two paths cannot
+    // drift: zero unless network input is actually on.
+    const bool on = d_.ctl.net.enabled.load();
+    const unsigned ms = d_.ctl.net.delay_ms.load();
+    d_.ctl.net.delay_frames.store(on ? static_cast<uint32_t>(1ull * ms * rate / 1000) : 0);
+
+    int want_port = d_.net.port();
+    if (j.contains("port")) {
+      want_port = j["port"].get<int>();
+      if (want_port < 1 || want_port > 65535) return send_error(res, 400, "port out of range");
+    }
+
+    if (!on) {
+      d_.net.stop();
+    } else if (!d_.net.listening() || d_.net.port() != want_port) {
+      d_.net.stop();
+      d_.net.start(static_cast<uint16_t>(want_port));
+    }
+
+    send_json(res, json{{"enabled", on},
+                        {"listening", d_.net.listening()},
+                        {"port", d_.net.port()},
+                        {"delay_ms", ms},
+                        {"delay_frames", d_.ctl.net.delay_frames.load()},
+                        {"error", d_.net.last_error()}});
+  }));
+
   svr.Post("/api/capture/freeze", [this](const httplib::Request&, httplib::Response& res) {
     const CaptureStatus cs = d_.capture.freeze(d_.engine.stats().generation);
     if (!cs.frozen) return send_error(res, 503, "not enough captured audio to freeze yet");
@@ -563,8 +694,8 @@ void WebServer::install_routes() {
   });
 
   svr.Get("/api/capture/window", [this](const httplib::Request& req, httplib::Response& res) {
-    const unsigned ch = static_cast<unsigned>(query_u64(req, "ch", kInputs));
-    if (ch >= kInputs) return send_error(res, 400, "ch must be 0..5");
+    const unsigned ch = static_cast<unsigned>(query_u64(req, "ch", kTotalInputs));
+    if (ch >= kTotalInputs) return send_error(res, 400, kChannelRangeMsg);
     const uint64_t now = d_.ring.counter();
     const uint64_t len = query_u64(req, "len", 96000);
     const uint64_t start = query_u64(req, "start", now > len ? now - len : 0);
@@ -617,19 +748,19 @@ void WebServer::install_routes() {
   // "Is there sound on a channel?" The verdict is peak_db (a 3 s hold, so it catches a transient
   // tick/ping as well as a sustained tone — an RMS-only test can fall between ticks and miss it)
   // over a threshold (default kGenieSoundThresholdDb; override with ?threshold_db=). rms_db,
-  // peak_db and the tone detector ride along. ?ch=0..5 returns one input; omit for all six.
+  // peak_db and the tone detector ride along. ?ch=N returns one input; omit for every channel.
   svr.Get("/api/genie/sound", [this](const httplib::Request& req, httplib::Response& res) {
     int only = -1;
     if (req.has_param("ch")) {
-      only = static_cast<int>(query_u64(req, "ch", kInputs));
-      if (only < 0 || only >= static_cast<int>(kInputs)) {
-        return send_error(res, 400, "ch must be 0..5");
+      only = static_cast<int>(query_u64(req, "ch", kTotalInputs));
+      if (only < 0 || only >= static_cast<int>(kTotalInputs)) {
+        return send_error(res, 400, kChannelRangeMsg);
       }
     }
     const double threshold = query_f64(req, "threshold_db", kGenieSoundThresholdDb);
     const AnalysisSnapshot s = d_.analysis.snapshot();
     json chans = json::array();
-    for (unsigned c = 0; c < kInputs; ++c) {
+    for (unsigned c = 0; c < kTotalInputs; ++c) {
       if (only >= 0 && c != static_cast<unsigned>(only)) continue;
       chans.push_back({{"ch", c},
                        {"sound", s.meters[c].peak_db > threshold},
@@ -651,14 +782,14 @@ void WebServer::install_routes() {
   svr.Get("/api/genie/sync", [this](const httplib::Request& req, httplib::Response& res) {
     const AnalysisSnapshot as = d_.analysis.snapshot();
     std::vector<unsigned> sounding;
-    for (unsigned ch = 0; ch < kInputs; ++ch) {
+    for (unsigned ch = 0; ch < kTotalInputs; ++ch) {
       if (as.meters[ch].peak_db > kGenieSoundThresholdDb) sounding.push_back(ch);
     }
     // Each channel: the query value if given, else the first sounding input that isn't `exclude`.
     auto pick = [&](const char* key, int exclude, int* out) -> const char* {
       if (req.has_param(key)) {
         const long v = std::strtol(req.get_param_value(key).c_str(), nullptr, 10);
-        if (v < 0 || v >= static_cast<long>(kInputs)) return "ch_a/ch_b must be 0..5";
+        if (v < 0 || v >= static_cast<long>(kTotalInputs)) return kSyncRangeMsg.c_str();
         *out = static_cast<int>(v);
         return nullptr;
       }
@@ -838,7 +969,7 @@ void WebServer::install_routes() {
 
   svr.WebSocket("/api/listen/:ch", [this](const httplib::Request& req, httplib::ws::WebSocket& ws) {
     unsigned ch = 0;
-    if (!parse_index(req, "ch", kInputs, &ch)) {
+    if (!parse_index(req, "ch", kTotalInputs, &ch)) {
       ws.close(httplib::ws::CloseStatus::PolicyViolation, "bad channel");
       return;
     }
@@ -907,7 +1038,7 @@ void WebServer::install_routes() {
 
   svr.Get("/api/inputs/:ch/stream.wav", [this](const httplib::Request& req, httplib::Response& res) {
     unsigned ch = 0;
-    if (!parse_index(req, "ch", kInputs, &ch)) return send_error(res, 404, "no such input");
+    if (!parse_index(req, "ch", kTotalInputs, &ch)) return send_error(res, 404, "no such input");
 
     auto slot = std::make_shared<StreamSlot>(listen_streams_);
     if (!slot->acquired()) return send_error(res, 503, "too many listeners");
@@ -965,7 +1096,7 @@ void WebServer::install_routes() {
     auto pacer = std::make_shared<MultiListenPacer>(d_.ring, enc->in_frames());
     auto sent_header = std::make_shared<bool>(false);
 
-    LOG_DEBUG("ogg stream opened ({} ch)", kInputs);
+    LOG_DEBUG("ogg stream opened ({} ch)", kTotalInputs);
     res.set_chunked_content_provider(
         "audio/ogg",
         [this, enc, pacer, sent_header, slot, ogg_slot, br](size_t, httplib::DataSink& sink) {
@@ -1064,7 +1195,10 @@ void WebServer::run_publisher() {
       }
       if (have_clients) {
         const EngineStats es = d_.engine.stats();
+        json net_active = json::array();
+        for (unsigned c = 0; c < kNetInputs; ++c) net_active.push_back(d_.net.channel_in_use(c));
         json j{{"type", "system"},
+               {"net_active", net_active},
                {"xruns", es.xruns},
                {"generation", es.generation},
                {"sync_errors", d_.kmsg.sync_errors()},
@@ -1091,7 +1225,7 @@ void WebServer::run_publisher() {
       const AnalysisSnapshot s = d_.analysis.snapshot();
       const uint32_t mask = telemetry_mask_.load(std::memory_order_relaxed);
       json chans = json::array();
-      for (unsigned c = 0; c < kInputs; ++c) {
+      for (unsigned c = 0; c < kTotalInputs; ++c) {
         if (!(mask & (1u << c))) continue;   // console is not watching this input — skip its bins
         // Quantised to 0.1 dB, which is far finer than the display can resolve and far coarser
         // than a float's shortest round-trip decimal. Raw floats serialise every bin in full

@@ -26,9 +26,11 @@ class Generators {
   void init(double rate);
 
   // Renders `frames` samples starting at absolute sample index `n` into the three
-  // generator buses. Emissions are appended to `log`.
+  // generator buses. Emissions are appended to `log`, offset by `log_offset`: outputs play at n
+  // but capture may be held back, and the log has to name where a ping will be SEEN in the ring,
+  // which is what every consumer of it (scope markers, genie/sync) actually wants.
   void render(uint64_t n, size_t frames, const Control& ctl, float* sine, float* noise,
-              float* ping, PingLog& log);
+              float* ping, PingLog& log, uint64_t log_offset = 0);
 
   // Renders the Identify pattern (short 1 kHz bursts) sample by sample.
   float identify_sample(uint64_t elapsed) const;
@@ -36,7 +38,8 @@ class Generators {
  private:
   void render_sine(size_t frames, float freq_hz, float amp, float* out);
   void render_noise(size_t frames, NoiseMode mode, float amp, float* out);
-  void render_ping(uint64_t n, size_t frames, const Control& ctl, float* out, PingLog& log);
+  void render_ping(uint64_t n, size_t frames, const Control& ctl, float* out, PingLog& log,
+                   uint64_t log_offset);
 
   float white();
 

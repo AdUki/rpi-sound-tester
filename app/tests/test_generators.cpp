@@ -113,6 +113,39 @@ void test_ping_interval_change_reschedules() {
   }
 }
 
+// Outputs play at n but capture can be held back, so the log has to name where a ping will be
+// SEEN in the ring rather than where it was emitted. Get this wrong and the scope's ping markers
+// and genie/sync both aim a whole delay away from the arrival they are looking for — and they
+// fail silently, finding noise instead of a peak.
+void test_ping_log_carries_the_capture_delay() {
+  Control ctl;
+  Generators g;
+  g.init(kRate);
+  ctl.ping.interval_s.store(0.5f);
+  ctl.ping.level_db.store(-6.0f);
+
+  const uint64_t offset = 96000;  // one second at 96 kHz
+  const size_t period = 1024;
+  std::vector<float> bs(period), bn(period), bp(period);
+
+  PingLog plain, shifted;
+  Generators g2;
+  g2.init(kRate);
+  for (size_t b = 0; b < 200; ++b) {
+    g.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), plain, 0);
+    g2.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), shifted, offset);
+  }
+
+  const auto a = plain.recent();
+  const auto d = shifted.recent();
+  CHECK(!a.empty());
+  CHECK_EQ(a.size(), d.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    CHECK_EQ(d[i].sample, a[i].sample + offset);
+    CHECK_EQ(d[i].variant, a[i].variant);
+  }
+}
+
 void test_ping_log_wraps_keeping_the_newest_entries() {
   PingLog log;
   const size_t total = kPingLogEntries + 40;
@@ -206,6 +239,7 @@ int main() {
   test_ping_energy_lands_at_logged_sample();
   test_ping_interval_change_reschedules();
   test_ping_log_wraps_keeping_the_newest_entries();
+  test_ping_log_carries_the_capture_delay();
   test_sine_frequency_and_level();
   test_sine_phase_is_continuous_across_blocks();
   test_noise_is_bounded_and_nonzero();

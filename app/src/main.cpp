@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
   unsigned rate = 0;
   unsigned period = 0;
   int port = 80;
+  int net_port = 0;  // 0 = whatever the config says
   std::string www = "/usr/share/soundtester/www";
   std::string config_path = "/etc/soundtester/config.json";
   std::string data_dir = "/data";
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
   app.add_option("--rate", rate, "Sample rate (default 96000)");
   app.add_option("--period", period, "Period size in frames (default 1024)");
   app.add_option("--port", port, "HTTP port (default 80)");
+  app.add_option("--net-port", net_port, "TCP port for network audio input (default 4010)");
   app.add_option("--www", www, "Directory of static web files");
   app.add_option("--config", config_path, "Path to the default config");
   app.add_option("--data-dir", data_dir, "Where saved settings live (the writable partition)");
@@ -100,8 +102,16 @@ int main(int argc, char** argv) {
   eopt.capture_channels = cfg.capture_channels;
   eopt.sim_stagger = sim_stagger;
 
-  st::RingBuffer ring(st::kRingFrames, st::kInputs, 2ull * cfg.period);
+  st::RingBuffer ring(st::kRingFrames, st::kTotalInputs, 2ull * cfg.period);
   st::AudioEngine engine(ctl, ring, eopt);
+
+  // Wired in before start(), so the audio thread never sees a half-constructed server. A bind
+  // failure is reported through /api/net, not fatal — same reasoning as a card that will not
+  // open: taking the console down removes the only way to find out what went wrong.
+  if (net_port > 0) cfg.net_port = net_port;  // the flag wins, like --device and --port
+  st::NetAudioServer net(ctl, engine.rate(), static_cast<uint16_t>(cfg.net_port));
+  engine.set_net(&net);
+  if (cfg.net_enabled) net.start(static_cast<uint16_t>(cfg.net_port));
 
   // A card that will not open is never fatal: the audio thread keeps retrying and the web
   // console comes up regardless, reporting the failure in /api/state. Only a thread that
@@ -126,7 +136,7 @@ int main(int argc, char** argv) {
   // systemctl the host.
   wopt.allow_reboot = !sim;
 
-  st::Deps deps{ctl, ring, engine, analysis, capture, kmsg, store, cfg};
+  st::Deps deps{ctl, net, ring, engine, analysis, capture, kmsg, store, cfg};
   st::WebServer server(deps, wopt);
   g_server = &server;
 

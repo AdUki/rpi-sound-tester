@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <limits>
 #include <new>
 
 #include "util/log.h"
@@ -18,6 +20,25 @@ size_t next_pow2(size_t n) {
   while (p < n) p <<= 1;
   return p;
 }
+
+// One field of /proc/meminfo, in bytes. Zero when it cannot be read, which callers treat as
+// "no opinion" rather than as "no memory".
+uint64_t meminfo_bytes(const char* field) {
+  std::ifstream f("/proc/meminfo");
+  std::string key;
+  uint64_t kb = 0;
+  while (f >> key) {
+    if (key == field) {
+      f >> kb;
+      return kb * 1024ull;
+    }
+    f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+  }
+  return 0;
+}
+
+// Never leave the box with less than this much room, whatever the operator asks for.
+constexpr uint64_t kMemHeadroomBytes = 64ull * 1024 * 1024;
 
 std::string mb_str(size_t floats) {
   const double mb = static_cast<double>(floats) * sizeof(float) / (1024.0 * 1024.0);
@@ -34,6 +55,22 @@ CaptureStore::CaptureStore(const RingBuffer& ring, double rate, unsigned period)
   // thin once a 192 MB memcpy needs room to finish before the writer laps its start.
   const size_t margin = std::max<size_t>(kFreezeHeadroomPeriods * period_, ring.frames() / 32);
   max_frames_ = ring.frames() - margin;
+
+  // The ring is not the only ceiling. With a dozen channels a full-length snapshot is larger than
+  // a 1 GB board has, and because the buffer is written on allocation the kernel reaches for the
+  // OOM killer long before `new` would ever throw — so bounding this only by the ring would put a
+  // slider in the console that kills the daemon. A third of RAM leaves room for the ring itself,
+  // for the transient where both the old and new buffers are resident during a resize, and for
+  // everything else on the box.
+  if (const uint64_t total = meminfo_bytes("MemTotal:")) {
+    const uint64_t budget = total / 4;
+    const uint64_t cap = budget / (kTotalInputs * sizeof(float));
+    if (cap < max_frames_) {
+      LOG_INFO("capture: analyze length capped at {:.0f} s by RAM ({} MB total), not by the ring",
+               static_cast<double>(cap) / rate_, total / (1024 * 1024));
+      max_frames_ = std::max<uint64_t>(cap, kCaptureMinFrames);
+    }
+  }
   // Default to a modest window, capped at the maximum, so a fresh freeze is quick out of the box.
   analyze_frames_ =
       std::min<uint64_t>(max_frames_, static_cast<uint64_t>(kCaptureDefaultSeconds * rate_));
@@ -48,8 +85,25 @@ CaptureStore::CaptureStore(const RingBuffer& ring, double rate, unsigned period)
 }
 
 bool CaptureStore::resize_snapshot(uint64_t frames, std::string* err) {
-  const size_t want = static_cast<size_t>(frames) * kInputs;
+  const size_t want = static_cast<size_t>(frames) * kTotalInputs;
   if (snap_.size() == want) return true;
+
+  // The static cap above bounds what the console may offer; this bounds what is actually
+  // attempted. They are not the same question — a resize holds the old buffer while it fills the
+  // new one, so a request that fits the cap can still not fit the machine right now. Checking
+  // first matters because assign() writes every page: the kernel would reach the OOM killer long
+  // before new threw anything to catch.
+  if (want > snap_.size()) {
+    const uint64_t need = static_cast<uint64_t>(want - snap_.size()) * sizeof(float);
+    const uint64_t avail = meminfo_bytes("MemAvailable:");
+    if (avail != 0 && need + kMemHeadroomBytes > avail) {
+      if (err) {
+        *err = "not enough free memory for a " + mb_str(want) + " MB snapshot (" +
+               std::to_string(avail / (1024 * 1024)) + " MB available)";
+      }
+      return false;
+    }
+  }
 
   std::vector<float> next;
   try {
@@ -108,21 +162,21 @@ CaptureStatus CaptureStore::freeze(uint32_t generation) {
   // lapped copy is discarded, not handed out as mixed data.
   // Apply a resize deferred while the previous snapshot was frozen. A failure here keeps the
   // old buffer, so the freeze still succeeds — just at the old length.
-  if (pending_frames_ != 0 && pending_frames_ * kInputs != snap_.size()) {
+  if (pending_frames_ != 0 && pending_frames_ * kTotalInputs != snap_.size()) {
     std::string err;
     if (!resize_snapshot(pending_frames_, &err)) {
-      LOG_WARN("capture: keeping the {}-frame snapshot buffer: {}", snap_.size() / kInputs, err);
+      LOG_WARN("capture: keeping the {}-frame snapshot buffer: {}", snap_.size() / kTotalInputs, err);
     }
   }
 
   const size_t span = static_cast<size_t>(std::min<uint64_t>(analyze_frames_, max_frames_));
-  if (span * kInputs > snap_.size()) {
+  if (span * kTotalInputs > snap_.size()) {
     LOG_WARN("capture: snapshot buffer holds fewer frames than requested — freezing short");
   }
 
   for (int attempt = 0; attempt < 2; ++attempt) {
     const uint64_t n1 = ring_.counter();
-    const uint64_t cap = snap_.size() / kInputs;  // the buffer is the hard bound on the copy
+    const uint64_t cap = snap_.size() / kTotalInputs;  // the buffer is the hard bound on the copy
     const uint64_t want = std::min<uint64_t>(span, cap);
     const uint64_t start = n1 > want ? n1 - want : 0;
     const uint64_t len = n1 - start;
@@ -151,7 +205,7 @@ CaptureStatus CaptureStore::freeze(uint32_t generation) {
 void CaptureStore::resume() {
   std::lock_guard<std::mutex> lock(m_);
   status_ = CaptureStatus{};
-  if (pending_frames_ != 0 && pending_frames_ * kInputs != snap_.size()) {
+  if (pending_frames_ != 0 && pending_frames_ * kTotalInputs != snap_.size()) {
     std::string err;
     if (!resize_snapshot(pending_frames_, &err)) LOG_WARN("capture: deferred resize failed: {}", err);
   }
@@ -163,13 +217,13 @@ CaptureStatus CaptureStore::status() const {
 }
 
 bool CaptureStore::snapshot_read(unsigned ch, uint64_t start, uint64_t len, float* out) const {
-  if (!status_.frozen || ch >= kInputs) return false;
+  if (!status_.frozen || ch >= kTotalInputs) return false;
   if (start < status_.valid_start) return false;
   const uint64_t off = start - status_.valid_start;
   // off > valid_len - len is the overflow-safe form of start + len > valid_start + valid_len:
   // a huge start from the query string must fail here, not wrap into a "valid" offset.
   if (len > status_.valid_len || off > status_.valid_len - len) return false;
-  for (uint64_t i = 0; i < len; ++i) out[i] = snap_[(off + i) * kInputs + ch];
+  for (uint64_t i = 0; i < len; ++i) out[i] = snap_[(off + i) * kTotalInputs + ch];
   return true;
 }
 
@@ -180,7 +234,7 @@ std::string CaptureStore::frozen_range_error() const {
 
 WindowResult CaptureStore::window(unsigned ch, uint64_t start, uint64_t len, unsigned cols) const {
   WindowResult r;
-  if (ch >= kInputs) {
+  if (ch >= kTotalInputs) {
     r.error = "channel out of range";
     return r;
   }
@@ -234,7 +288,7 @@ WindowResult CaptureStore::window(unsigned ch, uint64_t start, uint64_t len, uns
 
 XcorrResult CaptureStore::xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, uint64_t len) {
   XcorrResult r;
-  if (ch_a >= kInputs || ch_b >= kInputs) {
+  if (ch_a >= kTotalInputs || ch_b >= kTotalInputs) {
     r.error = "channel out of range";
     return r;
   }

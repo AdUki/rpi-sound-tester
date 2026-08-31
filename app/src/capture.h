@@ -86,7 +86,7 @@ class CaptureStore {
   const unsigned period_;
 
   mutable std::mutex m_;
-  std::vector<float> snap_;  // interleaved, kInputs channels; snap_[0] is at valid_start
+  std::vector<float> snap_;  // interleaved, kTotalInputs channels; snap_[0] is at valid_start
   uint64_t max_frames_ = 0;      // ring minus copy safety margin
   uint64_t analyze_frames_ = 0;  // recent frames the next freeze copies (<= max_frames_)
   uint64_t pending_frames_ = 0;  // resize requested while frozen; applied on resume/freeze

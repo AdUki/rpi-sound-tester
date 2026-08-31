@@ -5,12 +5,18 @@
   "device": "hw:audioinjectoroc,0",
   "capture_channels": 8,
   "inputs": [
-    { "gain_db": 0.0 },
-    { "gain_db": 0.0 },
-    { "gain_db": 0.0 },
-    { "gain_db": 0.0 },
-    { "gain_db": 0.0 },
-    { "gain_db": 0.0 }
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false },
+    { "gain_db": 0.0, "mute": false }
   ],
   "outputs": [
     { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
@@ -29,8 +35,9 @@
   },
   "input_map": [0, 1, 2, 3, 4, 5],
   "output_map": [0, 1, 2, 3, 4, 5, 6, 7],
-  "input_names": ["", "", "", "", "", ""],
+  "input_names": ["", "", "", "", "", "", "", "", "", "", "", ""],
   "output_names": ["", "", "", "", "", "", "", ""],
   "loopback_offset_samples": 0,
-  "listen": { "codec": "opus", "bitrate_kbps": 96 }
+  "listen": { "codec": "opus", "bitrate_kbps": 96 },
+  "net": { "enabled": false, "port": 4010, "delay_ms": 1000 }
 }

@@ -37,6 +37,9 @@ void test_json_round_trip() {
   a.loopback_offset_samples = 4321;
   a.listen_codec = "opus";
   a.listen_bitrate_kbps = 128;
+  a.net_enabled = true;
+  a.net_port = 4321;
+  a.net_delay_ms = 750;
 
   Config b;
   std::string err;
@@ -70,6 +73,39 @@ void test_json_round_trip() {
   CHECK_EQ(b.loopback_offset_samples, 4321);
   CHECK_EQ(b.listen_codec, std::string("opus"));
   CHECK_EQ(b.listen_bitrate_kbps, 128);
+  CHECK(b.net_enabled);
+  CHECK_EQ(b.net_port, 4321);
+  CHECK_EQ(b.net_delay_ms, 750);
+}
+
+// The capture delay is derived from enabled + delay_ms in two places — Config::apply_to and the
+// live PUT handler — and must come out zero whenever network input is off, or a device with no
+// remote sender would quietly shift its own capture by a second.
+void test_capture_delay_is_zero_unless_network_input_is_on() {
+  Control ctl;
+  Config c;
+  c.rate = 96000;
+  c.net_delay_ms = 1000;
+
+  c.net_enabled = false;
+  c.apply_to(ctl);
+  CHECK_EQ(ctl.net.delay_frames.load(), 0u);
+  CHECK_EQ(ctl.net.delay_ms.load(), 1000u);  // remembered, just not in force
+
+  c.net_enabled = true;
+  c.apply_to(ctl);
+  CHECK_EQ(ctl.net.delay_frames.load(), 96000u);
+
+  // Out of range clamps rather than being taken literally.
+  c.net_delay_ms = 999999;
+  c.apply_to(ctl);
+  CHECK_EQ(ctl.net.delay_ms.load(), kNetDelayMaxMs);
+  CHECK_EQ(ctl.net.delay_frames.load(), static_cast<uint32_t>(1ull * kNetDelayMaxMs * 96000 / 1000));
+
+  // And it survives the snapshot back out to a Config.
+  const Config back = Config::from_control(ctl, c);
+  CHECK(back.net_enabled);
+  CHECK_EQ(back.net_delay_ms, static_cast<int>(kNetDelayMaxMs));
 }
 
 void test_control_round_trip() {
@@ -171,5 +207,6 @@ int main() {
   test_saved_values_are_clamped();
   test_source_without_index_parses();
   test_garbage_is_rejected();
+  test_capture_delay_is_zero_unless_network_input_is_on();
   return report("config");
 }

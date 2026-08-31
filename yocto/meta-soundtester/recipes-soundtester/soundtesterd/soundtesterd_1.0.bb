@@ -8,8 +8,8 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 # stream. RDEPENDS puts the shared libraries into the read-only image, mirroring alsa-lib.
 # md2html-native is the build-time tool that renders docs/api.md to www/api.html for GET /api; it
 # is native-only, so it appears in DEPENDS but not RDEPENDS (nothing of it ships to the device).
-DEPENDS = "alsa-lib libopus libogg md2html-native"
-RDEPENDS:${PN} = "alsa-lib libopus libogg"
+DEPENDS = "alsa-lib libopus libogg libsamplerate0 libvorbis md2html-native"
+RDEPENDS:${PN} = "alsa-lib libopus libogg libsamplerate0 libvorbis"
 
 # The daemon is built from app/ in this repository: the layer sits at yocto/meta-soundtester,
 # so four levels up from this recipe is the repo root. Swap this for a git:// SRC_URI if the
@@ -47,9 +47,15 @@ do_configure:prepend() {
 # app/CMakeLists.txt (ST_UNSAFE_MATH defaults on for arm32).
 EXTRA_OECMAKE = "-DCMAKE_BUILD_TYPE=Release"
 
+# Defaulted here, not only in the .sample: soundtester-device.conf is untracked and every copy
+# created before network input existed lacks this. Without a default the sed below would write
+# a bare "--net-port" with no value and the daemon would refuse to start on the next reflash.
+SOUNDTESTER_NET_PORT ??= "4010"
+
 do_install:append() {
     install -d ${D}${systemd_system_unitdir}
     sed -e 's|@PORT@|${SOUNDTESTER_HTTP_PORT}|' \
+        -e 's|@NETPORT@|${SOUNDTESTER_NET_PORT}|' \
         ${WORKDIR}/soundtesterd.service \
         > ${D}${systemd_system_unitdir}/soundtesterd.service
     chmod 0644 ${D}${systemd_system_unitdir}/soundtesterd.service
@@ -67,4 +73,4 @@ FILES:${PN} += " \
     ${systemd_system_unitdir} \
 "
 
-do_install[vardeps] += "SOUNDTESTER_HTTP_PORT SOUNDTESTER_RATE SOUNDTESTER_PERIOD"
+do_install[vardeps] += "SOUNDTESTER_HTTP_PORT SOUNDTESTER_NET_PORT SOUNDTESTER_RATE SOUNDTESTER_PERIOD"

@@ -15,7 +15,7 @@ namespace st {
 namespace {
 
 // Encoded-packet buffer size per channel. One 20 ms CBR frame at kListenBitrateMaxKbps is
-// well under 1 kB; the mono path and the kInputs-channel multistream path both size from this.
+// well under 1 kB; the mono path and the kTotalInputs-channel multistream path both size from this.
 constexpr int kMaxPacketPerChannel = 4000;
 
 int clamp_kbps(int kbps) {
@@ -155,16 +155,16 @@ OpusOggMultiEncoder::OpusOggMultiEncoder(unsigned rate, int bitrate_kbps, uint32
   const unsigned factor = rate / kOpusRate;
   in_frames_ = kOpusFrameFrames * factor;
 
-  std::array<unsigned char, kInputs> mapping;
-  for (unsigned c = 0; c < kInputs; ++c) mapping[c] = static_cast<unsigned char>(c);
+  std::array<unsigned char, kTotalInputs> mapping;
+  for (unsigned c = 0; c < kTotalInputs; ++c) mapping[c] = static_cast<unsigned char>(c);
 
   int err = 0;
-  d_->enc = opus_multistream_encoder_create(kOpusRate, kInputs, kInputs, 0, mapping.data(),
+  d_->enc = opus_multistream_encoder_create(kOpusRate, kTotalInputs, kTotalInputs, 0, mapping.data(),
                                             OPUS_APPLICATION_AUDIO, &err);
   if (err != OPUS_OK || !d_->enc) return;
 
   const int kbps = clamp_kbps(bitrate_kbps);
-  opus_multistream_encoder_ctl(d_->enc, OPUS_SET_BITRATE(kbps * 1000 * static_cast<int>(kInputs)));
+  opus_multistream_encoder_ctl(d_->enc, OPUS_SET_BITRATE(kbps * 1000 * static_cast<int>(kTotalInputs)));
   opus_multistream_encoder_ctl(d_->enc, OPUS_SET_VBR(0));
   opus_multistream_encoder_ctl(d_->enc, OPUS_SET_DTX(0));
   opus_multistream_encoder_ctl(d_->enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
@@ -174,11 +174,11 @@ OpusOggMultiEncoder::OpusOggMultiEncoder(unsigned rate, int bitrate_kbps, uint32
   opus_multistream_encoder_ctl(d_->enc, OPUS_GET_LOOKAHEAD(&lookahead));
   d_->preskip = lookahead;
 
-  for (unsigned c = 0; c < kInputs; ++c) d_->decs.push_back(std::make_unique<Decimator>(factor));
+  for (unsigned c = 0; c < kTotalInputs; ++c) d_->decs.push_back(std::make_unique<Decimator>(factor));
   d_->chan.resize(in_frames_);
-  d_->downs.assign(kInputs, {});
-  d_->down.resize(static_cast<size_t>(kOpusFrameFrames) * kInputs);
-  d_->pkt.resize(static_cast<size_t>(kInputs) * kMaxPacketPerChannel);
+  d_->downs.assign(kTotalInputs, {});
+  d_->down.resize(static_cast<size_t>(kOpusFrameFrames) * kTotalInputs);
+  d_->pkt.resize(static_cast<size_t>(kTotalInputs) * kMaxPacketPerChannel);
 
   if (ogg_stream_init(&d_->os, static_cast<int>(serial)) != 0) return;
   d_->os_init = true;
@@ -190,7 +190,7 @@ OpusOggMultiEncoder::~OpusOggMultiEncoder() = default;
 std::string OpusOggMultiEncoder::headers() {
   std::string out;
 
-  const std::string head = make_opus_head(kInputs, d_->preskip, kOpusRate);
+  const std::string head = make_opus_head(kTotalInputs, d_->preskip, kOpusRate);
   ogg_packet op{};
   op.packet = reinterpret_cast<unsigned char*>(const_cast<char*>(head.data()));
   op.bytes = static_cast<long>(head.size());
@@ -216,16 +216,16 @@ bool OpusOggMultiEncoder::encode(const float* interleaved, int bitrate_kbps, std
   const int kbps = clamp_kbps(bitrate_kbps);
   if (kbps != d_->cur_kbps) {
     opus_multistream_encoder_ctl(d_->enc,
-                                 OPUS_SET_BITRATE(kbps * 1000 * static_cast<int>(kInputs)));
+                                 OPUS_SET_BITRATE(kbps * 1000 * static_cast<int>(kTotalInputs)));
     d_->cur_kbps = kbps;
   }
 
-  for (unsigned c = 0; c < kInputs; ++c) {
-    for (unsigned i = 0; i < in_frames_; ++i) d_->chan[i] = interleaved[i * kInputs + c];
+  for (unsigned c = 0; c < kTotalInputs; ++c) {
+    for (unsigned i = 0; i < in_frames_; ++i) d_->chan[i] = interleaved[i * kTotalInputs + c];
     d_->decs[c]->process(d_->chan.data(), in_frames_, &d_->downs[c]);
   }
   for (unsigned i = 0; i < kOpusFrameFrames; ++i) {
-    for (unsigned c = 0; c < kInputs; ++c) d_->down[i * kInputs + c] = d_->downs[c][i];
+    for (unsigned c = 0; c < kTotalInputs; ++c) d_->down[i * kTotalInputs + c] = d_->downs[c][i];
   }
 
   const opus_int32 n = opus_multistream_encode_float(

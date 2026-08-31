@@ -139,6 +139,21 @@ deploy-daemon: ## Copy the cross-compiled daemon to a board, stop+restart it (TA
 	@ssh $(TARGET) 'systemctl stop soundtesterd'
 	@ssh $(TARGET) 'mount -o remount,rw /'
 	@scp $(YOCTO_BIN) $(TARGET):$(BIN_DEST)
+	@# A new DEPENDS reaches the board only through a reflash, so a binary that has grown a
+	@# library since the image was built would land here and then refuse to start. Carry over
+	@# anything it needs that the board has not got; a reflash installs them properly.
+	@set -e; \
+	  for lib in $$(readelf -d $(YOCTO_BIN) | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'); do \
+	    if ! ssh $(TARGET) "test -e /usr/lib/$$lib -o -e /lib/$$lib" 2>/dev/null; then \
+	      src=$$(find $(YB)/tmp/sysroots-components -name "$$lib" -path "*cortexa7*" | head -1); \
+	      if [ -n "$$src" ]; then \
+	        echo -e "  $(DIM)+ $$lib (missing on the board)$(OFF)"; \
+	        scp -q "$$(readlink -f $$src)" $(TARGET):/usr/lib/$$lib; \
+	      else \
+	        echo -e "  $(BOLD)! $$lib is missing on the board and not in the sysroot$(OFF)"; \
+	      fi; \
+	    fi; \
+	  done
 	@ssh $(TARGET) 'sync && mount -o remount,ro /'
 	@ssh $(TARGET) 'systemctl start soundtesterd'
 	@echo "Done. Daemon restarted with the new binary."

@@ -1,7 +1,14 @@
 # HTTP API
 
 Base URL: `http://soundtester.local` (port 80 on the device; `--port` elsewhere). All bodies are
-JSON except the audio streams. Inputs are 0–5, outputs 0–7 (the UI labels them IN 1–6 / OUT 1–8).
+JSON except the audio streams. Inputs are 0–11, outputs 0–7 (the UI labels them IN 1–6, NET 1–6
+and OUT 1–8). Inputs 0–5 are the card's ADCs; 6–11 are **network inputs** fed over the LAN, and
+everything that takes an input index takes those too. `GET /api/state` reports each input's `kind`
+as `local` or `net`, and `limits.inputs_local` says where the split is. Each input also carries
+`active`: a network channel reads `false` until a sender has used it, which is how the console
+keeps unused ones out of sight. The channel exists either way — the index is fixed, and the arrays
+in the meters, spectrum and envelope messages always carry every channel — so a headless client
+can ignore `active` entirely.
 
 Every PUT field is optional — send only what changes. Out-of-range numbers clamp to their limits;
 bad enums and non-permutation maps are rejected.
@@ -18,13 +25,21 @@ output has a `name`, set only in `config.json` — there is no API to change it.
 
 ## Inputs
 
-### `PUT /api/inputs/{0-5}`
+### `PUT /api/inputs/{0-11}`
 ```json
-{"gain_db": 12.0}
+{"gain_db": 12.0, "mute": false}
 ```
-Make-up gain, 0…+40 dB, applied on capture **before the ring buffer** — so every reading (meters,
-spectrum, THD+N, scope, xcorr, listen streams) is post-gain. It cannot undo ADC clipping, which
-already happened in the codec; that is why there is no attenuation.
+Gain and mute, applied **before the ring buffer** — so every reading (meters, spectrum, THD+N,
+scope, xcorr, listen streams) is post-gain and a muted channel reads as silent everywhere.
+
+An ADC channel takes 0…+40 dB: it cannot undo clipping that already happened in the codec, so
+attenuating would only hide the damage from the meters. A **network** channel has no ADC and takes
+−60…+40 dB, which is what gives a mixer on the sending machine a playback volume worth the name.
+Each input reports its own floor as `gain_min_db` in `GET /api/state`.
+
+A sender can put its stream beyond both (`mixer off`, below). That input reports `"bypass": true`
+and plays exactly as it arrived, gain and mute ignored, until the stream ends; a stored gain is
+kept and applies again afterwards.
 
 ## Routing and outputs
 
@@ -34,8 +49,8 @@ already happened in the codec; that is why there is no attenuation.
 {"source": {"type": "gen", "index": "ping"}}
 {"source": {"type": "silence"}}
 ```
-`type` is `silence` | `input` | `gen`. `index` is 0–5 for `input`, or `sine` | `noise` | `ping` for
-`gen`. `gain_db` clamps to −60…0.
+`type` is `silence` | `input` | `gen`. `index` is 0–11 for `input` — a network channel routes like
+any other — or `sine` | `noise` | `ping` for `gen`. `gain_db` clamps to −60…0.
 
 ### `POST /api/outputs/{0-7}/identify`
 Three 100 ms beeps on that output only, then it reverts. Tells you which physical socket it is.
@@ -169,6 +184,99 @@ carries no captured arrival for that ping (e.g. it was emitted before routing) �
 the summary. `lag_samples_spread` (max−min) is the marker-to-marker jitter. Read each `confidence`:
 below ~2 the lag is ambiguous (a repeating stimulus or a continuous tone). Answers 503 when there is
 not enough captured audio to freeze, 400 when no input has sound and no channels were given.
+
+## Network inputs
+
+Any Linux machine on the network can feed audio in through the `soundtester` ALSA plugin
+(`alsa-plugin/` in the source tree), and it arrives as an ordinary input channel — metered, in the
+scope, routable to an output, and a valid operand for `xcorr` against a real input.
+
+A sender does not know the card's clock and never has to. It says only how far into its own stream
+each packet starts; the **device** anchors the stream when its first packet arrives, adds the
+**alignment delay** (`delay_ms`, 1 s by default), and places everything after it contiguously — the
+way an RTP receiver decides playout. Local capture is held back by the same delay, so ring index
+`n` means one instant on every channel. That delay does not appear in measurements: a delay
+measured between a network channel and a real input is the true path delay. It is zero when network
+input is disabled.
+
+Two machines' clocks are never identical, and a sender need not even run at the card's rate. Both
+differences are taken up in one place: every stream passes through an asynchronous sample-rate
+converter, and its **ratio** is trimmed continuously to hold the stream the configured delay ahead
+of playout. Nothing is corrected as a step anywhere, and the sender carries no model of the device.
+
+The lead that steers it is averaged over a couple of seconds first, so the loop follows drift
+rather than network jitter, and it is measured against an interpolated playout position rather
+than the last completed audio block. `lead_frames` is that filtered value — the loop's own input —
+and it should sit within a fraction of a millisecond of `target_lead_frames`.
+
+If a stream does get further out than the ratio could walk back in reasonable time — a quarter of
+a second — it is re-anchored instead, which is a discontinuity but a bounded one. `resyncs` counts
+those, and a number that climbs means the link cannot hold the configured `delay_ms`.
+
+Any of the usual rates and `S16_LE` / `S24_3LE` / `S32_LE` / `FLOAT_LE` are accepted; the device
+converts the format and resamples the rate, so `plug:` is no longer needed for ordinary files.
+
+A sender may also **encode** rather than send PCM, for a link that cannot carry the raw rate:
+`ENCODING=vorbis` compresses on the sending machine and the device decodes. Measured on 96 kHz
+S32 stereo that is 877 kB/s down to 65 kB/s. It is **lossy** — right for monitoring and for
+stimulus, wrong for a reference measurement, which wants the default `pcm`. `QUALITY` is Vorbis's
+own VBR scale, −0.1 to 1.0, default 0.4.
+
+Raw Vorbis packets, not an Ogg stream: this transport already frames and orders them, which is the
+job Ogg would be doing, so a container would add overhead and a second parser for nothing. The
+setup packets travel once, before any audio.
+
+A network channel's ring slot is permanent, because the ring is one pinned allocation and because
+a freeze taken after the sender disconnected still has to be analysable. What is dynamic is
+whether the console shows it: `active` goes true when a sender first uses the channel and stays
+true for the rest of the session.
+
+Only playback into the device is supported; there is no capture direction yet.
+
+### `GET /api/net`
+```json
+{"enabled": true, "listening": true, "port": 4010, "delay_ms": 1000,
+ "delay_frames": 96000, "rate": 96000, "n_now": 1466240, "lead_seconds": 1.0, "error": "",
+ "channels": [{"channel": 0, "input": 6, "connected": true, "peer": "192.168.1.7:41154",
+               "name": "alsa-plugin", "frames_received": 874496, "late_drops": 0,
+               "range_drops": 0, "underruns": 0, "last_target": 1562240,
+               "write_end": 1562496, "peak": 0.79}]}
+```
+`input` is the index to use everywhere else — route it with
+`{"source": {"type": "input", "index": 6}}`, or measure it with `?ch_a=0&ch_b=6`.
+
+`late_drops` counts packets that arrived after the instant they asked for. They are discarded, not
+slid forward: playing them late would put the audio at the wrong place on the axis, which is the
+one thing this device must not do. A steady count means the network cannot keep up with `delay_ms`
+— raise it. `range_drops` means the sender aimed outside the buffer entirely, and `underruns` means
+the sender stopped supplying audio before its slot came round.
+
+### Rates, formats and multi-channel senders
+A sender asks for `channels` (default 1) and gets that many **adjacent** inputs — a stereo source
+becomes NET 1 + NET 2, not NET 1 and NET 5 — so a pair reads as one source. All of its channels
+travel in the same packet and through one converter, which keeps them sample-identical even while
+the stream is being resampled: they cannot come apart because they are never handled apart.
+
+`GET /api/net` reports `stream_index` and `stream_count` per channel, and a channel's name gains
+`(1/2)`, `(2/2)` and so on so two cards from one machine are told apart. A mixer drives the whole
+run at once, the way a card's Master does.
+
+### Ports, and which channel a sender lands on
+The device listens on the base port for *any* channel, and on **base + 1 + N for NET N+1** — so
+`4010` takes whatever is free and `4013` is NET 3. Choosing a port is as deliberate as passing a
+channel, so it wins over the `channel` argument in the sender's config.
+
+With neither, a returning sender is given **the channel it used last time**, matched on its
+address. Routing set up against NET 3 therefore keeps meaning that machine across a reconnect, and
+a channel goes on saying whose it was while the machine is switched off. Two streams from one
+machine cannot be told apart by address — pin those with a port or a channel.
+
+### `PUT /api/net`
+```json
+{"enabled": true, "delay_ms": 1000, "port": 4010}
+```
+Changing the port rebinds the listener and drops any connected sender. A bind that fails still
+answers 200 — check `listening` and `error`.
 
 ## Listening
 

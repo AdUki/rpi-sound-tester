@@ -40,7 +40,7 @@ std::string Config::to_json() const {
   j["capture_channels"] = capture_channels;
 
   j["inputs"] = json::array();
-  for (const auto& i : inputs) j["inputs"].push_back({{"gain_db", i.gain_db}});
+  for (const auto& i : inputs) j["inputs"].push_back({{"gain_db", i.gain_db}, {"mute", i.mute}});
 
   j["outputs"] = json::array();
   for (const auto& o : outputs) {
@@ -60,6 +60,7 @@ std::string Config::to_json() const {
   j["output_names"] = output_names;
   j["loopback_offset_samples"] = loopback_offset_samples;
   j["listen"] = {{"codec", listen_codec}, {"bitrate_kbps", listen_bitrate_kbps}};
+  j["net"] = {{"enabled", net_enabled}, {"port", net_port}, {"delay_ms", net_delay_ms}};
   return j.dump(2);
 }
 
@@ -75,8 +76,9 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
 
     if (j.contains("inputs")) {
       const auto& arr = j.at("inputs");
-      for (size_t i = 0; i < arr.size() && i < kInputs; ++i) {
+      for (size_t i = 0; i < arr.size() && i < kTotalInputs; ++i) {
         c.inputs[i].gain_db = arr[i].value("gain_db", 0.0f);
+        c.inputs[i].mute = arr[i].value("mute", false);
       }
     }
 
@@ -126,6 +128,11 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
     if (j.contains("input_names")) c.input_names = j.at("input_names").get<std::vector<std::string>>();
     if (j.contains("output_names")) c.output_names = j.at("output_names").get<std::vector<std::string>>();
     c.loopback_offset_samples = j.value("loopback_offset_samples", c.loopback_offset_samples);
+    if (j.contains("net")) {
+      c.net_enabled = j["net"].value("enabled", c.net_enabled);
+      c.net_port = j["net"].value("port", c.net_port);
+      c.net_delay_ms = j["net"].value("delay_ms", c.net_delay_ms);
+    }
     if (j.contains("listen")) {
       c.listen_codec = j["listen"].value("codec", c.listen_codec);
       c.listen_bitrate_kbps = j["listen"].value("bitrate_kbps", c.listen_bitrate_kbps);
@@ -135,15 +142,17 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
     return false;
   }
 
-  c.input_names.resize(kInputs);
+  c.input_names.resize(kTotalInputs);
   c.output_names.resize(kOutputs);
   *out = c;
   return true;
 }
 
 void Config::apply_to(Control& ctl) const {
-  for (unsigned i = 0; i < kInputs; ++i) {
-    ctl.inputs[i].gain_db.store(std::clamp(inputs[i].gain_db, kInputGainMinDb, kInputGainMaxDb));
+  for (unsigned i = 0; i < kTotalInputs; ++i) {
+    ctl.inputs[i].gain_db.store(
+        std::clamp(inputs[i].gain_db, input_gain_min_db(i), kInputGainMaxDb));
+    ctl.inputs[i].mute.store(inputs[i].mute);
   }
 
   for (unsigned i = 0; i < kOutputs; ++i) {
@@ -153,7 +162,7 @@ void Config::apply_to(Control& ctl) const {
     if (o.source_type == "input") {
       type = SourceType::Input;
       index = static_cast<uint8_t>(std::clamp(std::atoi(o.source_index.c_str()), 0,
-                                              static_cast<int>(kInputs) - 1));
+                                              static_cast<int>(kTotalInputs) - 1));
     } else if (o.source_type == "gen") {
       GenId g = GenId::Sine;
       if (parse_gen(o.source_index, &g)) {
@@ -187,6 +196,15 @@ void Config::apply_to(Control& ctl) const {
   ctl.listen.bitrate_kbps.store(
       std::clamp(listen_bitrate_kbps, kListenBitrateMinKbps, kListenBitrateMaxKbps));
 
+  // The delay is derived once, here and in the live PUT handler, so the audio thread reads a
+  // frame count instead of recomputing one per block — and so it is unambiguously zero whenever
+  // network input is off.
+  const unsigned dms = static_cast<unsigned>(std::clamp(
+      net_delay_ms, static_cast<int>(kNetDelayMinMs), static_cast<int>(kNetDelayMaxMs)));
+  ctl.net.enabled.store(net_enabled);
+  ctl.net.delay_ms.store(dms);
+  ctl.net.delay_frames.store(net_enabled ? static_cast<uint32_t>(1ull * dms * rate / 1000) : 0);
+
   // A saved map that is not a permutation (see is_slot_permutation) is rejected wholesale.
   if (is_slot_permutation(input_map, kTdmSlots)) {
     for (unsigned i = 0; i < kInputs; ++i) ctl.input_map[i].store(input_map[i]);
@@ -205,7 +223,10 @@ void Config::apply_to(Control& ctl) const {
 
 Config Config::from_control(const Control& ctl, const Config& base) {
   Config c = base;
-  for (unsigned i = 0; i < kInputs; ++i) c.inputs[i].gain_db = ctl.inputs[i].gain_db.load();
+  for (unsigned i = 0; i < kTotalInputs; ++i) {
+    c.inputs[i].gain_db = ctl.inputs[i].gain_db.load();
+    c.inputs[i].mute = ctl.inputs[i].mute.load();
+  }
 
   for (unsigned i = 0; i < kOutputs; ++i) {
     const uint32_t packed = ctl.outputs[i].source.load();
@@ -236,6 +257,8 @@ Config Config::from_control(const Control& ctl, const Config& base) {
 
   c.listen_codec = codec_name(static_cast<ListenCodec>(ctl.listen.codec.load()));
   c.listen_bitrate_kbps = ctl.listen.bitrate_kbps.load();
+  c.net_enabled = ctl.net.enabled.load();
+  c.net_delay_ms = static_cast<int>(ctl.net.delay_ms.load());
   return c;
 }
 

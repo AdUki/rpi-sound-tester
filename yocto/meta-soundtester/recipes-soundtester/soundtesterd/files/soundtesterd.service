@@ -5,7 +5,7 @@ Wants=sound.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/soundtesterd --port @PORT@
+ExecStart=/usr/bin/soundtesterd --port @PORT@ --net-port @NETPORT@
 Restart=always
 RestartSec=2
 

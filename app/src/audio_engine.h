@@ -16,6 +16,8 @@ typedef struct _snd_pcm snd_pcm_t;
 
 namespace st {
 
+class NetAudioServer;
+
 struct EngineOptions {
   bool sim = false;
   std::string device = "hw:audioinjectoroc,0";
@@ -52,6 +54,9 @@ class AudioEngine {
   void stop();
 
   EngineStats stats() const;
+
+  // Wired in by main() before start(): the engine reads its network channels each block.
+  void set_net(NetAudioServer* net) { net_.store(net, std::memory_order_relaxed); }
   double rate() const { return static_cast<double>(opt_.rate); }
   unsigned period() const { return period_.load(std::memory_order_relaxed); }
   uint64_t identify_frames() const { return identify_frames_; }
@@ -66,6 +71,11 @@ class AudioEngine {
 
   void wait_before_retry();
   void size_buffers();
+  // Picks up a change to ctl_.net.delay_frames and returns the delay now in force.
+  unsigned sync_capture_delay();
+  // Writes the local channels of `ring_out` from `live` delayed by cap_delay_frames_, so that
+  // ring index n means the same real-world instant on an ADC channel as on a network channel.
+  void apply_capture_delay(size_t frames, const float* live, float* ring_out);
   bool open_alsa();
   void close_alsa();
   bool configure(snd_pcm_t* pcm, unsigned channels, const char* what);
@@ -78,8 +88,10 @@ class AudioEngine {
 
   // Shared by both backends: publishes one captured block to the ring and produces the
   // output block that sits on the same sample axis.
-  // in6 is modified in place: input gain is applied to it before anything else reads it.
-  void process_block(uint64_t n, size_t frames, float* in6, float* out8);
+  // `in_all` is kTotalInputs wide: the backend fills channels [0, kInputs) with card audio and
+  // process_block fills [kInputs, kTotalInputs) from the network timelines. It is modified in
+  // place — input gain is applied to it before anything else reads it.
+  void process_block(uint64_t n, size_t frames, float* in_all, float* out8);
 
   Control& ctl_;
   RingBuffer& ring_;
@@ -105,7 +117,22 @@ class AudioEngine {
 
   std::vector<int32_t> raw_in_;
   std::vector<int32_t> raw_out_;
-  std::vector<float> in6_;
+  // Set once before start(). The engine does not own it; a null pointer just means the network
+  // channels stay silent.
+  std::atomic<NetAudioServer*> net_{nullptr};
+
+  // Two views of the same block, on the two axes this device has. `in_` is LIVE — what the card
+  // just captured and what the network sender wants heard now — and is what outputs are routed
+  // from, so a passthrough keeps its near-zero latency. `ring_block_` is the same audio on the
+  // CAPTURE axis, every channel delayed alike, and is the only thing the ring ever sees.
+  // With no delay configured the two are the same buffer and none of this costs anything.
+  std::vector<float> in_;
+  std::vector<float> ring_block_;
+  std::vector<float> cap_delay_;   // kInputs wide, power-of-two frames, mask-indexed
+  size_t cap_delay_len_ = 0;
+  size_t cap_delay_mask_ = 0;
+  size_t cap_delay_pos_ = 0;
+  unsigned cap_delay_frames_ = 0;  // currently in force; a change resets the line
   std::vector<float> out8_;
   std::vector<float> gen_sine_, gen_noise_, gen_ping_;
 

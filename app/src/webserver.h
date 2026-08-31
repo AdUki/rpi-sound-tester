@@ -14,6 +14,7 @@
 #include "config.h"
 #include "control.h"
 #include "kmsg_watch.h"
+#include "net_audio.h"
 #include "ring_buffer.h"
 #include "ws_hub.h"
 
@@ -32,6 +33,7 @@ struct WebOptions {
 
 struct Deps {
   Control& ctl;
+  NetAudioServer& net;
   RingBuffer& ring;
   AudioEngine& engine;
   Analysis& analysis;

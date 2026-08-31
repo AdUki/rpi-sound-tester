@@ -45,6 +45,14 @@ pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
 #   sudo apt install libopus-dev libogg-dev
 pkg_check_modules(OPUS REQUIRED IMPORTED_TARGET opus)
 pkg_check_modules(OGG REQUIRED IMPORTED_TARGET ogg)
+# Asynchronous sample-rate conversion for network senders that are not at the card's rate. In
+# poky already (recipes-multimedia/libsamplerate), BSD-2-Clause, and its ratio-per-call interface
+# is what lets the conversion double as the clock discipline.
+pkg_check_modules(SAMPLERATE REQUIRED IMPORTED_TARGET samplerate)
+# Decodes the Vorbis a sender may send instead of PCM. Linked normally here, alongside the ogg and
+# opus this already carries; it is the ALSA plugin, installed on arbitrary machines, that loads it
+# dynamically so its absence costs nothing there.
+pkg_check_modules(VORBIS REQUIRED IMPORTED_TARGET vorbis)
 find_package(Threads REQUIRED)
 
 # third_party/* are git submodules pinned at a tag (pocketfft: a commit — it has no tags). All
@@ -122,6 +130,7 @@ add_library(soundtester_core STATIC
   src/kmsg_watch.cpp
   src/listen_encoder.cpp
   src/listen_stream.cpp
+  src/net_audio.cpp
   src/util/log.cpp
   src/util/sysinfo.cpp
   src/webserver.cpp
@@ -129,7 +138,7 @@ add_library(soundtester_core STATIC
 )
 target_include_directories(soundtester_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(soundtester_core PUBLIC third_party
-  PkgConfig::ALSA PkgConfig::OPUS PkgConfig::OGG Threads::Threads)
+  PkgConfig::ALSA PkgConfig::OPUS PkgConfig::OGG PkgConfig::SAMPLERATE PkgConfig::VORBIS Threads::Threads)
 target_compile_options(soundtester_core PRIVATE -Wall -Wextra)
 
 add_executable(soundtesterd src/main.cpp)

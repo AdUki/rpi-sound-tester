@@ -11,7 +11,10 @@
 namespace st {
 
 struct InputConfig {
-  float gain_db = 0.0f;  // digital make-up gain, 0..+40 dB
+  // Make-up gain: 0..+40 dB on an ADC channel, and down to -60 dB on a network one, which has no
+  // ADC to have clipped and so nothing to hide by attenuating.
+  float gain_db = 0.0f;
+  bool mute = false;
 };
 
 struct OutputConfig {
@@ -28,7 +31,7 @@ struct Config {
   std::string device = "hw:audioinjectoroc,0";
   unsigned capture_channels = kTdmSlots;
 
-  std::array<InputConfig, kInputs> inputs{};
+  std::array<InputConfig, kTotalInputs> inputs{};
   std::array<OutputConfig, kOutputs> outputs{};
   float sine_freq_hz = 440.0f;
   float sine_level_db = -20.0f;
@@ -41,7 +44,7 @@ struct Config {
   std::array<uint8_t, kInputs> input_map{{0, 1, 2, 3, 4, 5}};
   std::array<uint8_t, kOutputs> output_map{{0, 1, 2, 3, 4, 5, 6, 7}};
 
-  std::vector<std::string> input_names{kInputs};
+  std::vector<std::string> input_names{kTotalInputs};
   std::vector<std::string> output_names{kOutputs};
 
   int64_t loopback_offset_samples = 0;
@@ -51,6 +54,13 @@ struct Config {
   // stream.ogg default.
   std::string listen_codec = "opus";
   int listen_bitrate_kbps = kListenBitrateDefaultKbps;
+
+  // Network audio input. `net_delay_ms` is how far local capture is held back so that a network
+  // channel and an ADC channel that heard the same thing land on the same sample index. It only
+  // takes effect while net_enabled, so a device with no remote sender behaves as it always did.
+  bool net_enabled = false;
+  int net_port = kNetPort;
+  int net_delay_ms = static_cast<int>(kNetDelayDefaultMs);
 
   std::string to_json() const;
   static bool from_json(const std::string& text, Config* out, std::string* err);

@@ -1,5 +1,7 @@
 #include "audio_engine.h"
 
+#include "net_audio.h"
+
 #include <alsa/asoundlib.h>
 #include <pthread.h>
 #include <time.h>
@@ -345,7 +347,34 @@ void AudioEngine::init_mixer() {
   snd_mixer_close(mixer);
 }
 
-void AudioEngine::process_block(uint64_t n, size_t frames, float* in6, float* out8) {
+void AudioEngine::process_block(uint64_t n, size_t frames, float* in_all, float* out8) {
+  // Publish where the sample counter is right now, so a network client can aim a packet at an
+  // absolute index. This is the only place the card's clock is tied to CLOCK_MONOTONIC, and it
+  // is deliberately the same n that generators render at.
+  //
+  // n corresponds to audio the card captured a moment before this call, so the anchor carries a
+  // small systematic offset (a period plus the driver's own buffering). It is constant, so it
+  // shifts network audio uniformly rather than smearing it — loopback_offset_samples is the
+  // existing knob for taking it out.
+  ctl_.anchor.publish(n, mono_ns());
+
+  const unsigned delay = sync_capture_delay();
+
+  // Outputs are routed from the live block, so a passthrough keeps its near-zero latency; the
+  // ring gets the delayed one, so every channel in it shares a single axis. With no delay the
+  // two are literally the same buffer and the whole mechanism disappears.
+  float* ring_block = delay == 0 ? in_all : ring_block_.data();
+
+  if (NetAudioServer* net = net_.load(std::memory_order_relaxed)) {
+    net->read_block(n, frames, delay, in_all, ring_block);
+  } else {
+    for (unsigned c = kInputs; c < kTotalInputs; ++c) {
+      for (size_t i = 0; i < frames; ++i) in_all[i * kTotalInputs + c] = 0.0f;
+      if (ring_block != in_all)
+        for (size_t i = 0; i < frames; ++i) ring_block[i * kTotalInputs + c] = 0.0f;
+    }
+  }
+
   // Input gain lands here, upstream of the ring, so there is one version of the truth: meters,
   // spectrum, THD+N, the scope, listen streams, cross-correlation and anything routed to an
   // output all see the amplified signal. Gaining further downstream (say, only in the listen
@@ -355,18 +384,46 @@ void AudioEngine::process_block(uint64_t n, size_t frames, float* in6, float* ou
   // the envelope columns and the listen stream both convert to int16, and letting a sample past
   // 0 dBFS through would wrap into loud garbage. Clamping instead flat-tops the waveform on the
   // scope and pins the peak meter at 0.0 dBFS.
-  for (unsigned c = 0; c < kInputs; ++c) {
-    const float g = db_to_lin(ctl_.inputs[c].gain_db.load(std::memory_order_relaxed));
+  //
+  // A sender that declared its stream un-mixable is left at unity: no slider, here or in
+  // alsamixer, may touch a reference stimulus.
+  auto input_gain = [this](unsigned c) {
+    const InputControl& in = ctl_.inputs[c];
+    if (in.bypass.load(std::memory_order_relaxed)) return 1.0f;
+    return in.mute.load(std::memory_order_relaxed)
+               ? 0.0f
+               : db_to_lin(in.gain_db.load(std::memory_order_relaxed));
+  };
+
+  for (unsigned c = 0; c < kTotalInputs; ++c) {
+    const float g = input_gain(c);
     if (g == 1.0f) continue;  // unity: the common case, and bit-exact — do not touch the samples
     for (size_t i = 0; i < frames; ++i) {
-      in6[i * kInputs + c] = clampf(g * in6[i * kInputs + c], -1.0f, 1.0f);
+      in_all[i * kTotalInputs + c] = clampf(g * in_all[i * kTotalInputs + c], -1.0f, 1.0f);
     }
   }
 
-  ring_.write(in6, frames);
+  if (delay != 0) {
+    // Local audio reaches the ring through the delay line; the network channels reach it from the
+    // trailing timeline read, which has not been through the gain loop above, so it gets the same
+    // treatment here rather than a second version of the truth.
+    apply_capture_delay(frames, in_all, ring_block);
+    for (unsigned c = kInputs; c < kTotalInputs; ++c) {
+      const float g = input_gain(c);
+      if (g == 1.0f) continue;
+      for (size_t i = 0; i < frames; ++i)
+        ring_block[i * kTotalInputs + c] = clampf(g * ring_block[i * kTotalInputs + c], -1.0f, 1.0f);
+    }
+  }
 
+  ring_.write(ring_block, frames);
+
+  // Outputs play at n, undelayed — but capture is held back by cap_delay_frames_, so a ping
+  // emitted now shows up in the ring that much later. The log records where it will APPEAR, not
+  // where it was emitted, or the scope's ping markers and genie/sync would both aim a full
+  // second wide of the arrival the moment a network channel is in use.
   gen_.render(n, frames, ctl_, gen_sine_.data(), gen_noise_.data(), gen_ping_.data(),
-              ctl_.ping_log);
+              ctl_.ping_log, cap_delay_frames_);
 
   const float* gens[3] = {gen_sine_.data(), gen_noise_.data(), gen_ping_.data()};
 
@@ -384,9 +441,9 @@ void AudioEngine::process_block(uint64_t n, size_t frames, float* in6, float* ou
 
     const float* src = nullptr;
     size_t stride = 1;
-    if (type == SourceType::Input && index < kInputs) {
-      src = in6 + index;
-      stride = kInputs;
+    if (type == SourceType::Input && index < kTotalInputs) {
+      src = in_all + index;
+      stride = kTotalInputs;
     } else if (type == SourceType::Gen && index < static_cast<uint8_t>(GenId::Count)) {
       src = gens[index];
     }
@@ -407,6 +464,39 @@ void AudioEngine::process_block(uint64_t n, size_t frames, float* in6, float* ou
       for (size_t i = 0; i < frames; ++i) out8[i * kOutputs + o] = gain * src[i * stride];
     }
   }
+}
+
+unsigned AudioEngine::sync_capture_delay() {
+  const unsigned want =
+      std::min<unsigned>(ctl_.net.delay_frames.load(std::memory_order_relaxed),
+                         static_cast<unsigned>(cap_delay_len_ ? cap_delay_len_ - 1 : 0));
+  if (want != cap_delay_frames_) {
+    // The capture axis just moved. Anything already frozen was measured against the old one, so
+    // this is a discontinuity in exactly the way an xrun is.
+    std::fill(cap_delay_.begin(), cap_delay_.end(), 0.0f);
+    cap_delay_pos_ = 0;
+    cap_delay_frames_ = want;
+    generation_.fetch_add(1);
+    LOG_INFO("capture delay now {} frames ({:.0f} ms)", want, 1000.0 * want / opt_.rate);
+  }
+  return want;
+}
+
+void AudioEngine::apply_capture_delay(size_t frames, const float* live, float* ring_out) {
+  const unsigned d = cap_delay_frames_;
+  // Read the delayed frames out before pushing the new ones in. That order is what makes this
+  // correct for any delay, including one shorter than a single block.
+  for (size_t i = 0; i < frames; ++i) {
+    const size_t rd = (cap_delay_pos_ + i - d) & cap_delay_mask_;
+    for (unsigned c = 0; c < kInputs; ++c)
+      ring_out[i * kTotalInputs + c] = cap_delay_[rd * kInputs + c];
+  }
+  for (size_t i = 0; i < frames; ++i) {
+    const size_t wr = (cap_delay_pos_ + i) & cap_delay_mask_;
+    for (unsigned c = 0; c < kInputs; ++c)
+      cap_delay_[wr * kInputs + c] = live[i * kTotalInputs + c];
+  }
+  cap_delay_pos_ = (cap_delay_pos_ + frames) & cap_delay_mask_;
 }
 
 void AudioEngine::run_alsa() {
@@ -436,11 +526,11 @@ void AudioEngine::run_alsa() {
     }
     for (unsigned c = 0; c < kInputs; ++c) {
       const int32_t* src = raw_in_.data() + imap[c];
-      float* dst = in6_.data() + c;
-      for (size_t i = 0; i < frames; ++i) dst[i * kInputs] = s32_to_float(src[i * cap_ch]);
+      float* dst = in_.data() + c;
+      for (size_t i = 0; i < frames; ++i) dst[i * kTotalInputs] = s32_to_float(src[i * cap_ch]);
     }
 
-    process_block(n, frames, in6_.data(), out8_.data());
+    process_block(n, frames, in_.data(), out8_.data());
 
     for (unsigned c = 0; c < kOutputs; ++c) {
       const float* src = out8_.data() + c;
@@ -480,11 +570,11 @@ void AudioEngine::run_sim() {
       for (unsigned c = 0; c < kInputs; ++c) {
         const size_t delay = period + static_cast<size_t>(c) * opt_.sim_stagger;
         const size_t pos = (n + i + sim_delay_len_ - delay) % sim_delay_len_;
-        in6_[i * kInputs + c] = sim_delay_[pos * kInputs + c] + 3e-5f * noise();
+        in_[i * kTotalInputs + c] = sim_delay_[pos * kInputs + c] + 3e-5f * noise();
       }
     }
 
-    process_block(n, period, in6_.data(), out8_.data());
+    process_block(n, period, in_.data(), out8_.data());
 
     for (size_t i = 0; i < period; ++i) {
       const size_t pos = (n + i) % sim_delay_len_;
@@ -557,7 +647,22 @@ void AudioEngine::size_buffers() {
   // agreed to something.
   raw_in_.assign(static_cast<size_t>(opt_.period) * cap_ch_.load(std::memory_order_relaxed), 0);
   raw_out_.assign(static_cast<size_t>(opt_.period) * kOutputs, 0);
-  in6_.assign(static_cast<size_t>(opt_.period) * kInputs, 0.0f);
+  in_.assign(static_cast<size_t>(opt_.period) * kTotalInputs, 0.0f);
+  ring_block_.assign(static_cast<size_t>(opt_.period) * kTotalInputs, 0.0f);
+
+  // Sized for the maximum delay plus a block of slack, rounded up to a power of two so the
+  // circular index is a mask rather than a modulo in a per-sample loop.
+  {
+    const size_t want =
+        static_cast<size_t>(kNetDelayMaxMs / 1000.0 * opt_.rate) + opt_.period + 16;
+    size_t p = 1;
+    while (p < want) p <<= 1;
+    cap_delay_len_ = p;
+    cap_delay_mask_ = p - 1;
+    cap_delay_pos_ = 0;
+    cap_delay_frames_ = 0;
+    cap_delay_.assign(cap_delay_len_ * kInputs, 0.0f);
+  }
   out8_.assign(static_cast<size_t>(opt_.period) * kOutputs, 0.0f);
   gen_sine_.assign(opt_.period, 0.0f);
   gen_noise_.assign(opt_.period, 0.0f);

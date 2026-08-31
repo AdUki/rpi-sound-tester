@@ -26,8 +26,8 @@ struct ToneMetrics {
 };
 
 struct EnvColumn {
-  int16_t min[kInputs];
-  int16_t max[kInputs];
+  int16_t min[kTotalInputs];
+  int16_t max[kTotalInputs];
 };
 
 // One min/max column per kEnvColumnFrames of capture, indexed by column number
@@ -68,9 +68,9 @@ class EnvelopeRing {
 
 struct AnalysisSnapshot {
   uint64_t sample = 0;
-  std::array<ChannelMeters, kInputs> meters{};
-  std::array<std::vector<float>, kInputs> spectrum;  // dBFS, kSpectrumBins log-spaced
-  std::array<ToneMetrics, kInputs> tone{};
+  std::array<ChannelMeters, kTotalInputs> meters{};
+  std::array<std::vector<float>, kTotalInputs> spectrum;  // dBFS, kSpectrumBins log-spaced
+  std::array<ToneMetrics, kTotalInputs> tone{};
 };
 
 class Analysis {
@@ -116,8 +116,8 @@ class Analysis {
   std::array<std::pair<unsigned, unsigned>, kSpectrumBins> bin_ranges_{};
   std::array<float, kSpectrumBins> bin_hz_{};  // center frequency of each spectrum bin
 
-  std::array<float, kInputs> peak_hold_{};
-  std::array<uint64_t, kInputs> peak_time_{};
+  std::array<float, kTotalInputs> peak_hold_{};
+  std::array<uint64_t, kTotalInputs> peak_time_{};
 
   std::vector<float> env_buf_;
 };
