@@ -57,10 +57,11 @@ class AudioEngine {
 
   // Wired in by main() before start(): the engine reads its network channels each block.
   void set_net(NetAudioServer* net) { net_.store(net, std::memory_order_relaxed); }
-  // Also before start(): the ring the HDMI pair is handed over through. It is written every block,
-  // HDMI on or off, so its counter stays equal to the capture ring's and an index in it means the
-  // same sample as everywhere else.
+  // Also before start(): the rings the HDMI speakers and the line out's pair are handed over
+  // through. Each is written every block, its sink on or off, so its counter stays equal to the
+  // capture ring's and an index in it means the same sample as everywhere else.
   void set_hdmi_ring(RingBuffer* ring) { hdmi_ring_.store(ring, std::memory_order_relaxed); }
+  void set_lineout_ring(RingBuffer* ring) { lineout_ring_.store(ring, std::memory_order_relaxed); }
   double rate() const { return static_cast<double>(opt_.rate); }
   unsigned period() const { return period_.load(std::memory_order_relaxed); }
   uint64_t identify_frames() const { return identify_frames_; }
@@ -125,6 +126,7 @@ class AudioEngine {
   // channels stay silent.
   std::atomic<NetAudioServer*> net_{nullptr};
   std::atomic<RingBuffer*> hdmi_ring_{nullptr};
+  std::atomic<RingBuffer*> lineout_ring_{nullptr};
 
   // Two views of the same block, on the two axes this device has. `in_` is LIVE — what the card
   // just captured and what the network sender wants heard now — and is what outputs are routed
@@ -139,7 +141,8 @@ class AudioEngine {
   size_t cap_delay_pos_ = 0;
   unsigned cap_delay_frames_ = 0;  // currently in force; a change resets the line
   std::vector<float> out8_;
-  std::vector<float> hdmi_block_;  // kHdmiChannels wide
+  std::vector<float> hdmi_block_;     // kHdmiMaxChannels wide
+  std::vector<float> lineout_block_;  // kLineoutChannels wide
   std::vector<float> gen_sine_, gen_noise_, gen_ping_, gen_music_;
 
   std::vector<float> sim_delay_;

@@ -738,7 +738,7 @@ function sourceValue(src) {
 function setPingVariant(variant) {
   if (state.generators && state.generators.ping) state.generators.ping.variant = variant;
   const val = 'ping:' + variant;
-  // Every sink's Source list, the HDMI pair's included: one generator, one variant.
+  // Every sink's Source list, HDMI's and the line out's included: one generator, one variant.
   document.querySelectorAll('select.outsrc').forEach(el => {
     if (el.value.startsWith('ping:')) el.value = val;
   });
@@ -764,9 +764,10 @@ function optsFor(sel) {
     .join('');
 }
 
-// One card per channel, for any sink that routes like the Octo's DACs: the DACs themselves and
-// the HDMI pair. `p` prefixes every element id so the two sets never collide, and `path` is the
-// REST collection the card talks to (/outputs or /hdmi) — same body, same Identify, same clamps.
+// One card per channel, for any sink that routes like the Octo's DACs: the DACs themselves, HDMI
+// and the line out. `p` prefixes every element id so the sets never collide, and `path` is the
+// REST collection the card talks to (/outputs, /hdmi or /lineout) — same body, same Identify, same
+// clamps.
 function buildOutputCards(el, outs, p, label, path) {
   el.innerHTML = outs.map(o => `
     <div class="card">
@@ -813,44 +814,166 @@ function buildOutputCards(el, outs, p, label, path) {
 
 function buildOutputs() {
   buildOutputCards($('outputs'), state.outputs, '', ch => `OUT ${ch + 1}`, '/outputs');
-  buildHdmi();
+  SOC_SINKS.forEach(buildSoc);
 }
 
-// ---------------------------------------------------------------- HDMI output
+// ---------------------------------------------------------------- HDMI output and line out
 //
-// The Pi's own HDMI audio, as a stereo sink beside the DACs. It plays at the same sample index as
-// every other output, a fixed latency later, so the one thing worth watching here besides "is it
-// playing" is that latency holding still.
+// The Pi's own audio outputs: its HDMI port (mono, stereo, 5.1 or 7.1) and its 3.5 mm jack
+// (stereo). Each plays at the same sample index as every other output, a fixed latency later, so
+// the one thing worth watching here besides "is it playing" is that latency holding still. One set
+// of code for both: `k` is the sink's key in /api/state and the prefix of its element ids, `path`
+// its REST collection, `card` the prefix of its output cards' ids.
+const SOC_SINKS = [
+  {k: 'hdmi', path: '/hdmi', card: 'h', label: 'HDMI', title: 'HDMI output', layouts: true,
+   note: 'Engine to HDMI driver, held constant. The TV or receiver adds its own, also constant — ' +
+     'calibrate it once with a ping through an HDMI audio extractor.'},
+  {k: 'lineout', path: '/lineout', card: 'l', label: 'LINE', title: 'Line out', layouts: false,
+   note: 'Engine to the jack\'s driver, held constant. The firmware adds its own, also ' +
+     'constant — calibrate it once with a ping looped from the jack into an input.'},
+];
 
-function buildHdmi() {
-  const h = state.hdmi;
-  $('hdmisec').hidden = !h;   // an older daemon has no HDMI output
+// Channels are named by speaker. The daemon says which position each routed channel is
+// (`position`); an older one that does not, numbers them.
+const SPEAKERS = {
+  M: 'mono', L: 'left', R: 'right', C: 'centre', LFE: 'subwoofer',
+  Ls: 'surround left', Rs: 'surround right', Lb: 'back left', Rb: 'back right',
+};
+const HDMI_LAYOUT_LABELS = {mono: 'Mono', stereo: 'Stereo (2.0)', '5.1': '5.1', '7.1': '7.1'};
+// The Pi carries more than two HDMI channels only up to 48 kHz; the daemon refuses the rest.
+const SURROUND_MAX_RATE = 48000;
+const isSurround = layout => layout === '5.1' || layout === '7.1';
+const rateLabel = r => (r % 1000 ? (r / 1000).toFixed(1) : String(r / 1000)) + ' kHz';
+// Device names come from the kernel's card names, so they go into markup escaped.
+const esc = t => String(t).replace(/[&<>"]/g,
+  c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'})[c]);
+
+// The devices the pickers offer, read from the daemon (every playback card present but the
+// Octo). Refreshed each time the pickers are built; an older daemon has no list, and then each
+// picker offers just its current device and "Other…".
+let playbackDevices = [];
+function loadPlaybackDevices() {
+  return api('/playback-devices')
+    .then(r => { playbackDevices = r.devices || []; })
+    .catch(() => { playbackDevices = []; });
+}
+
+function buildSocCards(sink, h) {
+  const pos = ch => {
+    const o = h.outputs.find(x => x.ch === ch);
+    return o && o.position ? o.position : null;
+  };
+  const label = ch => {
+    const p = pos(ch);
+    if (!p) return `${sink.label} ${ch + 1}`;
+    return p === 'M' ? `${sink.label} mono`
+      : `${sink.label} ${p} <span class="muted small">${SPEAKERS[p] || ''}</span>`;
+  };
+  buildOutputCards($(sink.k + 'outs'), h.outputs, sink.card, label, sink.path);
+}
+
+function buildSoc(sink) {
+  const h = state[sink.k];
+  const el = id => $(sink.k + id);
+  el('sec').hidden = !h;   // an older daemon has no such output
   if (!h) return;
-  buildOutputCards($('hdmiouts'), h.outputs, 'h', ch => (ch === 0 ? 'HDMI L' : 'HDMI R'), '/hdmi');
-  $('hdmion').checked = !!h.enabled;
-  $('hdmion').onchange = e => put('/hdmi', {enabled: e.target.checked})
-    .then(renderHdmi)
+  buildSocCards(sink, h);
+  el('on').checked = !!h.enabled;
+  el('on').onchange = e => put(sink.path, {enabled: e.target.checked})
+    .then(r => applySoc(sink, r))
     .catch(err => { toast(err.message); e.target.checked = !e.target.checked; });
 
-  $('hdmidev').value = h.device;
-  const rates = (state.limits && state.limits.hdmi_rates) || [44100, 48000, 96000];
-  $('hdmirate').innerHTML = rates.map(r => `<option value="${r}">${r}</option>`).join('');
-  $('hdmirate').value = String(h.sample_rate);
-  $('hdmiapply').onclick = () => {
-    const device = $('hdmidev').value.trim();
-    put('/hdmi', {device, sample_rate: parseInt($('hdmirate').value, 10)})
-      .then(r => { renderHdmi(r); $('hdmimsg').textContent = 'applied — the HDMI output restarts'; })
-      .catch(err => { $('hdmimsg').textContent = err.message; });
+  // Each picker applies as soon as it changes: the sink restarts on its own, the DACs never do.
+  // A refusal puts the picker back to what is actually in force.
+  const apply = body => put(sink.path, body)
+    .then(r => applySoc(sink, r))
+    .catch(err => { toast(err.message); syncSocPickers(sink, state[sink.k]); });
+  el('dev').onchange = e => {
+    let device = e.target.value;
+    if (device === '__other') {
+      const typed = prompt('ALSA device name, e.g. hw:b1,0 or plughw:1,0', state[sink.k].device);
+      device = (typed || '').trim();
+      if (!device) return syncSocPickers(sink, state[sink.k]);
+    }
+    apply({device});
   };
-  renderHdmi(h);
+  el('rate').onchange = e => apply({sample_rate: parseInt(e.target.value, 10)});
+  if (sink.layouts) {
+    el('layout').onchange = e => {
+      const body = {layout: e.target.value};
+      // Surround above 48 kHz is refused, so bring the rate down with it in the same request.
+      if (isSurround(body.layout) && state[sink.k].sample_rate > SURROUND_MAX_RATE) {
+        body.sample_rate = SURROUND_MAX_RATE;
+        toast(`${body.layout} plays at up to 48 kHz: rate set to 48 kHz`);
+      }
+      apply(body);
+    };
+  }
+  syncSocPickers(sink, h);
+  loadPlaybackDevices().then(() => syncSocPickers(sink, state[sink.k]));
+  renderSoc(sink, h);
 }
 
-// Takes either the full status (/api/hdmi, /api/state) or the compact one in the 1 Hz system
+// Fills the device, rate and channel pickers from a full status, leaving alone one the operator
+// has open.
+function syncSocPickers(sink, h) {
+  if (!h) return;
+  const el = id => $(sink.k + id);
+  const idle = x => document.activeElement !== x;
+
+  const dev = el('dev');
+  if (idle(dev)) {
+    const known = playbackDevices.some(d => d.device === h.device);
+    dev.innerHTML = playbackDevices
+      .map(d => `<option value="${esc(d.device)}">${esc(d.name)} (${esc(d.device)})</option>`)
+      .concat(known ? [] : [`<option value="${esc(h.device)}">${esc(h.device)}</option>`])
+      .concat(['<option value="__other">Other…</option>'])
+      .join('');
+    dev.value = h.device;
+  }
+
+  const rate = el('rate');
+  if (idle(rate)) {
+    const rates = (state.limits && state.limits[sink.k + '_rates']) || [44100, 48000, 96000];
+    const cap = sink.layouts && isSurround(h.layout) ? SURROUND_MAX_RATE : Infinity;
+    rate.innerHTML = rates.map(r =>
+      `<option value="${r}"${r > cap ? ' disabled' : ''}>${rateLabel(r)}</option>`).join('');
+    rate.value = String(h.sample_rate);
+  }
+
+  if (sink.layouts) {
+    // An older daemon's HDMI is a fixed stereo pair with no layout to choose.
+    const layouts = (state.limits && state.limits.hdmi_layouts) || [];
+    el('laywrap').hidden = !layouts.length;
+    const lay = el('layout');
+    if (idle(lay)) {
+      lay.innerHTML = layouts
+        .map(l => `<option value="${l}">${HDMI_LAYOUT_LABELS[l] || l}</option>`).join('');
+      if (h.layout) lay.value = h.layout;
+    }
+  }
+}
+
+// Takes a full status with its outputs (PUT or GET on the sink, /api/state). The cards are rebuilt
+// only when the layout changed — possibly from another browser or a script — so a routing the
+// operator is in the middle of changing is not snapped back every five seconds.
+function applySoc(sink, h) {
+  if (!h || !Array.isArray(h.outputs)) return;
+  const was = state[sink.k];
+  const had = was ? was.layout : undefined;
+  const hadN = was && was.outputs ? was.outputs.length : -1;
+  state[sink.k] = h;
+  if (h.layout !== had || h.outputs.length !== hadN) buildSocCards(sink, h);
+  syncSocPickers(sink, h);
+  renderSoc(sink, h);
+}
+
+// Takes either the full status (the sink's GET, /api/state) or the compact one in the 1 Hz system
 // frame; everything it reads is in both.
-function renderHdmi(h) {
-  if (!h || !$('hdmistate')) return;
-  const pill = $('hdmistate'), detail = $('hdmidetail');
-  if (document.activeElement !== $('hdmion')) $('hdmion').checked = !!h.enabled;
+function renderSoc(sink, h) {
+  const pill = $(sink.k + 'state'), detail = $(sink.k + 'detail'), on = $(sink.k + 'on');
+  if (!h || !pill) return;
+  if (document.activeElement !== on) on.checked = !!h.enabled;
   if (!h.enabled) {
     pill.textContent = 'off';
     pill.className = 'pill';
@@ -862,8 +985,7 @@ function renderHdmi(h) {
     const trim = t > 0 ? '+' + t : t < 0 ? String(t) : '0';
     detail.textContent = `latency ${h.latency_ms.toFixed(1)} ms · clock trim ${trim} ppm` +
       ` · xruns ${h.xruns} · resyncs ${h.resyncs}`;
-    detail.title = 'Engine to HDMI driver, held constant. The TV or receiver adds its own, also ' +
-      'constant — calibrate it once with a ping through an HDMI audio extractor.';
+    detail.title = sink.note;
   } else {
     pill.textContent = h.error ? 'no device' : 'starting';
     pill.className = 'pill ' + (h.error ? 'bad' : 'warn');
@@ -2546,12 +2668,13 @@ function buildSystem() {
     ['Saved config', s.has_saved_config ? 'yes (data partition)' : 'no (image defaults)'],
     ['Loopback offset', s.loopback_offset_samples + ' samples'],
   ];
-  const h = state.hdmi;
-  if (h) {
-    rows.push(['HDMI output', !h.enabled ? 'off'
+  SOC_SINKS.forEach(sink => {
+    const h = state[sink.k];
+    if (!h) return;
+    rows.push([sink.title, !h.enabled ? 'off'
       : `${h.device}, ${h.device_rate || h.sample_rate} Hz` +
         (h.playing ? `, latency ${h.latency_ms.toFixed(1)} ms` : h.error ? ` — ${h.error}` : ', starting')]);
-  }
+  });
   if (e.last_error) rows.push(['Last error', e.last_error]);
   $('systable').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
 
@@ -2625,7 +2748,15 @@ function onSystem(s) {
   $('syncbanner').classList.toggle('hidden', !s.sync_errors);
   renderHost(s);
   renderPower(s.throttle);
-  if (s.hdmi) renderHdmi(s.hdmi);
+  SOC_SINKS.forEach(sink => {
+    const h = s[sink.k];
+    if (!h) return;
+    renderSoc(sink, h);
+    // The layout changed somewhere else: fetch the routing for its speakers.
+    if (h.layout && state[sink.k] && h.layout !== state[sink.k].layout) {
+      api(sink.path).then(r => applySoc(sink, r)).catch(() => {});
+    }
+  });
 }
 
 // The single push feed carries every live visual: the waveform envelope, the spectrum, the meters
@@ -2684,10 +2815,7 @@ function pollState() {
     }
     buildSystem();
     syncInputLevels(s2.inputs);
-    if (s2.hdmi) {
-      state.hdmi = s2.hdmi;
-      renderHdmi(s2.hdmi);
-    }
+    SOC_SINKS.forEach(sink => { if (s2[sink.k]) applySoc(sink, s2[sink.k]); });
   }).catch(() => {});
   // Only while the panel is on screen — the same discipline refreshPings() uses, so a background
   // tab costs the daemon nothing.

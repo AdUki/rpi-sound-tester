@@ -19,9 +19,10 @@ This document, rendered to HTML (built from `api.md`). Also served as the static
 ## State
 
 ### `GET /api/state`
-The whole device state in one object: `inputs`, `outputs`, `hdmi`, `generators`, `channel_map`,
-`capture`, `engine`, `system`, and `limits` (slider ranges and feature flags the console reads). Each input and
-output has a `name`, set only in `config.json` — there is no API to change it.
+The whole device state in one object: `inputs`, `outputs`, `hdmi`, `lineout`, `generators`,
+`channel_map`, `capture`, `engine`, `system`, and `limits` (slider ranges and feature flags the
+console reads).
+Each input and output has a `name`, set only in `config.json` — there is no API to change it.
 
 ## Inputs
 
@@ -65,36 +66,73 @@ the request is rejected.
 
 ## HDMI output
 
-The Pi's own HDMI audio, as a stereo sink beside the eight DACs: channel 0 is L, 1 is R. It plays
-the same sources at the same sample index as the DACs, rendered by the same code, so a ping routed
-to HDMI is logged and measured like any other. HDMI runs on the Pi's clock rather than the card's;
-a sample-rate converter follows the drift and holds the path's latency constant.
+The Pi's own HDMI audio, as a mono, stereo, 5.1 or 7.1 sink beside the eight DACs. It plays the
+same sources at the same sample index as the DACs, rendered by the same code, so a ping routed to
+HDMI is logged and measured like any other. HDMI runs on the Pi's clock rather than the card's; a
+sample-rate converter follows the drift and holds the path's latency constant.
 
-### `PUT /api/hdmi/{0-1}` · `POST /api/hdmi/{0-1}/identify`
-Exactly as `PUT /api/outputs/{0-7}` and its identify, for HDMI L and R.
+### `PUT /api/hdmi/{0-7}` · `POST /api/hdmi/{0-7}/identify`
+Exactly as `PUT /api/outputs/{0-7}` and its identify, indexed by **speaker**: 0 L, 1 R, 2 C,
+3 LFE, 4 Ls, 5 Rs (surround; the side pair in 7.1), 6 Lb, 7 Rb (back, 7.1 only). Mono plays
+speaker 0. All eight keep their routing whatever the layout, so L stays L across layouts.
 
 ### `GET /api/hdmi`
 ```json
 {"enabled": true, "open": true, "playing": true, "device": "hw:b1,0", "sample_rate": 48000,
- "device_rate": 48000, "latency_ms": 112.0, "target_ms": 112.0, "ring_ms": 27.4, "alsa_ms": 84.6,
- "trim_ppm": -1.2, "xruns": 0, "underruns": 0, "overruns": 0, "resyncs": 0, "error": "",
- "outputs": [{"ch": 0, "source": {"type": "gen", "index": "music"}, "gain_db": 0, "mute": false}]}
+ "device_rate": 48000, "layout": "stereo", "speakers": 2, "device_channels": 2,
+ "latency_ms": 112.0, "target_ms": 112.0, "ring_ms": 27.4, "alsa_ms": 84.6, "trim_ppm": -1.2,
+ "xruns": 0, "underruns": 0, "overruns": 0, "resyncs": 0, "error": "",
+ "outputs": [{"ch": 0, "position": "L", "slot": 0, "source": {"type": "gen", "index": "music"},
+              "gain_db": 0, "mute": false}]}
 ```
 `latency_ms` is engine to HDMI driver, averaged, and it is held at `target_ms`. It leaves out the
 Pi firmware and the TV or receiver. Both are constant, so measure them once. Route a `tick` to
 HDMI, feed an HDMI audio extractor into an input, and run `genie/sync` against a DAC looped into
 another input. Keep the ping interval at 1 s or more, so each window holds exactly one arrival.
 `resyncs` counts re-anchors; each is a latency step. `error` says why a device will not open.
+`outputs` lists the layout's speakers, each with the PCM `slot` it is sent in.
 
 ### `PUT /api/hdmi`
 ```json
-{"enabled": true, "device": "hw:b1,0", "sample_rate": 48000}
+{"enabled": true, "device": "hw:b1,0", "sample_rate": 48000, "layout": "5.1"}
 ```
-`sample_rate` is 44100, 48000 or 96000. Use 48000 unless you know the sink takes more: the
-driver accepts any rate whether or not the TV can play it. The image names the device `hw:b1,0`
-(`snd_bcm2835.enable_compat_alsa=0`). Without that kernel option it is `hw:ALSA,1`. A new device
-or rate restarts the HDMI output only; the DACs are never touched. HDMI is off by default, and
-`soundtesterd --hdmi-device DEV` turns it on at start.
+`layout` is `mono` | `stereo` | `5.1` | `7.1`. The Pi's HDMI driver tells the sink only a channel
+count, and the sink picks the speakers from it. Only these four counts map to one layout each.
+Four channels, for example, could be quad or 3.1, so it isn't offered. Mono is sent on both L
+and R of a stereo stream (`device_channels` 2). 5.1 and 7.1 need a `sample_rate` of 48000 or
+less: the Pi carries more than two HDMI channels only up to 48 kHz.
+`sample_rate` is 32000, 44100, 48000, 88200, 96000, 176400 or 192000. Use 48000 unless you know
+the sink takes more: the driver accepts any rate whether or not the TV can play it. The image
+names the device `hw:b1,0` (`snd_bcm2835.enable_compat_alsa=0`). Without that kernel option it is
+`hw:ALSA,1`. A new device, rate or layout restarts the HDMI output only; the DACs are never
+touched. HDMI is off by default, and `soundtesterd --hdmi-device DEV` turns it on at start.
+
+### `GET /api/playback-devices`
+```json
+{"devices": [{"device": "hw:b1,0", "card": "b1", "name": "bcm2835 HDMI 1"},
+             {"device": "hw:Headphones,0", "card": "Headphones", "name": "bcm2835 Headphones"}]}
+```
+Every playback device present, except the Octo, which the engine holds open. Any `device` here
+can be given to `PUT /api/hdmi` or `PUT /api/lineout`. Other ALSA names are accepted too.
+
+## Line out
+
+The Pi's own 3.5 mm jack, as a stereo sink. It works exactly like the HDMI output: same sources,
+same sample index, and its own converter holding its own latency constant. It has L and R only
+and no `layout`.
+
+### `PUT /api/lineout/{0-1}` · `POST /api/lineout/{0-1}/identify`
+Exactly as `PUT /api/outputs/{0-7}` and its identify: 0 is L, 1 is R.
+
+### `GET /api/lineout` · `PUT /api/lineout`
+```json
+{"enabled": true, "device": "hw:Headphones,0", "sample_rate": 48000}
+```
+The status has the same fields as `GET /api/hdmi`, with `layout` always `stereo`. A `layout`
+other than `stereo` is rejected. The image names the device `hw:Headphones,0`; without
+`snd_bcm2835.enable_compat_alsa=0` it is `hw:ALSA,0`. `latency_ms` leaves out the firmware, so
+calibrate it once by looping the jack into an input. Off by default;
+`soundtesterd --lineout-device DEV` turns it on at start.
 
 ## Generators
 
@@ -444,7 +482,7 @@ can threshold by frequency directly. `?ch=0..5` for one input; omit for all six.
 | 10 Hz | `{"type":"meters","sample":…,"rms_db":[6],"peak_db":[6]}` |
 | 5 Hz | `{"type":"spectrum","channels":[{"ch":0,"bins":[240],"tone":{…}}]}` |
 | 10 Hz | binary envelope frame (below) |
-| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"cpu_pct":…,"temp_c":…,"hdmi":{…},…}` |
+| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"cpu_pct":…,"temp_c":…,"hdmi":{…},"lineout":{…},…}` |
 
 Spectrum bins are quantised to 0.1 dB on the WS to save bandwidth; the GET gives full float precision.
 
@@ -461,7 +499,7 @@ frame). Global, last-writer-wins; resets to all-on at restart.
 ## System
 
 ### `POST /api/config/save`
-Writes routing (HDMI included), generators and channel map to `/data/config.json` — the only
+Writes routing (HDMI and line out included), generators and channel map to `/data/config.json` — the only
 state that survives a reboot. `/data` is remounted read-write for the write, then back. If `/data` did not mount the save
 is refused (`data_persistent: false` in `/api/state`).
 

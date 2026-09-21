@@ -161,7 +161,7 @@ inline constexpr double kNetResyncFrames = 0.25 * kDefaultRate;
 // How quickly a converter's ratio trim closes a residual offset, and how far it may stray from
 // nominal. 0.2% is far more than two crystals can differ by, and small enough that the audio does
 // not audibly change pitch while it is being applied. Shared by every clock this device has to
-// follow: a network sender's and the HDMI output's.
+// follow: a network sender's, and the HDMI and line outputs'.
 inline constexpr double kAsrcTauS = 5.0;
 inline constexpr double kAsrcTrimMax = 0.002;
 
@@ -172,46 +172,60 @@ inline constexpr unsigned kNetMaxPacketFrames = 4096;
 
 static_assert(kDefaultRate == ST_DEFAULT_RATE, "the plugin's default rate must match the card's");
 
-// ---- HDMI output ---------------------------------------------------------------------------
+// ---- The SoC's own outputs: HDMI and the line out -------------------------------------------
 //
-// A second, stereo sink on the Pi's own HDMI audio (the firmware snd_bcm2835 driver). It plays the
-// same buses and routed inputs as the Octo's DACs, rendered by the audio thread at the same n and
-// handed to a thread of its own through a ring. HDMI runs on the Pi's clock, not the Octo's FPGA,
-// so that thread follows the card with a trimmed sample-rate converter, as a network input does.
-inline constexpr unsigned kHdmiChannels = 2;
+// Two more sinks on the Pi's own audio (the firmware snd_bcm2835 driver): its HDMI port and its
+// 3.5 mm jack. Each plays the same buses and routed inputs as the Octo's DACs, rendered by the
+// audio thread at the same n and handed to a thread of its own through a ring. Both run on the
+// Pi's clock, not the Octo's FPGA, so that thread follows the card with a trimmed sample-rate
+// converter, as a network input does. Everything below is shared by the two.
+//
+// HDMI takes up to 8 channels, in the speaker layouts of hdmi_layout.h. Eight is a hard ceiling
+// twice over: it is all HDMI carries as plain PCM (7.1), and it is the firmware driver's
+// channels_max. Its ring and routing are always 8 wide, so a change of layout only reopens the
+// HDMI PCM; the audio thread renders the speakers in play into their PCM slots and zeroes the rest.
+inline constexpr unsigned kHdmiMaxChannels = 8;
+// The jack is stereo and nothing else.
+inline constexpr unsigned kLineoutChannels = 2;
 
-// The rate the HDMI PCM is opened at. 48 kHz because every HDMI sink must accept it: the
+// The rate each PCM is opened at. 48 kHz by default because every HDMI sink must accept it: the
 // firmware driver advertises anything up to 192 kHz whatever the TV can actually play, so asking
-// for the card's own 96 kHz would "succeed" and then be resampled or dropped out of sight.
-inline constexpr unsigned kHdmiRateDefault = 48000;
-inline constexpr bool hdmi_rate_ok(unsigned r) { return r == 44100 || r == 48000 || r == 96000; }
+// for more "succeeds" even when the sink then resamples or drops it out of sight. The choices are
+// HDMI's own audio rates; the converter takes the engine's rate to any of them.
+inline constexpr unsigned kSocRateDefault = 48000;
+inline constexpr unsigned kSocRates[] = {32000, 44100, 48000, 88200, 96000, 176400, 192000};
+inline constexpr bool soc_rate_ok(unsigned r) {
+  for (unsigned x : kSocRates)
+    if (x == r) return true;
+  return false;
+}
 
-// Handoff ring, in engine frames: 2^16 is 0.68 s at 96 kHz and 512 kB pinned. The reader sits a
-// few periods behind the writer, so this only has to outlast a stall of the HDMI thread.
-inline constexpr size_t kHdmiRingFrames = 1u << 16;
+// Handoff ring, in engine frames: 2^16 is 0.68 s at 96 kHz, 2 MB pinned at HDMI's 8 channels. The
+// reader sits a few periods behind the writer, so this only has to outlast a stall of its thread.
+inline constexpr size_t kSocRingFrames = 1u << 16;
 
-// The HDMI PCM's own buffering. The firmware driver reports its position in coarse steps, so
-// generous periods are worth more than a few milliseconds of latency: what a delay measurement
-// needs is for the latency to be constant, not small.
-inline constexpr unsigned kHdmiPeriodMs = 20;
-inline constexpr unsigned kHdmiPeriods = 4;
+// The PCM's own buffering. The firmware driver reports its position in coarse steps, so generous
+// periods are worth more than a few milliseconds of latency: what a delay measurement needs is for
+// the latency to be constant, not small.
+inline constexpr unsigned kSocPeriodMs = 20;
+inline constexpr unsigned kSocPeriods = 4;
 
-// How far behind the card's current sample the HDMI reader aims, in engine periods, on top of
-// the HDMI buffer itself. The engine publishes a whole period at a time, so the reader needs at
-// least one period of slack to never find its next chunk not yet written; three leaves room for
+// How far behind the card's current sample the reader aims, in engine periods, on top of the
+// PCM's buffer itself. The engine publishes a whole period at a time, so the reader needs at least
+// one period of slack to never find its next chunk not yet written; three leaves room for
 // scheduling jitter.
-inline constexpr unsigned kHdmiRingLagPeriods = 3;
+inline constexpr unsigned kSocRingLagPeriods = 3;
 
 // Past this much latency error the output is re-anchored rather than walked back by the trim.
-inline constexpr double kHdmiResyncS = 0.05;
+inline constexpr double kSocResyncS = 0.05;
 
 // How long after an anchor the latency readings are ignored. A driver that has just started
 // reports its queue in a transient way for the first few periods — measured under PipeWire at
 // 70 ms short — and letting that prime the filter trips a resync against nothing.
-inline constexpr double kHdmiSettleS = 0.5;
+inline constexpr double kSocSettleS = 0.5;
 
-// Below the audio thread (80): an HDMI hiccup must never cost the Octo a block.
-inline constexpr int kHdmiRtPriority = 60;
+// Below the audio thread (80): a hiccup on either must never cost the Octo a block.
+inline constexpr int kSocRtPriority = 60;
 
 // "Genie" convenience helpers (GET /api/genie/sound, GET /api/genie/sync).
 inline constexpr float kGenieSoundThresholdDb = -60.0f;  // peak_db above this reads as "sound"

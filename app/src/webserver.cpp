@@ -71,7 +71,7 @@ auto json_route(Fn fn) {
 // json_route for the per-channel routes: the 404 for a bad channel must win over the 400 for
 // a bad body, so the index check runs before the body is parsed.
 template <class Fn>
-auto json_channel_route(const char* name, unsigned limit, const char* missing, Fn fn) {
+auto json_channel_route(const char* name, unsigned limit, std::string missing, Fn fn) {
   return [=](const httplib::Request& req, httplib::Response& res) {
     unsigned ch = 0;
     if (!parse_index(req, name, limit, &ch)) return send_error(res, 404, missing);
@@ -109,7 +109,7 @@ int effective_kbps(const BitrateOverride& b, const Control& ctl) {
   return b.fixed ? b.kbps : ctl.listen.bitrate_kbps.load();
 }
 
-// One output's state and its PUT body, shared by the Octo's outputs and the HDMI pair so the two
+// One output's state and its PUT body, shared by the Octo's outputs, HDMI and the line out so all
 // routes accept exactly the same sources and clamp exactly alike.
 json output_json(const OutputControl& oc, unsigned ch, const std::string& name) {
   const uint32_t packed = oc.source.load();
@@ -164,13 +164,16 @@ bool apply_output_put(OutputControl& oc, const json& j, httplib::Response& res) 
   return true;
 }
 
-json hdmi_status_json(const HdmiStatus& h) {
+json soc_status_json(const SocStatus& h) {
   return {{"enabled", h.enabled},
           {"open", h.open},
           {"playing", h.playing},
           {"device", h.device},
           {"sample_rate", h.sample_rate},
           {"device_rate", h.device_rate},
+          {"layout", hdmi_layout_name(h.layout)},
+          {"speakers", h.speakers},
+          {"device_channels", h.device_channels},
           {"period_frames", h.period_frames},
           {"buffer_frames", h.buffer_frames},
           {"latency_ms", h.latency_ms},
@@ -183,6 +186,70 @@ json hdmi_status_json(const HdmiStatus& h) {
           {"overruns", h.overruns},
           {"resyncs", h.resyncs},
           {"error", h.error}};
+}
+
+// The compact form the 1 Hz WS system frame carries.
+json soc_brief_json(const SocStatus& h) {
+  return {{"enabled", h.enabled},
+          {"playing", h.playing},
+          {"layout", hdmi_layout_name(h.layout)},
+          {"latency_ms", h.latency_ms},
+          {"trim_ppm", h.trim_ppm},
+          {"xruns", h.xruns},
+          {"resyncs", h.resyncs},
+          {"error", h.error}};
+}
+
+// A sink's status plus the routing of its layout's speakers, each with its position and the PCM
+// slot it is sent in. HDMI's other speakers keep their routing and get it back when a layout that
+// has them is chosen again, but they are not listed: nothing plays them.
+json soc_json(const SocStatus& h, const OutputControl* outs,
+              const std::vector<std::string>& names) {
+  json j = soc_status_json(h);
+  const HdmiLayoutInfo& lay = hdmi_layout_info(h.layout);
+  j["outputs"] = json::array();
+  for (unsigned s = 0; s < lay.speakers; ++s) {
+    json o = output_json(outs[s], s, s < names.size() ? names[s] : "");
+    o["position"] = hdmi_speaker_name(h.layout, s);
+    o["slot"] = lay.slot[s];
+    j["outputs"].push_back(o);
+  }
+  return j;
+}
+
+json soc_rates_json() {
+  json a = json::array();
+  for (unsigned r : kSocRates) a.push_back(r);
+  return a;
+}
+
+// "32000, 44100, ... or 192000", for the 400 a bad sample_rate gets.
+std::string soc_rates_text() {
+  std::string t;
+  const size_t n = sizeof(kSocRates) / sizeof(kSocRates[0]);
+  for (size_t i = 0; i < n; ++i) {
+    if (i) t += i + 1 == n ? " or " : ", ";
+    t += std::to_string(kSocRates[i]);
+  }
+  return t;
+}
+
+// The card an ALSA device name opens, for "hw:ID,DEV" and "plughw:ID,DEV"; empty for anything else.
+std::string alsa_card_of(const std::string& device) {
+  for (const char* prefix : {"hw:", "plughw:"}) {
+    const std::string p = prefix;
+    if (device.compare(0, p.size(), p) == 0) {
+      const std::string rest = device.substr(p.size());
+      return rest.substr(0, rest.find(','));
+    }
+  }
+  return {};
+}
+
+json hdmi_layouts_json() {
+  json a = json::array();
+  for (const HdmiLayoutInfo& l : kHdmiLayouts) a.push_back(l.name);
+  return a;
 }
 
 json meters_json(const AnalysisSnapshot& s) {
@@ -324,13 +391,14 @@ void WebServer::install_routes() {
       si = sys_;
     }
     // Copies, because a concurrent /api/config/save may replace d_.config.
-    std::vector<std::string> in_names, out_names, hdmi_names;
+    std::vector<std::string> in_names, out_names, hdmi_names, lineout_names;
     int64_t loopback_offset = 0;
     {
       std::lock_guard<std::mutex> lk(config_m_);
       in_names = d_.config.input_names;
       out_names = d_.config.output_names;
-      hdmi_names = d_.config.hdmi_names;
+      hdmi_names = d_.config.hdmi.names;
+      lineout_names = d_.config.lineout.names;
       loopback_offset = d_.config.loopback_offset_samples;
     }
 
@@ -347,10 +415,6 @@ void WebServer::install_routes() {
     for (unsigned i = 0; i < kOutputs; ++i)
       outs.push_back(output_json(d_.ctl.outputs[i], i, out_names[i]));
 
-    json hdmi = hdmi_status_json(d_.hdmi.status());
-    hdmi["outputs"] = json::array();
-    for (unsigned i = 0; i < kHdmiChannels; ++i)
-      hdmi["outputs"].push_back(output_json(d_.ctl.hdmi_outputs[i], i, hdmi_names[i]));
 
     // A network channel with no name in config.json takes the sender's: the dashboard card then
     // reads "NET 1 — thinkpad.local" with nothing to configure, which is the whole point of
@@ -393,7 +457,8 @@ void WebServer::install_routes() {
     json j{
         {"inputs", ins},
         {"outputs", outs},
-        {"hdmi", hdmi},
+        {"hdmi", soc_json(d_.hdmi.status(), d_.ctl.hdmi_outputs.data(), hdmi_names)},
+        {"lineout", soc_json(d_.lineout.status(), d_.ctl.lineout_outputs.data(), lineout_names)},
         {"generators",
          {{"sine", {{"freq_hz", d_.ctl.sine.freq_hz.load()}, {"level_db", d_.ctl.sine.level_db.load()}}},
           {"noise",
@@ -445,10 +510,13 @@ void WebServer::install_routes() {
           {"net_delay_max_ms", kNetDelayMaxMs},
           {"net", true},
           {"hdmi", true},
-          {"hdmi_rates", json::array({44100, 48000, 96000})},
-          {"pinned_mb",
-           (d_.ring.pinned_bytes() + d_.capture.pinned_bytes() + d_.hdmi.pinned_bytes()) /
-               (1024 * 1024)}}},
+          {"hdmi_rates", soc_rates_json()},
+          {"hdmi_layouts", hdmi_layouts_json()},
+          {"lineout", true},
+          {"lineout_rates", soc_rates_json()},
+          {"pinned_mb", (d_.ring.pinned_bytes() + d_.capture.pinned_bytes() +
+                         d_.hdmi.pinned_bytes() + d_.lineout.pinned_bytes()) /
+                            (1024 * 1024)}}},
     };
     send_json(res, j);
   });
@@ -545,74 +613,114 @@ void WebServer::install_routes() {
     send_json(res, json{{"ok", true}});
   });
 
-  // ---- HDMI output ------------------------------------------------------------------------
+  // ---- The SoC's own outputs: HDMI and the line out ------------------------------------------
   //
-  // L and R route exactly like the Octo's outputs — same sources, same clamps, same Identify —
-  // and play at the same n. Only the link itself (on/off, device, rate) is configured here.
-  svr.Get("/api/hdmi", [this](const httplib::Request&, httplib::Response& res) {
-    json j = hdmi_status_json(d_.hdmi.status());
-    std::vector<std::string> names;
-    {
+  // Every channel routes exactly like the Octo's outputs — same sources, same clamps, same
+  // Identify — and plays at the same n. Only the link itself (on/off, device, rate, and for HDMI
+  // how many channels) is configured here. One set of routes, installed once per sink.
+  auto install_soc = [this, &svr](const std::string& base, SocOutput* out, SocControl* sc,
+                                  OutputControl* outs, SocConfig Config::*cfg, bool layouts,
+                                  const std::string& label) {
+    const unsigned width = out->sink().width;
+    auto names = [this, cfg] {
       std::lock_guard<std::mutex> lk(config_m_);
-      names = d_.config.hdmi_names;
+      return (d_.config.*cfg).names;
+    };
+    svr.Get(base, [out, outs, names](const httplib::Request&, httplib::Response& res) {
+      send_json(res, soc_json(out->status(), outs, names()));
+    });
+
+    // Body: {"enabled": bool, "device": "hw:b1,0", "sample_rate": 48000, "layout": "5.1"}. A new
+    // device, rate or layout restarts the sink's thread; the Octo is not touched either way.
+    svr.Put(base, json_route([this, out, sc, outs, cfg, layouts, label, width, names](
+                                 const json& j, const httplib::Request&, httplib::Response& res) {
+      // Everything is checked before anything is applied, so a rejected body changes nothing.
+      std::string device = out->device();
+      unsigned sample_rate = out->sample_rate();
+      const HdmiLayout layout_was = soc_layout(*sc, width);
+      HdmiLayout layout = layout_was;
+      if (j.contains("device")) {
+        device = j["device"].get<std::string>();
+        if (device.empty()) return send_error(res, 400, "device must not be empty");
+      }
+      if (j.contains("sample_rate")) {
+        sample_rate = j["sample_rate"].get<unsigned>();
+        if (!soc_rate_ok(sample_rate)) {
+          return send_error(res, 400, "sample_rate must be " + soc_rates_text());
+        }
+      }
+      if (j.contains("layout")) {
+        const bool known = parse_hdmi_layout(j["layout"].get<std::string>(), &layout);
+        if (!layouts && (!known || layout != HdmiLayout::Stereo)) {
+          return send_error(res, 400, "the " + label + " is stereo only");
+        }
+        if (!known) return send_error(res, 400, "layout must be mono, stereo, 5.1 or 7.1");
+      }
+      if (!hdmi_layout_rate_ok(layout, sample_rate)) {
+        return send_error(res, 400, std::string(hdmi_layout_name(layout)) +
+                                        " needs a sample_rate of 48000 or less: the Pi carries "
+                                        "more than two HDMI channels only up to 48 kHz");
+      }
+
+      // Stored before any restart, so one reopen picks up everything in this request.
+      sc->layout.store(static_cast<uint8_t>(layout));
+      if (device != out->device() || sample_rate != out->sample_rate()) {
+        out->configure(device, sample_rate);
+        // Not live state, so it rides the config rather than Control; a later save keeps it.
+        std::lock_guard<std::mutex> lk(config_m_);
+        (d_.config.*cfg).device = device;
+        (d_.config.*cfg).sample_rate = sample_rate;
+      } else if (layout != layout_was) {
+        out->restart();
+      }
+      if (j.contains("enabled")) {
+        const bool on = j["enabled"].get<bool>();
+        // The audio thread starts rendering the channels before the sink's thread goes looking
+        // for them, and stops only after that thread is gone.
+        if (on) {
+          sc->enabled.store(true);
+          out->start();
+        } else {
+          out->stop();
+          sc->enabled.store(false);
+        }
+      }
+      send_json(res, soc_json(out->status(), outs, names()));
+    }));
+
+    // Indexed by speaker: HDMI's are 0 L, 1 R, 2 C, 3 LFE, 4 Ls, 5 Rs, 6 Lb, 7 Rb, the line out's
+    // 0 L and 1 R. Any of them takes a route, played or not, so a layout can be set up before it
+    // is switched on.
+    const std::string missing = "no such " + label + " channel";
+    svr.Put(base + "/:ch", json_channel_route("ch", width, missing,
+        [outs](unsigned ch, const json& j, const httplib::Request&, httplib::Response& res) {
+      apply_output_put(outs[ch], j, res);
+    }));
+
+    svr.Post(base + "/:ch/identify",
+             [this, outs, width, missing](const httplib::Request& req, httplib::Response& res) {
+      unsigned ch = 0;
+      if (!parse_index(req, "ch", width, &ch)) return send_error(res, 404, missing);
+      outs[ch].identify_until.store(d_.ring.counter() + d_.engine.identify_frames());
+      send_json(res, json{{"ok", true}});
+    });
+  };
+  // What the device pickers offer: every playback device present but the Octo, which the engine
+  // holds open for good and which would only ever answer "busy".
+  svr.Get("/api/playback-devices", [this](const httplib::Request&, httplib::Response& res) {
+    const std::string engine_card = alsa_card_of(d_.engine.stats().device);
+    json a = json::array();
+    for (const PlaybackDevice& p : list_playback_devices()) {
+      if (!engine_card.empty() && p.card == engine_card) continue;
+      a.push_back({{"device", p.device}, {"card", p.card}, {"name", p.name}});
     }
-    j["outputs"] = json::array();
-    for (unsigned i = 0; i < kHdmiChannels; ++i)
-      j["outputs"].push_back(output_json(d_.ctl.hdmi_outputs[i], i, names[i]));
-    send_json(res, j);
+    send_json(res, json{{"devices", a}});
   });
 
-  // Body: {"enabled": bool, "device": "hw:b1,0", "sample_rate": 48000}. A new device or rate
-  // restarts the HDMI thread; the Octo is not touched either way.
-  svr.Put("/api/hdmi", json_route([this](const json& j, const httplib::Request&,
-                                         httplib::Response& res) {
-    std::string device = d_.hdmi.device();
-    unsigned sample_rate = d_.hdmi.sample_rate();
-    if (j.contains("device")) {
-      device = j["device"].get<std::string>();
-      if (device.empty()) return send_error(res, 400, "device must not be empty");
-    }
-    if (j.contains("sample_rate")) {
-      sample_rate = j["sample_rate"].get<unsigned>();
-      if (!hdmi_rate_ok(sample_rate)) {
-        return send_error(res, 400, "sample_rate must be 44100, 48000 or 96000");
-      }
-    }
-    if (device != d_.hdmi.device() || sample_rate != d_.hdmi.sample_rate()) {
-      d_.hdmi.configure(device, sample_rate);
-      // Not live state, so it rides the config rather than Control; a later save keeps it.
-      std::lock_guard<std::mutex> lk(config_m_);
-      d_.config.hdmi_device = device;
-      d_.config.hdmi_sample_rate = sample_rate;
-    }
-    if (j.contains("enabled")) {
-      const bool on = j["enabled"].get<bool>();
-      // The audio thread starts rendering the pair before the HDMI thread goes looking for it, and
-      // stops only after that thread is gone.
-      if (on) {
-        d_.ctl.hdmi.enabled.store(true);
-        d_.hdmi.start();
-      } else {
-        d_.hdmi.stop();
-        d_.ctl.hdmi.enabled.store(false);
-      }
-    }
-    send_json(res, hdmi_status_json(d_.hdmi.status()));
-  }));
-
-  svr.Put("/api/hdmi/:ch", json_channel_route("ch", kHdmiChannels, "no such HDMI channel",
-      [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response& res) {
-    apply_output_put(d_.ctl.hdmi_outputs[ch], j, res);
-  }));
-
-  svr.Post("/api/hdmi/:ch/identify", [this](const httplib::Request& req, httplib::Response& res) {
-    unsigned ch = 0;
-    if (!parse_index(req, "ch", kHdmiChannels, &ch)) {
-      return send_error(res, 404, "no such HDMI channel");
-    }
-    d_.ctl.hdmi_outputs[ch].identify_until.store(d_.ring.counter() + d_.engine.identify_frames());
-    send_json(res, json{{"ok", true}});
-  });
+  install_soc("/api/hdmi", &d_.hdmi, &d_.ctl.hdmi, d_.ctl.hdmi_outputs.data(), &Config::hdmi,
+              true, "HDMI");
+  install_soc("/api/lineout", &d_.lineout, &d_.ctl.lineout, d_.ctl.lineout_outputs.data(),
+              &Config::lineout, false, "line out");
 
   svr.Put("/api/generators/sine", json_route([this](const json& j, const httplib::Request&,
                                                     httplib::Response&) {
@@ -1334,14 +1442,8 @@ void WebServer::run_publisher() {
                {"sync_errors", d_.kmsg.sync_errors()},
                {"listen_streams", listen_streams_.load()},
                {"engine_running", es.running}};
-        const HdmiStatus hs = d_.hdmi.status();
-        j["hdmi"] = {{"enabled", hs.enabled},
-                     {"playing", hs.playing},
-                     {"latency_ms", hs.latency_ms},
-                     {"trim_ppm", hs.trim_ppm},
-                     {"xruns", hs.xruns},
-                     {"resyncs", hs.resyncs},
-                     {"error", hs.error}};
+        j["hdmi"] = soc_brief_json(d_.hdmi.status());
+        j["lineout"] = soc_brief_json(d_.lineout.status());
         j.update(sysinfo_json(si));
         hub_.publish(std::make_shared<WsMessage>(WsMessage{j.dump(), false}));
       }

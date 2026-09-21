@@ -229,46 +229,56 @@ void test_net_port_rides_the_control_path() {
 // The HDMI block rides the same file and the same Config<->Control path as everything else.
 void test_hdmi_round_trip() {
   Config a;
-  a.hdmi_enabled = true;
-  a.hdmi_device = "hw:ALSA,1";
-  a.hdmi_sample_rate = 44100;
-  a.hdmi_outputs[0].source_type = "gen";
-  a.hdmi_outputs[0].source_index = "music";
-  a.hdmi_outputs[0].gain_db = -3.0f;
-  a.hdmi_outputs[1].source_type = "input";
-  a.hdmi_outputs[1].source_index = "7";
-  a.hdmi_outputs[1].mute = true;
-  a.hdmi_names[1] = "tv right";
+  a.hdmi.enabled = true;
+  a.hdmi.device = "hw:ALSA,1";
+  a.hdmi.sample_rate = 44100;
+  a.hdmi.layout = "5.1";
+  a.hdmi.outputs[5].source_type = "gen";
+  a.hdmi.outputs[5].source_index = "ping";
+  a.hdmi.outputs[0].source_type = "gen";
+  a.hdmi.outputs[0].source_index = "music";
+  a.hdmi.outputs[0].gain_db = -3.0f;
+  a.hdmi.outputs[1].source_type = "input";
+  a.hdmi.outputs[1].source_index = "7";
+  a.hdmi.outputs[1].mute = true;
+  a.hdmi.names[1] = "tv right";
 
   Config b;
   std::string err;
   CHECK(Config::from_json(a.to_json(), &b, &err));
-  CHECK(b.hdmi_enabled);
-  CHECK_EQ(b.hdmi_device, std::string("hw:ALSA,1"));
-  CHECK_EQ(b.hdmi_sample_rate, 44100u);
-  CHECK_EQ(b.hdmi_outputs[0].source_index, std::string("music"));
-  CHECK_EQ(b.hdmi_outputs[0].gain_db, -3.0f);
-  CHECK_EQ(b.hdmi_outputs[1].source_type, std::string("input"));
-  CHECK_EQ(b.hdmi_outputs[1].source_index, std::string("7"));
-  CHECK(b.hdmi_outputs[1].mute);
-  CHECK_EQ(b.hdmi_names[1], std::string("tv right"));
+  CHECK(b.hdmi.enabled);
+  CHECK_EQ(b.hdmi.device, std::string("hw:ALSA,1"));
+  CHECK_EQ(b.hdmi.sample_rate, 44100u);
+  CHECK_EQ(b.hdmi.layout, std::string("5.1"));
+  CHECK_EQ(b.hdmi.outputs[5].source_index, std::string("ping"));
+  CHECK_EQ(b.hdmi.outputs[0].source_index, std::string("music"));
+  CHECK_EQ(b.hdmi.outputs[0].gain_db, -3.0f);
+  CHECK_EQ(b.hdmi.outputs[1].source_type, std::string("input"));
+  CHECK_EQ(b.hdmi.outputs[1].source_index, std::string("7"));
+  CHECK(b.hdmi.outputs[1].mute);
+  CHECK_EQ(b.hdmi.names[1], std::string("tv right"));
 
   Control ctl;
   b.apply_to(ctl);
   CHECK(ctl.hdmi.enabled.load());
+  CHECK_EQ(soc_layout(ctl.hdmi, kHdmiMaxChannels), HdmiLayout::S51);
+  CHECK_EQ(source_index(ctl.hdmi_outputs[5].source.load()), static_cast<uint8_t>(GenId::Ping));
   CHECK_EQ(source_type(ctl.hdmi_outputs[0].source.load()), SourceType::Gen);
   CHECK_EQ(source_index(ctl.hdmi_outputs[0].source.load()), static_cast<uint8_t>(GenId::Music));
   CHECK_EQ(source_index(ctl.hdmi_outputs[1].source.load()), 7);
-  // The Octo's outputs are untouched by the HDMI pair.
+  // The Octo's outputs and the line out are untouched by HDMI.
+  CHECK_EQ(source_type(ctl.lineout_outputs[1].source.load()), SourceType::Silence);
   CHECK_EQ(source_type(ctl.outputs[0].source.load()), SourceType::Silence);
 
   ctl.hdmi.enabled.store(false);
+  ctl.hdmi.layout.store(static_cast<uint8_t>(HdmiLayout::S71));
   ctl.hdmi_outputs[1].gain_db.store(-12.0f);
   const Config c = Config::from_control(ctl, b);
-  CHECK(!c.hdmi_enabled);
-  CHECK_EQ(c.hdmi_outputs[1].gain_db, -12.0f);
-  CHECK_EQ(c.hdmi_outputs[0].source_index, std::string("music"));
-  CHECK_EQ(c.hdmi_device, std::string("hw:ALSA,1"));  // not live: carried over from the base
+  CHECK(!c.hdmi.enabled);
+  CHECK_EQ(c.hdmi.layout, std::string("7.1"));
+  CHECK_EQ(c.hdmi.outputs[1].gain_db, -12.0f);
+  CHECK_EQ(c.hdmi.outputs[0].source_index, std::string("music"));
+  CHECK_EQ(c.hdmi.device, std::string("hw:ALSA,1"));  // not live: carried over from the base
 }
 
 // A config written before HDMI existed must load with HDMI off, and a rate the HDMI path cannot
@@ -277,21 +287,106 @@ void test_hdmi_defaults_and_bad_values() {
   Config c;
   std::string err;
   CHECK(Config::from_json(R"({"rate": 96000})", &c, &err));
-  CHECK(!c.hdmi_enabled);
-  CHECK_EQ(c.hdmi_device, std::string("hw:b1,0"));
-  CHECK_EQ(c.hdmi_sample_rate, kHdmiRateDefault);
-  CHECK_EQ(c.hdmi_names.size(), static_cast<size_t>(kHdmiChannels));
+  CHECK(!c.hdmi.enabled);
+  CHECK_EQ(c.hdmi.device, std::string("hw:b1,0"));
+  CHECK_EQ(c.hdmi.sample_rate, kSocRateDefault);
+  CHECK_EQ(c.hdmi.names.size(), static_cast<size_t>(kHdmiMaxChannels));
+  CHECK_EQ(c.hdmi.layout, std::string("stereo"));
 
   CHECK(Config::from_json(R"({"hdmi": {"sample_rate": 22050,
       "outputs": [{"source": {"type": "gen", "index": "nope"}, "gain_db": 12.0}]}})", &c, &err));
-  CHECK_EQ(c.hdmi_sample_rate, kHdmiRateDefault);
+  CHECK_EQ(c.hdmi.sample_rate, kSocRateDefault);
   Control ctl;
+  c.apply_to(ctl);
+
+  // A layout that does not exist is stereo, and surround asked for at a rate the Pi cannot carry
+  // it at comes back at 48 kHz rather than reaching the firmware.
+  Config odd;
+  CHECK(Config::from_json(R"({"hdmi": {"layout": "5"}})", &odd, &err));
+  CHECK_EQ(odd.hdmi.layout, std::string("stereo"));
+  CHECK(Config::from_json(R"({"hdmi": {"layout": "7.1", "sample_rate": 96000}})", &odd, &err));
+  CHECK_EQ(odd.hdmi.layout, std::string("7.1"));
+  CHECK_EQ(odd.hdmi.sample_rate, 48000u);
+  CHECK(Config::from_json(R"({"hdmi": {"layout": "stereo", "sample_rate": 96000}})", &odd, &err));
+  CHECK_EQ(odd.hdmi.sample_rate, 96000u);
+  // Every HDMI audio rate is offered for stereo, and only those.
+  CHECK(Config::from_json(R"({"hdmi": {"layout": "stereo", "sample_rate": 192000}})", &odd, &err));
+  CHECK_EQ(odd.hdmi.sample_rate, 192000u);
+  CHECK(Config::from_json(R"({"hdmi": {"layout": "5.1", "sample_rate": 32000}})", &odd, &err));
+  CHECK_EQ(odd.hdmi.sample_rate, 32000u);
+  CHECK(Config::from_json(R"({"hdmi": {"layout": "5.1", "sample_rate": 88200}})", &odd, &err));
+  CHECK_EQ(odd.hdmi.sample_rate, 48000u);
+  for (unsigned r : {32000u, 44100u, 48000u, 88200u, 96000u, 176400u, 192000u})
+    CHECK(soc_rate_ok(r));
+  for (unsigned r : {0u, 8000u, 22050u, 64000u, 384000u}) CHECK(!soc_rate_ok(r));
+  odd.hdmi.layout = "bogus";
+  odd.apply_to(ctl);
+  CHECK_EQ(soc_layout(ctl.hdmi, kHdmiMaxChannels), HdmiLayout::Stereo);
   c.apply_to(ctl);
   CHECK_EQ(source_type(ctl.hdmi_outputs[0].source.load()), SourceType::Silence);
   CHECK_EQ(ctl.hdmi_outputs[0].gain_db.load(), kLevelMaxDb);
 
   // The shipped defaults parse, and ship HDMI off.
-  CHECK(!Config{}.hdmi_enabled);
+  CHECK(!Config{}.hdmi.enabled);
+}
+
+// The line out rides the same file and path as HDMI, but has no layout: it is stereo whatever a
+// file or a stray control value says, and the file does not carry one.
+void test_lineout_round_trip() {
+  Config a;
+  a.lineout.enabled = true;
+  a.lineout.device = "hw:ALSA,0";
+  a.lineout.sample_rate = 44100;
+  a.lineout.outputs[0].source_type = "gen";
+  a.lineout.outputs[0].source_index = "music";
+  a.lineout.outputs[1].source_type = "input";
+  a.lineout.outputs[1].source_index = "3";
+  a.lineout.outputs[1].gain_db = -6.0f;
+  a.lineout.names[0] = "desk left";
+
+  const std::string text = a.to_json();
+  CHECK(text.find("\"lineout\"") != std::string::npos);
+  Config b;
+  std::string err;
+  CHECK(Config::from_json(text, &b, &err));
+  CHECK(b.lineout.enabled);
+  CHECK_EQ(b.lineout.device, std::string("hw:ALSA,0"));
+  CHECK_EQ(b.lineout.sample_rate, 44100u);
+  CHECK_EQ(b.lineout.outputs.size(), static_cast<size_t>(kLineoutChannels));
+  CHECK_EQ(b.lineout.outputs[0].source_index, std::string("music"));
+  CHECK_EQ(b.lineout.outputs[1].gain_db, -6.0f);
+  CHECK_EQ(b.lineout.names[0], std::string("desk left"));
+  CHECK_EQ(b.lineout.names.size(), static_cast<size_t>(kLineoutChannels));
+
+  Control ctl;
+  b.apply_to(ctl);
+  CHECK(ctl.lineout.enabled.load());
+  CHECK(!ctl.hdmi.enabled.load());
+  CHECK_EQ(source_index(ctl.lineout_outputs[0].source.load()), static_cast<uint8_t>(GenId::Music));
+  CHECK_EQ(source_index(ctl.lineout_outputs[1].source.load()), 3);
+  CHECK_EQ(source_type(ctl.hdmi_outputs[0].source.load()), SourceType::Silence);
+  CHECK_EQ(soc_layout(ctl.lineout, kLineoutChannels), HdmiLayout::Stereo);
+
+  ctl.lineout.enabled.store(false);
+  ctl.lineout_outputs[0].mute.store(true);
+  const Config c = Config::from_control(ctl, b);
+  CHECK(!c.lineout.enabled);
+  CHECK(c.lineout.outputs[0].mute);
+  CHECK_EQ(c.lineout.device, std::string("hw:ALSA,0"));  // not live: carried over from the base
+
+  // A layout in the file is not the line out's to have.
+  Config odd;
+  CHECK(Config::from_json(R"({"lineout": {"layout": "7.1", "sample_rate": 22050,
+      "names": ["a", "b", "c"]}})", &odd, &err));
+  CHECK_EQ(odd.lineout.layout, std::string("stereo"));
+  CHECK_EQ(odd.lineout.sample_rate, kSocRateDefault);
+  CHECK_EQ(odd.lineout.names.size(), static_cast<size_t>(kLineoutChannels));
+  odd.apply_to(ctl);
+  CHECK_EQ(ctl.lineout.layout.load(), static_cast<uint8_t>(HdmiLayout::Stereo));
+
+  // Defaults: off, on the jack's own card.
+  CHECK(!Config{}.lineout.enabled);
+  CHECK_EQ(Config{}.lineout.device, std::string("hw:Headphones,0"));
 }
 
 void test_garbage_is_rejected() {
@@ -314,5 +409,6 @@ int main() {
   test_net_port_rides_the_control_path();
   test_hdmi_round_trip();
   test_hdmi_defaults_and_bad_values();
+  test_lineout_round_trip();
   return report("config");
 }

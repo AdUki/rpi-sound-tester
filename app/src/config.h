@@ -24,6 +24,22 @@ struct OutputConfig {
   bool mute = false;
 };
 
+// One of the SoC's own outputs: HDMI or the line out. `device` is an ALSA name, and
+// `sample_rate` the rate its PCM is opened at (never "rate": the image recipe patches every "rate"
+// key in config.json to the card's). `outputs` and `names` hold one entry per speaker the sink can
+// have, playing or not.
+struct SocConfig {
+  SocConfig(std::string dev, unsigned width)
+      : device(std::move(dev)), outputs(width), names(width) {}
+
+  bool enabled = false;
+  std::string device;
+  unsigned sample_rate = kSocRateDefault;
+  std::string layout = hdmi_layout_name(kHdmiLayoutDefault);  // mono | stereo | 5.1 | 7.1
+  std::vector<OutputConfig> outputs;
+  std::vector<std::string> names;
+};
+
 struct Config {
   unsigned rate = kDefaultRate;
   unsigned period = kDefaultPeriod;
@@ -63,15 +79,12 @@ struct Config {
   int net_port = kNetPort;
   int net_delay_ms = static_cast<int>(kNetDelayDefaultMs);
 
-  // HDMI output. `hdmi_device` is an ALSA name: the firmware driver calls the first HDMI port's
-  // card "b1" once snd_bcm2835.enable_compat_alsa=0 is on the kernel command line, and exposes it
-  // as device 1 of card "ALSA" when it is not. `hdmi_sample_rate` is the rate that PCM is opened
-  // at (never "rate": the image recipe patches every "rate" key in config.json to the card's).
-  bool hdmi_enabled = false;
-  std::string hdmi_device = "hw:b1,0";
-  unsigned hdmi_sample_rate = kHdmiRateDefault;
-  std::array<OutputConfig, kHdmiChannels> hdmi_outputs{};
-  std::vector<std::string> hdmi_names{kHdmiChannels};
+  // The firmware driver calls the first HDMI port's card "b1" and the 3.5 mm jack's "Headphones"
+  // once snd_bcm2835.enable_compat_alsa=0 is on the kernel command line; without it both are
+  // devices of one card called "ALSA", HDMI 1 and the jack 0. Only HDMI has a layout: the line out
+  // is always stereo, and neither reads nor writes one.
+  SocConfig hdmi{"hw:b1,0", kHdmiMaxChannels};
+  SocConfig lineout{"hw:Headphones,0", kLineoutChannels};
 
   std::string to_json() const;
   static bool from_json(const std::string& text, Config* out, std::string* err);

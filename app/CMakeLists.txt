@@ -127,7 +127,7 @@ add_library(soundtester_core STATIC
   src/capture.cpp
   src/config.cpp
   src/generators.cpp
-  src/hdmi_out.cpp
+  src/soc_out.cpp
   src/kmsg_watch.cpp
   src/listen_encoder.cpp
   src/listen_stream.cpp

@@ -45,6 +45,17 @@
     "enabled": false,
     "device": "hw:b1,0",
     "sample_rate": 48000,
+    "layout": "stereo",
+    "outputs": [
+      { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
+      { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false }
+    ],
+    "names": ["", ""]
+  },
+  "lineout": {
+    "enabled": false,
+    "device": "hw:Headphones,0",
+    "sample_rate": 48000,
     "outputs": [
       { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
       { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false }

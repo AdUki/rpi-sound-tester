@@ -1,8 +1,9 @@
-#include "hdmi_out.h"
+#include "soc_out.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "check.h"
@@ -33,7 +34,8 @@ void write_ramp(RingBuffer& ring, size_t frames, size_t block) {
 }
 
 // The reader asks for absolute indices and gets exactly those frames back, however the chunks
-// line up against the writer's blocks: that is what keeps HDMI on the device's one sample axis.
+// line up against the writer's blocks: that is what keeps each sink on the device's one sample
+// axis.
 void test_pull_tracks_absolute_index() {
   RingBuffer ring(1u << 12, 2, 256);
   write_ramp(ring, 3000, 1024);
@@ -42,7 +44,7 @@ void test_pull_tracks_absolute_index() {
   std::vector<float> out(2 * 777);
   for (int pass = 0; pass < 3; ++pass) {
     const uint64_t at = r_n;
-    CHECK(hdmi_pull(ring, &r_n, 777, out.data()) == HdmiPull::Ok);
+    CHECK(soc_pull(ring, &r_n, 777, out.data()) == SocPull::Ok);
     CHECK_EQ(r_n, at + 777);
     bool exact = true;
     for (size_t i = 0; i < 777; ++i) {
@@ -61,16 +63,16 @@ void test_pull_starved_leaves_the_reader_alone() {
   std::vector<float> out(2 * 512);
 
   uint64_t r_n = 700;
-  CHECK(hdmi_pull(ring, &r_n, 512, out.data()) == HdmiPull::Starved);
+  CHECK(soc_pull(ring, &r_n, 512, out.data()) == SocPull::Starved);
   CHECK_EQ(r_n, 700u);
 
   // Beyond the head altogether.
   uint64_t far = 5000;
-  CHECK(hdmi_pull(ring, &far, 16, out.data()) == HdmiPull::Starved);
+  CHECK(soc_pull(ring, &far, 16, out.data()) == SocPull::Starved);
   CHECK_EQ(far, 5000u);
 
   write_ramp(ring, 1024, 1024);
-  CHECK(hdmi_pull(ring, &r_n, 512, out.data()) == HdmiPull::Ok);
+  CHECK(soc_pull(ring, &r_n, 512, out.data()) == SocPull::Ok);
   CHECK_EQ(out[0], 700.0f);
 }
 
@@ -81,20 +83,20 @@ void test_pull_lapped_is_reported() {
   write_ramp(ring, 3 * 4096, 1024);
   std::vector<float> out(2 * 256);
   uint64_t r_n = 0;
-  CHECK(hdmi_pull(ring, &r_n, 256, out.data()) == HdmiPull::Lapped);
+  CHECK(soc_pull(ring, &r_n, 256, out.data()) == SocPull::Lapped);
   CHECK_EQ(r_n, 0u);
 }
 
-// A model of the HDMI loop: each pass pulls a fixed chunk, converts it at the trimmed ratio and
+// A model of a sink's loop: each pass pulls a fixed chunk, converts it at the trimmed ratio and
 // hands it to a driver that drains at its own, slightly wrong, rate. The card runs slightly wrong
 // too. The servo has to hold the latency anyway, and do it by slewing the ratio, never stepping.
 struct LoopModel {
   double rate = 96000.0;      // engine nominal
-  double dev_rate = 48000.0;  // HDMI nominal
+  double dev_rate = 48000.0;  // device nominal
   double engine_ppm = 0.0;
   double device_ppm = 0.0;
   double chunk_in = 1920.0;   // 20 ms of engine frames
-  double buffer = 3840.0;     // HDMI buffer, device frames
+  double buffer = 3840.0;     // PCM buffer, device frames
   double ring_lag = 3072.0;
 
   double target() const { return ring_lag + buffer * rate / dev_rate; }
@@ -108,7 +110,7 @@ struct LoopResult {
 };
 
 LoopResult run_loop(const LoopModel& m, double initial_error, double seconds) {
-  HdmiServo servo;
+  SocServo servo;
   const double target = m.target();
   double lag = m.ring_lag + initial_error;  // the driver term is a full buffer at each measurement
   uint64_t prng = 0x1234567887654321ull;
@@ -131,7 +133,7 @@ LoopResult run_loop(const LoopModel& m, double initial_error, double seconds) {
     if (!first) r.worst_trim_step = std::max(r.worst_trim_step, std::fabs(servo.trim - prev_trim));
     first = false;
     r.worst_trim_dev = std::max(r.worst_trim_dev, std::fabs(servo.trim - 1.0));
-    r.ever_adrift |= servo.adrift(target, kHdmiResyncS * m.rate);
+    r.ever_adrift |= servo.adrift(target, kSocResyncS * m.rate);
     prev_trim = servo.trim;
   }
   r.final_error = servo.filter.avg - target;
@@ -166,7 +168,7 @@ void test_servo_walks_back_an_offset() {
 }
 
 void test_servo_adrift() {
-  HdmiServo s;
+  SocServo s;
   CHECK(!s.adrift(1000.0, 100.0));  // nothing measured yet
   s.update(1050.0, 0.02, 1000.0, 96000.0);
   CHECK(!s.adrift(1000.0, 100.0));
@@ -179,8 +181,8 @@ void test_servo_adrift() {
   CHECK_EQ(s.trim > 1.0, true);  // behind target: consume slower, let the latency grow back
 }
 
-// The HDMI pair and the DACs are rendered by the same helper at different strides. Whatever an
-// OutputControl says, both must come out sample-for-sample identical: a source, a gain, a mute,
+// The DACs, HDMI and the line out are rendered by the same helper at three strides. Whatever an
+// OutputControl says, all must come out sample-for-sample identical: a source, a gain, a mute,
 // a passthrough of a network channel, and an Identify burst that begins and ends mid-block.
 void test_route_identical_across_strides() {
   constexpr size_t kFrames = 1024;
@@ -221,19 +223,24 @@ void test_route_identical_across_strides() {
     if (c.identify_offset > 0) oc.identify_until.store(n + c.identify_offset);
 
     std::vector<float> out8(kFrames * kOutputs, 99.0f);
-    std::vector<float> out2(kFrames * kHdmiChannels, 99.0f);
+    std::vector<float> outh(kFrames * kHdmiMaxChannels, 99.0f);
+    std::vector<float> outl(kFrames * kLineoutChannels, 99.0f);
     route_output<kOutputs>(oc, n, kFrames, in_all.data(), gens, gen, identify_frames,
                            out8.data() + 5);
-    route_output<kHdmiChannels>(oc, n, kFrames, in_all.data(), gens, gen, identify_frames,
-                                out2.data() + 1);
+    route_output<kHdmiMaxChannels>(oc, n, kFrames, in_all.data(), gens, gen, identify_frames,
+                                   outh.data() + 1);
+    route_output<kLineoutChannels>(oc, n, kFrames, in_all.data(), gens, gen, identify_frames,
+                                   outl.data() + 1);
 
     const float g = c.mute ? 0.0f : db_to_lin(c.gain_db);
     bool same = true, right = true, untouched = true;
     for (size_t i = 0; i < kFrames; ++i) {
       const float a = out8[i * kOutputs + 5];
-      const float b = out2[i * kHdmiChannels + 1];
-      same &= a == b;
-      untouched &= out8[i * kOutputs + 4] == 99.0f && out2[i * kHdmiChannels] == 99.0f;
+      const float b = outh[i * kHdmiMaxChannels + 1];
+      const float l = outl[i * kLineoutChannels + 1];
+      same &= a == b && a == l;
+      untouched &= out8[i * kOutputs + 4] == 99.0f && outh[i * kHdmiMaxChannels] == 99.0f &&
+                   outh[i * kHdmiMaxChannels + 2] == 99.0f && outl[i * kLineoutChannels] == 99.0f;
 
       float want = 0.0f;
       if (c.identify_offset > 0 && static_cast<int64_t>(i) < c.identify_offset) {
@@ -251,6 +258,137 @@ void test_route_identical_across_strides() {
   }
 }
 
+// The converter only ever sees the channels in play, in order, whatever the ring's width.
+void test_select_keeps_the_channels_in_play() {
+  constexpr size_t kFrames = 5;
+  std::vector<float> ring(kFrames * kHdmiMaxChannels);
+  for (size_t i = 0; i < kFrames; ++i)
+    for (unsigned c = 0; c < kHdmiMaxChannels; ++c)
+      ring[i * kHdmiMaxChannels + c] = static_cast<float>(100 * i + c);
+
+  for (unsigned ch = 1; ch <= kHdmiMaxChannels; ++ch) {
+    std::vector<float> sel(kFrames * ch, -1.0f);
+    soc_select(ring.data(), kFrames, kHdmiMaxChannels, ch, sel.data());
+    bool exact = true;
+    for (size_t i = 0; i < kFrames; ++i)
+      for (unsigned c = 0; c < ch; ++c) exact &= sel[i * ch + c] == static_cast<float>(100 * i + c);
+    CHECK(exact);
+  }
+}
+
+// Mono is one channel on both L and R; every other width is written through as it is.
+void test_s16_layout() {
+  const float mono[] = {0.5f, -0.25f, 2.0f};  // the last one clips
+  int16_t pcm[6] = {};
+  soc_to_s16(mono, 3, 1, pcm);
+  CHECK_EQ(pcm[0], float_to_s16(0.5f));
+  CHECK_EQ(pcm[1], float_to_s16(0.5f));
+  CHECK_EQ(pcm[2], float_to_s16(-0.25f));
+  CHECK_EQ(pcm[3], float_to_s16(-0.25f));
+  CHECK_EQ(pcm[4], 32767);
+  CHECK_EQ(pcm[5], 32767);
+
+  std::vector<float> six(2 * 6);
+  for (size_t i = 0; i < six.size(); ++i) six[i] = 0.01f * static_cast<float>(i);
+  std::vector<int16_t> out(six.size(), 0);
+  soc_to_s16(six.data(), 2, 6, out.data());
+  bool through = true;
+  for (size_t i = 0; i < six.size(); ++i) through &= out[i] == float_to_s16(six[i]);
+  CHECK(through);
+}
+
+// Every layout sends each of its speakers to its own PCM slot, and fills the PCM: no slot carries
+// two speakers (they would sum), none is left out (a speaker the sink expects would be silent),
+// and the converter carries exactly what the PCM holds. Mono is the one exception by design.
+void test_layout_tables_are_clean() {
+  for (uint8_t i = 0; i < static_cast<uint8_t>(HdmiLayout::Count); ++i) {
+    const auto l = static_cast<HdmiLayout>(i);
+    const HdmiLayoutInfo& lay = hdmi_layout_info(l);
+    CHECK(lay.speakers >= 1 && lay.speakers <= kHdmiMaxChannels);
+    CHECK(lay.pcm_channels >= 2 && lay.pcm_channels <= kHdmiMaxChannels);
+    if (l == HdmiLayout::Mono) {
+      CHECK_EQ(lay.speakers, 1u);
+      CHECK_EQ(lay.pcm_channels, 2u);
+      CHECK_EQ(lay.slot[0], 0);
+      CHECK_EQ(soc_converted_channels(lay), 1u);
+      continue;
+    }
+    CHECK_EQ(lay.speakers, lay.pcm_channels);
+    CHECK_EQ(soc_converted_channels(lay), lay.pcm_channels);
+    bool used[kHdmiMaxChannels] = {};
+    for (unsigned s = 0; s < lay.speakers; ++s) {
+      CHECK(lay.slot[s] < lay.pcm_channels);
+      if (lay.slot[s] < kHdmiMaxChannels) {
+        CHECK(!used[lay.slot[s]]);
+        used[lay.slot[s]] = true;
+      }
+    }
+    // L and R are the first two slots in every layout: stereo content stays where it belongs.
+    CHECK_EQ(lay.slot[kSpkL], 0);
+    CHECK_EQ(lay.slot[kSpkR], 1);
+    // The name round-trips.
+    HdmiLayout back = HdmiLayout::Mono;
+    CHECK(parse_hdmi_layout(lay.name, &back));
+    CHECK_EQ(back, l);
+  }
+  HdmiLayout x;
+  CHECK(!parse_hdmi_layout("5", &x));
+  CHECK(!parse_hdmi_layout("quad", &x));
+  CHECK_EQ(std::string(hdmi_speaker_name(HdmiLayout::Mono, 0)), std::string("M"));
+  CHECK_EQ(std::string(hdmi_speaker_name(HdmiLayout::S71, kSpkLb)), std::string("Lb"));
+}
+
+// The Pi carries more than two HDMI channels only up to 48 kHz.
+void test_surround_is_refused_above_48k() {
+  CHECK(hdmi_layout_rate_ok(HdmiLayout::Stereo, 96000));
+  CHECK(hdmi_layout_rate_ok(HdmiLayout::Mono, 96000));
+  CHECK(hdmi_layout_rate_ok(HdmiLayout::S51, 48000));
+  CHECK(hdmi_layout_rate_ok(HdmiLayout::S71, 44100));
+  CHECK(!hdmi_layout_rate_ok(HdmiLayout::S51, 96000));
+  CHECK(!hdmi_layout_rate_ok(HdmiLayout::S71, 96000));
+}
+
+// The audio thread and a sink's thread both index the slot table with the stored layout and write
+// its slots into a ring the sink's width, so a value outside the table, or a layout wider than the
+// sink, must read back as something that fits rather than off either end.
+void test_layout_is_always_usable() {
+  SocControl h;
+  CHECK_EQ(soc_layout(h, kHdmiMaxChannels), kHdmiLayoutDefault);
+  h.layout.store(200);
+  CHECK_EQ(soc_layout(h, kHdmiMaxChannels), kHdmiLayoutDefault);
+  h.layout.store(static_cast<uint8_t>(HdmiLayout::S71));
+  CHECK_EQ(soc_layout(h, kHdmiMaxChannels), HdmiLayout::S71);
+  // The line out is two slots wide: surround stored there by anything reads as stereo.
+  CHECK_EQ(soc_layout(h, kLineoutChannels), HdmiLayout::Stereo);
+  h.layout.store(static_cast<uint8_t>(HdmiLayout::S51));
+  CHECK_EQ(soc_layout(h, kLineoutChannels), HdmiLayout::Stereo);
+  // And the line out's layout puts L and R in slots 0 and 1 of its two.
+  const HdmiLayoutInfo& lay = hdmi_layout_info(soc_layout(SocControl{}, kLineoutChannels));
+  CHECK_EQ(lay.speakers, kLineoutChannels);
+  CHECK_EQ(lay.pcm_channels, kLineoutChannels);
+  CHECK_EQ(lay.slot[kSpkL], 0);
+  CHECK_EQ(lay.slot[kSpkR], 1);
+}
+
+// A two-wide ring (the line out) is read through as it is.
+void test_select_at_the_line_outs_width() {
+  const float ring[] = {1, 2, 3, 4, 5, 6};
+  float sel[6] = {};
+  soc_select(ring, 3, kLineoutChannels, kLineoutChannels, sel);
+  CHECK(std::equal(ring, ring + 6, sel));
+}
+
+// Each sink says which one it is, so two of them never log or fail under the other's name, and
+// its ring is as wide as the most slots it can have.
+void test_sinks_are_told_apart() {
+  CHECK_EQ(std::string(kHdmiSink.name), std::string("hdmi"));
+  CHECK_EQ(std::string(kLineoutSink.name), std::string("lineout"));
+  CHECK_EQ(kHdmiSink.width, kHdmiMaxChannels);
+  CHECK_EQ(kLineoutSink.width, kLineoutChannels);
+  CHECK(std::string(kLineoutSink.where).find("Headphones") != std::string::npos);
+  CHECK(std::string(kHdmiSink.where).find("b1") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -261,5 +399,12 @@ int main() {
   test_servo_walks_back_an_offset();
   test_servo_adrift();
   test_route_identical_across_strides();
-  return report("hdmi");
+  test_select_keeps_the_channels_in_play();
+  test_s16_layout();
+  test_layout_tables_are_clean();
+  test_surround_is_refused_above_48k();
+  test_layout_is_always_usable();
+  test_select_at_the_line_outs_width();
+  test_sinks_are_told_apart();
+  return report("soc_out");
 }

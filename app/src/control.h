@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "constants.h"
+#include "hdmi_layout.h"
 
 namespace st {
 
@@ -192,21 +193,40 @@ struct NetControl {
   std::atomic<uint16_t> port{kNetPort};
 };
 
-// The HDMI output. `enabled` is what the audio thread reads: while it is off, the HDMI pair is
-// neither rendered nor keeps the melody alive. The device and its rate are not live values; they
-// belong to the HDMI thread and the config.
-struct HdmiControl {
+// One of the SoC's own outputs: HDMI or the line out. The audio thread reads both fields: while
+// `enabled` is off the sink's speakers are neither rendered nor keep the melody alive, and `layout`
+// says which speakers are rendered and into which PCM slots. The sink's thread reads `layout` when
+// it opens its PCM, so a change needs that thread restarted. Only HDMI's layout ever changes; the
+// line out's stays stereo. The device and its rate are not live values; they belong to the sink's
+// thread and the config.
+struct SocControl {
   std::atomic<bool> enabled{false};
+  std::atomic<uint8_t> layout{static_cast<uint8_t>(kHdmiLayoutDefault)};
 };
+
+// The layout in force for a sink `width` channels wide, whatever was stored: the audio thread and
+// the sink's thread both index the slot table with it and write the slots into a ring that wide,
+// so a value outside the table, or a layout wider than the sink, must never reach them.
+inline HdmiLayout soc_layout(const SocControl& s, unsigned width) {
+  const uint8_t l = s.layout.load(std::memory_order_relaxed);
+  const auto layout = l < static_cast<uint8_t>(HdmiLayout::Count) ? static_cast<HdmiLayout>(l)
+                                                                   : kHdmiLayoutDefault;
+  return hdmi_layout_info(layout).pcm_channels <= width ? layout : HdmiLayout::Stereo;
+}
 
 // Written by web handlers, read by the audio thread at the top of each block. Scalars are
 // independent atomics; tearing across a block boundary there is benign.
 struct Control {
   std::array<InputControl, kTotalInputs> inputs;
   std::array<OutputControl, kOutputs> outputs;
-  // HDMI L and R: routed exactly like the Octo's outputs, and on the same sample axis.
-  std::array<OutputControl, kHdmiChannels> hdmi_outputs;
-  HdmiControl hdmi;
+  // The HDMI speakers, indexed by HdmiSpeaker (L R C LFE Ls Rs Lb Rb): routed exactly like the
+  // Octo's outputs, and on the same sample axis. All eight keep their routing whatever the layout;
+  // only the layout's speakers are played.
+  std::array<OutputControl, kHdmiMaxChannels> hdmi_outputs;
+  SocControl hdmi;
+  // The 3.5 mm jack's L and R, routed the same way. Always the stereo layout.
+  std::array<OutputControl, kLineoutChannels> lineout_outputs;
+  SocControl lineout;
   SineControl sine;
   NoiseControl noise;
   PingControl ping;

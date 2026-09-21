@@ -1,4 +1,4 @@
-#include "hdmi_out.h"
+#include "soc_out.h"
 
 #include <alsa/asoundlib.h>
 #include <errno.h>
@@ -19,7 +19,7 @@ namespace {
 constexpr unsigned kReopenDelayS = 5;
 
 // How long the reader waits for the engine's next block before calling it a stall. Well inside
-// what the HDMI buffer holds, so a block that is merely late costs nothing audible.
+// what the PCM's buffer holds, so a block that is merely late costs nothing audible.
 constexpr unsigned kStarveWaitMs = 40;
 
 // A device that has taken no audio for this long is treated as gone, and reopened.
@@ -27,77 +27,125 @@ constexpr unsigned kWriteStallMs = 2000;
 
 }  // namespace
 
-HdmiPull hdmi_pull(const RingBuffer& ring, uint64_t* r_n, size_t frames, float* out) {
-  if (frames == 0) return HdmiPull::Ok;
+SocPull soc_pull(const RingBuffer& ring, uint64_t* r_n, size_t frames, float* out) {
+  if (frames == 0) return SocPull::Ok;
   const uint64_t head = ring.counter();
-  if (*r_n > head || frames > head - *r_n) return HdmiPull::Starved;
-  if (!ring.read_interleaved(*r_n, frames, out)) return HdmiPull::Lapped;
+  if (*r_n > head || frames > head - *r_n) return SocPull::Starved;
+  if (!ring.read_interleaved(*r_n, frames, out)) return SocPull::Lapped;
   *r_n += frames;
-  return HdmiPull::Ok;
+  return SocPull::Ok;
 }
 
-HdmiOutput::HdmiOutput(Control& ctl, const AudioEngine& engine, std::string device,
-                       unsigned sample_rate)
-    : ctl_(ctl),
+void soc_select(const float* in, size_t frames, unsigned stride, unsigned channels, float* out) {
+  for (size_t i = 0; i < frames; ++i)
+    for (unsigned c = 0; c < channels; ++c) out[i * channels + c] = in[i * stride + c];
+}
+
+void soc_to_s16(const float* in, size_t frames, unsigned channels, int16_t* out) {
+  if (channels == 1) {
+    for (size_t i = 0; i < frames; ++i) out[2 * i] = out[2 * i + 1] = float_to_s16(in[i]);
+    return;
+  }
+  for (size_t i = 0; i < frames * channels; ++i) out[i] = float_to_s16(in[i]);
+}
+
+std::vector<PlaybackDevice> list_playback_devices() {
+  std::vector<PlaybackDevice> out;
+  snd_ctl_card_info_t* info;
+  snd_pcm_info_t* pcm;
+  snd_ctl_card_info_alloca(&info);
+  snd_pcm_info_alloca(&pcm);
+  int card = -1;
+  while (snd_card_next(&card) == 0 && card >= 0) {
+    snd_ctl_t* ctl = nullptr;
+    if (snd_ctl_open(&ctl, ("hw:" + std::to_string(card)).c_str(), 0) < 0) continue;
+    if (snd_ctl_card_info(ctl, info) == 0) {
+      const std::string id = snd_ctl_card_info_get_id(info);
+      int dev = -1;
+      while (snd_ctl_pcm_next_device(ctl, &dev) == 0 && dev >= 0) {
+        snd_pcm_info_set_device(pcm, static_cast<unsigned>(dev));
+        snd_pcm_info_set_subdevice(pcm, 0);
+        snd_pcm_info_set_stream(pcm, SND_PCM_STREAM_PLAYBACK);
+        if (snd_ctl_pcm_info(ctl, pcm) < 0) continue;  // capture only
+        out.push_back({"hw:" + id + "," + std::to_string(dev), id, snd_pcm_info_get_name(pcm)});
+      }
+    }
+    snd_ctl_close(ctl);
+  }
+  return out;
+}
+
+SocOutput::SocOutput(const SocSink& sink, SocControl& sctl, Control& ctl,
+                     const AudioEngine& engine, std::string device, unsigned sample_rate)
+    : sink_(sink),
+      sctl_(sctl),
+      ctl_(ctl),
       engine_(engine),
-      ring_(kHdmiRingFrames, kHdmiChannels, kHdmiRingFrames / 8),
+      ring_(kSocRingFrames, sink.width, kSocRingFrames / 8),
       device_(std::move(device)),
-      sample_rate_(hdmi_rate_ok(sample_rate) ? sample_rate : kHdmiRateDefault) {}
+      sample_rate_(soc_rate_ok(sample_rate) ? sample_rate : kSocRateDefault) {}
 
-HdmiOutput::~HdmiOutput() { stop(); }
+SocOutput::~SocOutput() { stop(); }
 
-void HdmiOutput::start() {
+void SocOutput::start() {
   std::lock_guard<std::mutex> life(life_m_);
   start_locked();
 }
 
-void HdmiOutput::stop() {
+void SocOutput::stop() {
   std::lock_guard<std::mutex> life(life_m_);
   stop_locked();
 }
 
-void HdmiOutput::start_locked() {
+void SocOutput::start_locked() {
   if (running_.load()) return;
   running_.store(true);
   thread_ = std::thread([this] { run(); });
 }
 
-void HdmiOutput::stop_locked() {
+void SocOutput::stop_locked() {
   running_.store(false);
   if (thread_.joinable()) thread_.join();
 }
 
-void HdmiOutput::configure(std::string device, unsigned sample_rate) {
+void SocOutput::configure(std::string device, unsigned sample_rate) {
   std::lock_guard<std::mutex> life(life_m_);
   const bool was_running = running_.load();
   stop_locked();
   {
     std::lock_guard<std::mutex> lk(m_);
     device_ = std::move(device);
-    sample_rate_ = hdmi_rate_ok(sample_rate) ? sample_rate : kHdmiRateDefault;
+    sample_rate_ = soc_rate_ok(sample_rate) ? sample_rate : kSocRateDefault;
     error_.clear();
   }
   if (was_running) start_locked();
 }
 
-std::string HdmiOutput::device() const {
+void SocOutput::restart() {
+  std::lock_guard<std::mutex> life(life_m_);
+  if (!running_.load()) return;
+  stop_locked();
+  start_locked();
+}
+
+std::string SocOutput::device() const {
   std::lock_guard<std::mutex> lk(m_);
   return device_;
 }
 
-unsigned HdmiOutput::sample_rate() const {
+unsigned SocOutput::sample_rate() const {
   std::lock_guard<std::mutex> lk(m_);
   return sample_rate_;
 }
 
-void HdmiOutput::set_error(std::string msg) {
+void SocOutput::set_error(std::string msg) {
   std::lock_guard<std::mutex> lk(m_);
   error_ = std::move(msg);
 }
 
-HdmiStatus HdmiOutput::status() const {
-  HdmiStatus s;
-  s.enabled = ctl_.hdmi.enabled.load();
+SocStatus SocOutput::status() const {
+  SocStatus s;
+  s.enabled = sctl_.enabled.load();
   s.open = open_.load();
   s.playing = playing_.load();
   {
@@ -107,6 +155,9 @@ HdmiStatus HdmiOutput::status() const {
     s.error = error_;
   }
   s.device_rate = dev_rate_.load();
+  s.layout = soc_layout(sctl_, sink_.width);
+  s.speakers = hdmi_layout_info(s.layout).speakers;
+  s.device_channels = dev_channels_.load();
   s.period_frames = dev_period_.load();
   s.buffer_frames = dev_buffer_.load();
   s.xruns = xruns_.load();
@@ -121,13 +172,13 @@ HdmiStatus HdmiOutput::status() const {
   return s;
 }
 
-void HdmiOutput::sleep_ms(unsigned ms) const {
+void SocOutput::sleep_ms(unsigned ms) const {
   timespec ts{static_cast<time_t>(ms / 1000), static_cast<long>((ms % 1000) * 1000000L)};
   nanosleep(&ts, nullptr);
 }
 
-void HdmiOutput::run() {
-  make_realtime(kHdmiRtPriority, "hdmi");
+void SocOutput::run() {
+  make_realtime(kSocRtPriority, sink_.name);
   std::string logged;  // log a failure once, not every five seconds for as long as it lasts
   while (running_.load()) {
     if (!open_pcm()) {
@@ -148,14 +199,14 @@ void HdmiOutput::run() {
     const bool clean = stream();
     close_pcm();
     if (!clean && running_.load()) {
-      LOG_WARN("hdmi: stream stopped — reopening in {} s", kReopenDelayS);
+      LOG_WARN("{}: stream stopped — reopening in {} s", sink_.name, kReopenDelayS);
       for (unsigned i = 0; i < kReopenDelayS * 10 && running_.load(); ++i) sleep_ms(100);
     }
   }
-  LOG_INFO("hdmi: stopped");
+  LOG_INFO("{}: stopped", sink_.name);
 }
 
-bool HdmiOutput::open_pcm() {
+bool SocOutput::open_pcm() {
   std::string dev;
   unsigned want = 0;
   {
@@ -164,6 +215,17 @@ bool HdmiOutput::open_pcm() {
     want = sample_rate_;
   }
   rate_ = engine_.rate();
+  const HdmiLayout layout = soc_layout(sctl_, sink_.width);
+  const HdmiLayoutInfo& lay = hdmi_layout_info(layout);
+  ch_ = soc_converted_channels(lay);
+  pcm_ch_ = lay.pcm_channels;
+  // The API and the config both refuse surround above 48 kHz; this only guards a path that
+  // bypassed them, rather than hand the firmware a stream it would resample or corrupt.
+  if (!hdmi_layout_rate_ok(layout, want)) {
+    LOG_WARN("{}: {} is not carried at {} Hz — opening at {}", sink_.name, lay.name, want,
+             kSocRateDefault);
+    want = kSocRateDefault;
+  }
 
   // Non-blocking open: a busy hw device would otherwise park this thread in open() until whoever
   // holds it lets go, and stop() would wait just as long. Writes stay non-blocking too, paced by
@@ -171,17 +233,14 @@ bool HdmiOutput::open_pcm() {
   int err = snd_pcm_open(&pcm_, dev.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
   if (err < 0) {
     pcm_ = nullptr;
-    std::string msg = "hdmi: cannot open " + dev + ": " + snd_strerror(err);
-    if (err == -ENOENT || err == -ENODEV) {
-      msg += " (the Pi's HDMI audio needs dtparam=audio=on in config.txt; it is hw:b1,0 with "
-             "snd_bcm2835.enable_compat_alsa=0 on the kernel command line, hw:ALSA,1 without)";
-    }
+    std::string msg = std::string(sink_.name) + ": cannot open " + dev + ": " + snd_strerror(err);
+    if (err == -ENOENT || err == -ENODEV) msg += std::string(" (") + sink_.where + ")";
     set_error(msg);
     return false;
   }
 
   auto fail = [&](const char* what, int e) {
-    set_error("hdmi: " + dev + ": " + what + ": " + snd_strerror(e));
+    set_error(std::string(sink_.name) + ": " + dev + ": " + what + ": " + snd_strerror(e));
     snd_pcm_close(pcm_);
     pcm_ = nullptr;
     return false;
@@ -194,15 +253,16 @@ bool HdmiOutput::open_pcm() {
     return fail("set_access", err);
   if ((err = snd_pcm_hw_params_set_format(pcm_, hw, SND_PCM_FORMAT_S16_LE)) < 0)
     return fail("S16_LE not available", err);
-  if ((err = snd_pcm_hw_params_set_channels(pcm_, hw, kHdmiChannels)) < 0)
-    return fail("stereo not available", err);
+  if ((err = snd_pcm_hw_params_set_channels(pcm_, hw, pcm_ch_)) < 0) {
+    return fail((std::to_string(pcm_ch_) + " channels not available").c_str(), err);
+  }
   unsigned rate = want;
   if ((err = snd_pcm_hw_params_set_rate_near(pcm_, hw, &rate, nullptr)) < 0)
     return fail("set_rate", err);
-  snd_pcm_uframes_t period = static_cast<snd_pcm_uframes_t>(rate) * kHdmiPeriodMs / 1000;
+  snd_pcm_uframes_t period = static_cast<snd_pcm_uframes_t>(rate) * kSocPeriodMs / 1000;
   if ((err = snd_pcm_hw_params_set_period_size_near(pcm_, hw, &period, nullptr)) < 0)
     return fail("set_period_size", err);
-  snd_pcm_uframes_t buffer = period * kHdmiPeriods;
+  snd_pcm_uframes_t buffer = period * kSocPeriods;
   if ((err = snd_pcm_hw_params_set_buffer_size_near(pcm_, hw, &buffer)) < 0)
     return fail("set_buffer_size", err);
   if ((err = snd_pcm_hw_params(pcm_, hw)) < 0) return fail("hw_params", err);
@@ -219,8 +279,8 @@ bool HdmiOutput::open_pcm() {
   if ((err = snd_pcm_sw_params(pcm_, sw)) < 0) return fail("sw_params", err);
 
   std::string aerr;
-  if (!asrc_.configure(kHdmiChannels, rate_, rate, &aerr)) {
-    set_error("hdmi: converter: " + aerr);
+  if (!asrc_.configure(ch_, rate_, rate, &aerr)) {
+    set_error(std::string(sink_.name) + ": converter: " + aerr);
     snd_pcm_close(pcm_);
     pcm_ = nullptr;
     return false;
@@ -229,18 +289,24 @@ bool HdmiOutput::open_pcm() {
   dev_rate_.store(rate);
   dev_period_.store(static_cast<unsigned>(period));
   dev_buffer_.store(static_cast<unsigned>(buffer));
-  // One HDMI period's worth of engine frames per pass, so each pass hands the driver about one
+  dev_channels_.store(pcm_ch_);
+  // One device period's worth of engine frames per pass, so each pass hands the driver about one
   // period and the driver's own pace sets the loop's.
   chunk_in_ = static_cast<size_t>(std::llround(static_cast<double>(period) * rate_ / rate));
-  in_.assign(chunk_in_ * kHdmiChannels, 0.0f);
+  in_.assign(chunk_in_ * sink_.width, 0.0f);
+  sel_.assign(chunk_in_ * ch_, 0.0f);
   open_.store(true);
-  if (rate != want) LOG_WARN("hdmi: {} asked for {} Hz, driver chose {}", dev, want, rate);
-  LOG_INFO("hdmi: {} open: {} Hz, S16_LE, {} ch, period {}, buffer {}", dev, rate, kHdmiChannels,
+  if (rate != want) {
+    LOG_WARN("{}: {} asked for {} Hz, driver chose {}", sink_.name, dev, want, rate);
+  }
+  LOG_INFO("{}: {} open: {} {}, {} Hz, S16_LE, {} ch, period {}, buffer {}", sink_.name, dev,
+           lay.name,
+           ch_ == 1 ? "(on both sides)" : "layout", rate, pcm_ch_,
            static_cast<unsigned>(period), static_cast<unsigned>(buffer));
   return true;
 }
 
-void HdmiOutput::close_pcm() {
+void SocOutput::close_pcm() {
   if (pcm_) {
     snd_pcm_drop(pcm_);
     snd_pcm_close(pcm_);
@@ -249,15 +315,16 @@ void HdmiOutput::close_pcm() {
   open_.store(false);
   playing_.store(false);
   dev_rate_.store(0);
+  dev_channels_.store(0);
 }
 
-long HdmiOutput::write_all(const int16_t* buf, size_t frames) {
+long SocOutput::write_all(const int16_t* buf, size_t frames) {
   size_t done = 0;
   unsigned waited = 0;
   while (done < frames) {
     if (!running_.load()) return static_cast<long>(done);
     const snd_pcm_sframes_t w =
-        snd_pcm_writei(pcm_, buf + done * kHdmiChannels, frames - done);
+        snd_pcm_writei(pcm_, buf + done * pcm_ch_, frames - done);
     if (w == -EAGAIN) {
       const int r = snd_pcm_wait(pcm_, 100);
       if (r < 0) return r;
@@ -271,7 +338,7 @@ long HdmiOutput::write_all(const int16_t* buf, size_t frames) {
   return static_cast<long>(done);
 }
 
-bool HdmiOutput::wait_for_engine() {
+bool SocOutput::wait_for_engine() {
   for (;;) {
     if (!running_.load()) return false;
     const uint64_t h0 = ring_.counter();
@@ -280,14 +347,14 @@ bool HdmiOutput::wait_for_engine() {
   }
 }
 
-bool HdmiOutput::anchor() {
+bool SocOutput::anchor() {
   playing_.store(false);
   if (!wait_for_engine()) return false;
 
   snd_pcm_drop(pcm_);
   const int err = snd_pcm_prepare(pcm_);
   if (err < 0) {
-    set_error(std::string("hdmi: prepare: ") + snd_strerror(err));
+    set_error(std::string(sink_.name) + ": prepare: " + snd_strerror(err));
     return false;
   }
   asrc_.reset();
@@ -297,10 +364,10 @@ bool HdmiOutput::anchor() {
   const unsigned dev_rate = dev_rate_.load();
   const unsigned period = dev_period_.load();
   const unsigned buffer = dev_buffer_.load();
-  pcm_buf_.assign(static_cast<size_t>(buffer - period) * kHdmiChannels, 0);
+  pcm_buf_.assign(static_cast<size_t>(buffer - period) * pcm_ch_, 0);
   const long w = write_all(pcm_buf_.data(), buffer - period);
   if (w < 0) {
-    set_error(std::string("hdmi: prefill: ") + snd_strerror(static_cast<int>(w)));
+    set_error(std::string(sink_.name) + ": prefill: " + snd_strerror(static_cast<int>(w)));
     return false;
   }
   if (snd_pcm_state(pcm_) == SND_PCM_STATE_PREPARED) snd_pcm_start(pcm_);
@@ -308,7 +375,7 @@ bool HdmiOutput::anchor() {
   // The latency held from here on: a few engine periods of slack in the ring, so the next chunk
   // is always already written, plus the driver's whole buffer. Recomputed per anchor because the
   // engine's period is whatever its driver last agreed to.
-  const double ring_lag = static_cast<double>(kHdmiRingLagPeriods) * engine_.period();
+  const double ring_lag = static_cast<double>(kSocRingLagPeriods) * engine_.period();
   target_ = ring_lag + static_cast<double>(buffer) * rate_ / dev_rate;
   target_ms_.store(static_cast<float>(1000.0 * target_ / rate_));
 
@@ -322,7 +389,7 @@ bool HdmiOutput::anchor() {
   return true;
 }
 
-bool HdmiOutput::stream() {
+bool SocOutput::stream() {
   bool need_anchor = true;
   uint64_t last_ns = 0;
   uint64_t settled_ns = 0;  // readings before this are not trusted
@@ -332,54 +399,55 @@ bool HdmiOutput::stream() {
       if (!anchor()) return !running_.load();
       need_anchor = false;
       last_ns = mono_ns();
-      settled_ns = last_ns + static_cast<uint64_t>(kHdmiSettleS * 1e9);
+      settled_ns = last_ns + static_cast<uint64_t>(kSocSettleS * 1e9);
     }
 
-    HdmiPull p = hdmi_pull(ring_, &r_n_, chunk_in_, in_.data());
+    SocPull p = soc_pull(ring_, &r_n_, chunk_in_, in_.data());
     // The engine publishes a period at a time, so the next chunk can be a moment away. Wait for
     // it in small steps: this is a FIFO thread, and spinning would starve everything below it.
-    for (unsigned waited = 0; p == HdmiPull::Starved && waited < kStarveWaitMs; ++waited) {
+    for (unsigned waited = 0; p == SocPull::Starved && waited < kStarveWaitMs; ++waited) {
       if (!running_.load()) return true;
       sleep_ms(1);
-      p = hdmi_pull(ring_, &r_n_, chunk_in_, in_.data());
+      p = soc_pull(ring_, &r_n_, chunk_in_, in_.data());
     }
-    if (p == HdmiPull::Starved) {
+    if (p == SocPull::Starved) {
       // The engine has stopped: its card is reopening, typically. Nothing to play, and when it
       // comes back its counter will not have moved on in step with this clock — so start over.
       underruns_.fetch_add(1);
-      LOG_WARN("hdmi: the engine stopped supplying audio — re-anchoring once it resumes");
+      LOG_WARN("{}: the engine stopped supplying audio — re-anchoring once it resumes", sink_.name);
       snd_pcm_drop(pcm_);
       need_anchor = true;
       continue;
     }
-    if (p == HdmiPull::Lapped) {
+    if (p == SocPull::Lapped) {
       overruns_.fetch_add(1);
-      LOG_WARN("hdmi: fell a whole ring behind the engine — re-anchoring");
+      LOG_WARN("{}: fell a whole ring behind the engine — re-anchoring", sink_.name);
       need_anchor = true;
       continue;
     }
 
+    soc_select(in_.data(), chunk_in_, sink_.width, ch_, sel_.data());
     out_.clear();
     std::string aerr;
-    const size_t got = asrc_.process(in_.data(), chunk_in_, servo_.trim, &out_, &aerr);
+    const size_t got = asrc_.process(sel_.data(), chunk_in_, servo_.trim, &out_, &aerr);
     if (!aerr.empty()) {
-      set_error("hdmi: converter: " + aerr);
+      set_error(std::string(sink_.name) + ": converter: " + aerr);
       return false;
     }
-    pcm_buf_.resize(got * kHdmiChannels);
-    for (size_t i = 0; i < pcm_buf_.size(); ++i) pcm_buf_[i] = float_to_s16(out_[i]);
+    pcm_buf_.resize(got * pcm_ch_);
+    soc_to_s16(out_.data(), got, ch_, pcm_buf_.data());
 
     if (got) {
       const long w = write_all(pcm_buf_.data(), got);
       if (w == -EPIPE || w == -ESTRPIPE) {
         xruns_.fetch_add(1);
-        LOG_WARN("hdmi: xrun ({}) — re-anchoring", snd_strerror(static_cast<int>(w)));
+        LOG_WARN("{}: xrun ({}) — re-anchoring", sink_.name, snd_strerror(static_cast<int>(w)));
         if (snd_pcm_recover(pcm_, static_cast<int>(w), 1) < 0) return false;
         need_anchor = true;
         continue;
       }
       if (w < 0) {
-        set_error(std::string("hdmi: write: ") + snd_strerror(static_cast<int>(w)));
+        set_error(std::string(sink_.name) + ": write: " + snd_strerror(static_cast<int>(w)));
         return false;
       }
     }
@@ -406,11 +474,11 @@ bool HdmiOutput::stream() {
     latency_ms_.store(static_cast<float>(1000.0 * servo_.filter.avg / rate_));
     trim_ppm_.store(static_cast<float>((servo_.trim - 1.0) * 1e6));
 
-    if (servo_.adrift(target_, kHdmiResyncS * rate_)) {
+    if (servo_.adrift(target_, kSocResyncS * rate_)) {
       resyncs_.fetch_add(1);
-      LOG_WARN("hdmi: latency {:.1f} ms off target, past what the trim can pull back — "
+      LOG_WARN("{}: latency {:.1f} ms off target, past what the trim can pull back — "
                "re-anchoring",
-               1000.0 * (servo_.filter.avg - target_) / rate_);
+               sink_.name, 1000.0 * (servo_.filter.avg - target_) / rate_);
       need_anchor = true;
     }
   }

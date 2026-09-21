@@ -14,7 +14,7 @@ namespace st {
 // Identify burst laid over the top while one is running. `dst` is that channel's first sample in
 // an interleaved block `DstStride` channels wide.
 //
-// One function for every sink, so the Octo's eight DACs and the HDMI pair cannot come to disagree
+// One function for every sink, so the Octo's eight DACs, HDMI and the line out cannot disagree
 // about what a source, a gain or an Identify means. The stride is a template parameter so each
 // caller gets a loop with a compile-time step, which is what the vectorizer needs.
 //

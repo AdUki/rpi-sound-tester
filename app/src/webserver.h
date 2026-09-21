@@ -13,10 +13,10 @@
 #include "capture.h"
 #include "config.h"
 #include "control.h"
-#include "hdmi_out.h"
 #include "kmsg_watch.h"
 #include "net_audio.h"
 #include "ring_buffer.h"
+#include "soc_out.h"
 #include "ws_hub.h"
 
 namespace httplib {
@@ -35,7 +35,8 @@ struct WebOptions {
 struct Deps {
   Control& ctl;
   NetAudioServer& net;
-  HdmiOutput& hdmi;
+  SocOutput& hdmi;
+  SocOutput& lineout;
   RingBuffer& ring;
   AudioEngine& engine;
   Analysis& analysis;

@@ -16,7 +16,7 @@ add_st_test(test_net_timeline)
 add_st_test(test_net_protocol)
 add_st_test(test_resample)
 add_st_test(test_net_session)
-add_st_test(test_hdmi)
+add_st_test(test_soc_out)
 # That test encodes with libvorbis so the decoder is checked against a real encoder rather than
 # against an assumption about one. The daemon itself only ever decodes, so vorbisenc is linked
 # here and nowhere else.

@@ -36,6 +36,38 @@ void prefault_stack() {
   asm volatile("" : : "r"(scratch) : "memory");
 }
 
+// One of the SoC's own outputs, as the audio thread sees it for one block.
+struct SocFeed {
+  RingBuffer* ring;           // null until main() wires it in
+  const HdmiLayoutInfo* lay;  // puts each speaker in its PCM slot
+  unsigned speakers;          // how many are rendered: none while the sink is off
+};
+
+SocFeed soc_feed(const std::atomic<RingBuffer*>& ring, const SocControl& sc, unsigned width) {
+  RingBuffer* const r = ring.load(std::memory_order_relaxed);
+  const HdmiLayoutInfo& lay = hdmi_layout_info(soc_layout(sc, width));
+  const bool on = r && sc.enabled.load(std::memory_order_relaxed);
+  return {r, &lay, on ? lay.speakers : 0u};
+}
+
+// A sink's speakers, rendered at the same n by the same code as the DACs, each into its layout's
+// PCM slot of a `Width`-wide block, then handed to the sink's thread. Written whether or not
+// anything is playing them, so the handoff ring's counter never falls out of step with the capture
+// ring's; that write is a memcpy and an atomic store. Slots no speaker of the layout uses stay
+// silent.
+template <size_t Width>
+void feed_soc(const SocFeed& f, const OutputControl* outs, uint64_t n, size_t frames,
+              const float* in_all, const float* const* gens, const Generators& gen,
+              uint64_t identify_frames, float* block) {
+  if (!f.ring) return;
+  if (f.speakers < Width) std::fill(block, block + frames * Width, 0.0f);
+  for (unsigned s = 0; s < f.speakers; ++s) {
+    route_output<Width>(outs[s], n, frames, in_all, gens, gen, identify_frames,
+                        block + f.lay->slot[s]);
+  }
+  f.ring->write(block, frames);
+}
+
 }  // namespace
 
 AudioEngine::AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt)
@@ -409,8 +441,8 @@ void AudioEngine::process_block(uint64_t n, size_t frames, float* in_all, float*
 
   ring_.write(ring_block, frames);
 
-  RingBuffer* const hdmi_ring = hdmi_ring_.load(std::memory_order_relaxed);
-  const bool hdmi_on = hdmi_ring && ctl_.hdmi.enabled.load(std::memory_order_relaxed);
+  const SocFeed hdmi = soc_feed(hdmi_ring_, ctl_.hdmi, kHdmiMaxChannels);
+  const SocFeed lineout = soc_feed(lineout_ring_, ctl_.lineout, kLineoutChannels);
 
   // Outputs play at n, undelayed — but capture is held back by cap_delay_frames_, so a ping
   // emitted now shows up in the ring that much later. The log records where it will APPEAR, not
@@ -421,8 +453,10 @@ void AudioEngine::process_block(uint64_t n, size_t frames, float* in_all, float*
   // blocks it skips cost it nothing: it picks up at the right place in the tune on its own.
   bool want_music = false;
   for (const OutputControl& oc : ctl_.outputs) want_music |= routes_gen(oc, GenId::Music);
-  if (hdmi_on)
-    for (const OutputControl& oc : ctl_.hdmi_outputs) want_music |= routes_gen(oc, GenId::Music);
+  for (unsigned s = 0; s < hdmi.speakers; ++s)
+    want_music |= routes_gen(ctl_.hdmi_outputs[s], GenId::Music);
+  for (unsigned s = 0; s < lineout.speakers; ++s)
+    want_music |= routes_gen(ctl_.lineout_outputs[s], GenId::Music);
   if (!want_music) std::fill(gen_music_.begin(), gen_music_.begin() + frames, 0.0f);
   gen_.render(n, frames, ctl_, gen_sine_.data(), gen_noise_.data(), gen_ping_.data(),
               want_music ? gen_music_.data() : nullptr, ctl_.ping_log, cap_delay_frames_);
@@ -435,20 +469,10 @@ void AudioEngine::process_block(uint64_t n, size_t frames, float* in_all, float*
                            out8 + o);
   }
 
-  // The HDMI pair, rendered here at the same n by the same code as the DACs, then handed to the
-  // HDMI thread. Written whether or not anything is playing it, so the handoff ring's counter never
-  // falls out of step with the capture ring's; that write is a memcpy and an atomic store.
-  if (hdmi_ring) {
-    if (hdmi_on) {
-      for (unsigned c = 0; c < kHdmiChannels; ++c) {
-        route_output<kHdmiChannels>(ctl_.hdmi_outputs[c], n, frames, in_all, gens, gen_,
-                                    identify_frames_, hdmi_block_.data() + c);
-      }
-    } else {
-      std::fill(hdmi_block_.begin(), hdmi_block_.begin() + frames * kHdmiChannels, 0.0f);
-    }
-    hdmi_ring->write(hdmi_block_.data(), frames);
-  }
+  feed_soc<kHdmiMaxChannels>(hdmi, ctl_.hdmi_outputs.data(), n, frames, in_all, gens, gen_,
+                             identify_frames_, hdmi_block_.data());
+  feed_soc<kLineoutChannels>(lineout, ctl_.lineout_outputs.data(), n, frames, in_all, gens, gen_,
+                             identify_frames_, lineout_block_.data());
 }
 
 unsigned AudioEngine::sync_capture_delay() {
@@ -649,7 +673,8 @@ void AudioEngine::size_buffers() {
     cap_delay_.assign(cap_delay_len_ * kInputs, 0.0f);
   }
   out8_.assign(static_cast<size_t>(opt_.period) * kOutputs, 0.0f);
-  hdmi_block_.assign(static_cast<size_t>(opt_.period) * kHdmiChannels, 0.0f);
+  hdmi_block_.assign(static_cast<size_t>(opt_.period) * kHdmiMaxChannels, 0.0f);
+  lineout_block_.assign(static_cast<size_t>(opt_.period) * kLineoutChannels, 0.0f);
   gen_sine_.assign(opt_.period, 0.0f);
   gen_noise_.assign(opt_.period, 0.0f);
   gen_ping_.assign(opt_.period, 0.0f);

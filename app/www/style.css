@@ -130,17 +130,20 @@ main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
    where these three breakpoints come from; 260 px is the width at which a channel name and both
    Listen buttons still share one line. Six across would need 1620 px of content and main stops
    at 1368, so it is not reachable without widening main. */
-#inputs, #netinputs, #outputs, #hdmiouts { --cols: 1; }
-@media (min-width: 564px)  { #inputs, #netinputs, #outputs, #hdmiouts { --cols: 2; } }
-@media (min-width: 836px)  { #inputs, #netinputs                      { --cols: 3; } }
-@media (min-width: 1108px) { #outputs                                 { --cols: 4; } }
-/* Two cards, sized like two of the four output cards above so L and R line up under OUT 1-2. */
-@media (min-width: 1108px) { #hdmiouts { --cols: 4; } }
+#inputs, #netinputs, #outputs, #hdmiouts, #lineoutouts { --cols: 1; }
+@media (min-width: 564px)  { #inputs, #netinputs, #outputs, #hdmiouts, #lineoutouts { --cols: 2; } }
+@media (min-width: 836px)  { #inputs, #netinputs                                    { --cols: 3; } }
+@media (min-width: 1108px) { #outputs                                               { --cols: 4; } }
+/* HDMI's and the line out's cards, sized like the four output cards above so L and R line up
+   under OUT 1-2. */
+@media (min-width: 1108px) { #hdmiouts, #lineoutouts { --cols: 4; } }
 
-.hdmibar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
-.hdmibar .hdmion { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0; color: var(--fg); cursor: pointer; }
-.hdmibar .hdmion input { margin: 0; }
-#hdmidetail { overflow-wrap: anywhere; }
+.socbar { display: flex; align-items: center; gap: 0.6rem 1rem; flex-wrap: wrap; margin-bottom: 0.4rem; }
+.socbar label { display: inline-flex; align-items: center; margin: 0; white-space: nowrap; max-width: 100%; }
+.socbar select { max-width: 100%; min-width: 0; }
+.socbar .socon { gap: 0.3rem; color: var(--fg); cursor: pointer; }
+.socbar .socon input { margin: 0; }
+.socdetail { overflow-wrap: anywhere; min-height: 1.2em; margin-bottom: 0.75rem; }
 
 .card {
   background: var(--panel);
@@ -241,7 +244,6 @@ input[type="number"], input[type="text"], select {
   font: inherit;
 }
 input[type="range"] { vertical-align: middle; width: 140px; }
-#hdmidev { width: 11em; max-width: 100%; }
 .buflen { color: var(--muted); white-space: nowrap; }
 .buflen input[type="number"] { width: 5em; padding: 0.2rem 0.35rem; }
 
