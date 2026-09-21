@@ -844,20 +844,6 @@ const HDMI_LAYOUT_LABELS = {mono: 'Mono', stereo: 'Stereo (2.0)', '5.1': '5.1', 
 const SURROUND_MAX_RATE = 48000;
 const isSurround = layout => layout === '5.1' || layout === '7.1';
 const rateLabel = r => (r % 1000 ? (r / 1000).toFixed(1) : String(r / 1000)) + ' kHz';
-// Device names come from the kernel's card names, so they go into markup escaped.
-const esc = t => String(t).replace(/[&<>"]/g,
-  c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'})[c]);
-
-// The devices the pickers offer, read from the daemon (every playback card present but the
-// Octo). Refreshed each time the pickers are built; an older daemon has no list, and then each
-// picker offers just its current device and "Other…".
-let playbackDevices = [];
-function loadPlaybackDevices() {
-  return api('/playback-devices')
-    .then(r => { playbackDevices = r.devices || []; })
-    .catch(() => { playbackDevices = []; });
-}
-
 function buildSocCards(sink, h) {
   const pos = ch => {
     const o = h.outputs.find(x => x.ch === ch);
@@ -888,15 +874,6 @@ function buildSoc(sink) {
   const apply = body => put(sink.path, body)
     .then(r => applySoc(sink, r))
     .catch(err => { toast(err.message); syncSocPickers(sink, state[sink.k]); });
-  el('dev').onchange = e => {
-    let device = e.target.value;
-    if (device === '__other') {
-      const typed = prompt('ALSA device name, e.g. hw:b1,0 or plughw:1,0', state[sink.k].device);
-      device = (typed || '').trim();
-      if (!device) return syncSocPickers(sink, state[sink.k]);
-    }
-    apply({device});
-  };
   el('rate').onchange = e => apply({sample_rate: parseInt(e.target.value, 10)});
   if (sink.layouts) {
     el('layout').onchange = e => {
@@ -910,27 +887,14 @@ function buildSoc(sink) {
     };
   }
   syncSocPickers(sink, h);
-  loadPlaybackDevices().then(() => syncSocPickers(sink, state[sink.k]));
   renderSoc(sink, h);
 }
 
-// Fills the device, rate and channel pickers from a full status, leaving alone one the operator
-// has open.
+// Fills the rate and channel pickers from a full status, leaving alone one the operator has open.
 function syncSocPickers(sink, h) {
   if (!h) return;
   const el = id => $(sink.k + id);
   const idle = x => document.activeElement !== x;
-
-  const dev = el('dev');
-  if (idle(dev)) {
-    const known = playbackDevices.some(d => d.device === h.device);
-    dev.innerHTML = playbackDevices
-      .map(d => `<option value="${esc(d.device)}">${esc(d.name)} (${esc(d.device)})</option>`)
-      .concat(known ? [] : [`<option value="${esc(h.device)}">${esc(h.device)}</option>`])
-      .concat(['<option value="__other">Other…</option>'])
-      .join('');
-    dev.value = h.device;
-  }
 
   const rate = el('rate');
   if (idle(rate)) {

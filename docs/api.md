@@ -107,14 +107,6 @@ names the device `hw:b1,0` (`snd_bcm2835.enable_compat_alsa=0`). Without that ke
 `hw:ALSA,1`. A new device, rate or layout restarts the HDMI output only; the DACs are never
 touched. HDMI is off by default, and `soundtesterd --hdmi-device DEV` turns it on at start.
 
-### `GET /api/playback-devices`
-```json
-{"devices": [{"device": "hw:b1,0", "card": "b1", "name": "bcm2835 HDMI 1"},
-             {"device": "hw:Headphones,0", "card": "Headphones", "name": "bcm2835 Headphones"}]}
-```
-Every playback device present, except the Octo, which the engine holds open. Any `device` here
-can be given to `PUT /api/hdmi` or `PUT /api/lineout`. Other ALSA names are accepted too.
-
 ## Line out
 
 The Pi's own 3.5 mm jack, as a stereo sink. It works exactly like the HDMI output: same sources,

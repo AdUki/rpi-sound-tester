@@ -72,17 +72,6 @@ struct SocServo {
   }
 };
 
-// A playback device the sinks could be pointed at: every PCM device of every card present, named
-// the way the config and the API want it (hw:<card id>,<device>), so the console can offer a list
-// rather than ask for an ALSA name. Cards come and go (a USB interface, a driver reloaded), so
-// it is read fresh each time.
-struct PlaybackDevice {
-  std::string device;  // hw:b1,0
-  std::string card;    // b1
-  std::string name;    // bcm2835 HDMI 1
-};
-std::vector<PlaybackDevice> list_playback_devices();
-
 // ---- The output itself --------------------------------------------------------------------------
 
 // What tells the two sinks apart. Everything else about them is the same code.

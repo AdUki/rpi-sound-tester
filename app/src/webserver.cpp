@@ -234,18 +234,6 @@ std::string soc_rates_text() {
   return t;
 }
 
-// The card an ALSA device name opens, for "hw:ID,DEV" and "plughw:ID,DEV"; empty for anything else.
-std::string alsa_card_of(const std::string& device) {
-  for (const char* prefix : {"hw:", "plughw:"}) {
-    const std::string p = prefix;
-    if (device.compare(0, p.size(), p) == 0) {
-      const std::string rest = device.substr(p.size());
-      return rest.substr(0, rest.find(','));
-    }
-  }
-  return {};
-}
-
 json hdmi_layouts_json() {
   json a = json::array();
   for (const HdmiLayoutInfo& l : kHdmiLayouts) a.push_back(l.name);
@@ -705,18 +693,6 @@ void WebServer::install_routes() {
       send_json(res, json{{"ok", true}});
     });
   };
-  // What the device pickers offer: every playback device present but the Octo, which the engine
-  // holds open for good and which would only ever answer "busy".
-  svr.Get("/api/playback-devices", [this](const httplib::Request&, httplib::Response& res) {
-    const std::string engine_card = alsa_card_of(d_.engine.stats().device);
-    json a = json::array();
-    for (const PlaybackDevice& p : list_playback_devices()) {
-      if (!engine_card.empty() && p.card == engine_card) continue;
-      a.push_back({{"device", p.device}, {"card", p.card}, {"name", p.name}});
-    }
-    send_json(res, json{{"devices", a}});
-  });
-
   install_soc("/api/hdmi", &d_.hdmi, &d_.ctl.hdmi, d_.ctl.hdmi_outputs.data(), &Config::hdmi,
               true, "HDMI");
   install_soc("/api/lineout", &d_.lineout, &d_.ctl.lineout, d_.ctl.lineout_outputs.data(),

@@ -49,32 +49,6 @@ void soc_to_s16(const float* in, size_t frames, unsigned channels, int16_t* out)
   for (size_t i = 0; i < frames * channels; ++i) out[i] = float_to_s16(in[i]);
 }
 
-std::vector<PlaybackDevice> list_playback_devices() {
-  std::vector<PlaybackDevice> out;
-  snd_ctl_card_info_t* info;
-  snd_pcm_info_t* pcm;
-  snd_ctl_card_info_alloca(&info);
-  snd_pcm_info_alloca(&pcm);
-  int card = -1;
-  while (snd_card_next(&card) == 0 && card >= 0) {
-    snd_ctl_t* ctl = nullptr;
-    if (snd_ctl_open(&ctl, ("hw:" + std::to_string(card)).c_str(), 0) < 0) continue;
-    if (snd_ctl_card_info(ctl, info) == 0) {
-      const std::string id = snd_ctl_card_info_get_id(info);
-      int dev = -1;
-      while (snd_ctl_pcm_next_device(ctl, &dev) == 0 && dev >= 0) {
-        snd_pcm_info_set_device(pcm, static_cast<unsigned>(dev));
-        snd_pcm_info_set_subdevice(pcm, 0);
-        snd_pcm_info_set_stream(pcm, SND_PCM_STREAM_PLAYBACK);
-        if (snd_ctl_pcm_info(ctl, pcm) < 0) continue;  // capture only
-        out.push_back({"hw:" + id + "," + std::to_string(dev), id, snd_pcm_info_get_name(pcm)});
-      }
-    }
-    snd_ctl_close(ctl);
-  }
-  return out;
-}
-
 SocOutput::SocOutput(const SocSink& sink, SocControl& sctl, Control& ctl,
                      const AudioEngine& engine, std::string device, unsigned sample_rate)
     : sink_(sink),
