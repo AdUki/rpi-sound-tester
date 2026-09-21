@@ -17,9 +17,12 @@ namespace st {
 // offered at all.
 //
 // Routing is indexed by SPEAKER, not by PCM slot, so that L is L in every layout and a correction
-// to the slot table below moves no one's routing. The slot order is ALSA's own for 5.1 and 7.1
-// (FL FR RL RR FC LFE SL SR): what the firmware takes when told nothing, as measured on a Pi 3 with
-// this driver. If a receiver shows otherwise, `slot` is the one place to change.
+// to the slot table below moves no one's routing. The slot order is HDMI's own (CEA-861: FL FR LFE
+// FC RL RR RLC RRC), not ALSA's (FL FR RL RR FC LFE SL SR): the firmware passes the PCM's channels
+// through to the sink as they are. Confirmed for 5.1 on a soundbar; 7.1's back pair (RLC RRC) is
+// the same standard's, not yet heard. If a sink shows otherwise, `slot` is the one place to change.
+// A desktop sound server (PipeWire, PulseAudio) reads the PCM in ALSA's order, so a laptop test
+// through one shows C/LFE and the surround pair swapped: that is the laptop, not this table.
 enum class HdmiLayout : uint8_t { Mono = 0, Stereo = 1, S51 = 2, S71 = 3, Count = 4 };
 
 // Speaker positions, in the order the console lists them and the API indexes them.
@@ -47,9 +50,9 @@ inline constexpr HdmiLayoutInfo kHdmiLayouts[] = {
     {"mono", 1, 2, {0}},
     {"stereo", 2, 2, {0, 1}},
     //                L  R  C  LFE Ls Rs
-    {"5.1", 6, 6, {0, 1, 4, 5, 2, 3}},
+    {"5.1", 6, 6, {0, 1, 3, 2, 4, 5}},
     //                L  R  C  LFE Ls Rs Lb Rb
-    {"7.1", 8, 8, {0, 1, 4, 5, 6, 7, 2, 3}},
+    {"7.1", 8, 8, {0, 1, 3, 2, 4, 5, 6, 7}},
 };
 static_assert(sizeof(kHdmiLayouts) / sizeof(kHdmiLayouts[0]) ==
                   static_cast<size_t>(HdmiLayout::Count),

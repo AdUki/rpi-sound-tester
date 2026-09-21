@@ -338,6 +338,23 @@ void test_layout_tables_are_clean() {
   CHECK_EQ(std::string(hdmi_speaker_name(HdmiLayout::S71, kSpkLb)), std::string("Lb"));
 }
 
+// The slots are HDMI's order (CEA-861: FL FR LFE FC RL RR RLC RRC), which the firmware passes to
+// the sink as they are. ALSA's order (FL FR RL RR FC LFE) put C on a soundbar's surround left and
+// the surround pair on its subwoofer and centre.
+void test_surround_slots_are_hdmi_order() {
+  const HdmiLayoutInfo& s51 = hdmi_layout_info(HdmiLayout::S51);
+  CHECK_EQ(s51.slot[kSpkL], 0);
+  CHECK_EQ(s51.slot[kSpkR], 1);
+  CHECK_EQ(s51.slot[kSpkLfe], 2);
+  CHECK_EQ(s51.slot[kSpkC], 3);
+  CHECK_EQ(s51.slot[kSpkLs], 4);
+  CHECK_EQ(s51.slot[kSpkRs], 5);
+  const HdmiLayoutInfo& s71 = hdmi_layout_info(HdmiLayout::S71);
+  for (unsigned sp = 0; sp < 6; ++sp) CHECK_EQ(s71.slot[sp], s51.slot[sp]);
+  CHECK_EQ(s71.slot[kSpkLb], 6);
+  CHECK_EQ(s71.slot[kSpkRb], 7);
+}
+
 // The Pi carries more than two HDMI channels only up to 48 kHz.
 void test_surround_is_refused_above_48k() {
   CHECK(hdmi_layout_rate_ok(HdmiLayout::Stereo, 96000));
@@ -402,6 +419,7 @@ int main() {
   test_select_keeps_the_channels_in_play();
   test_s16_layout();
   test_layout_tables_are_clean();
+  test_surround_slots_are_hdmi_order();
   test_surround_is_refused_above_48k();
   test_layout_is_always_usable();
   test_select_at_the_line_outs_width();
