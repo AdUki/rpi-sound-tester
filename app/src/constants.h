@@ -155,12 +155,60 @@ inline constexpr unsigned kNetTimelineMs = 6000;
 inline constexpr double kNetLeadFilterTauS = 2.0;
 inline constexpr double kNetResyncFrames = 0.25 * kDefaultRate;
 
+// How quickly a converter's ratio trim closes a residual offset, and how far it may stray from
+// nominal. 0.2% is far more than two crystals can differ by, and small enough that the audio does
+// not audibly change pitch while it is being applied. Shared by every clock this device has to
+// follow: a network sender's and the HDMI output's.
+inline constexpr double kAsrcTauS = 5.0;
+inline constexpr double kAsrcTrimMax = 0.002;
+
 // Frames per audio packet. Small on purpose: a clock probe queued behind one of these on a
 // 100 Mbit link waits under ~80 us, i.e. under ten samples of timing error at 96 kHz.
 inline constexpr unsigned kNetPacketFrames = ST_PACKET_FRAMES;
 inline constexpr unsigned kNetMaxPacketFrames = 4096;
 
 static_assert(kDefaultRate == ST_DEFAULT_RATE, "the plugin's default rate must match the card's");
+
+// ---- HDMI output ---------------------------------------------------------------------------
+//
+// A second, stereo sink on the Pi's own HDMI audio (the firmware snd_bcm2835 driver). It plays the
+// same buses and routed inputs as the Octo's DACs, rendered by the audio thread at the same n and
+// handed to a thread of its own through a ring. HDMI runs on the Pi's clock, not the Octo's FPGA,
+// so that thread follows the card with a trimmed sample-rate converter, as a network input does.
+inline constexpr unsigned kHdmiChannels = 2;
+
+// The rate the HDMI PCM is opened at. 48 kHz because every HDMI sink must accept it: the
+// firmware driver advertises anything up to 192 kHz whatever the TV can actually play, so asking
+// for the card's own 96 kHz would "succeed" and then be resampled or dropped out of sight.
+inline constexpr unsigned kHdmiRateDefault = 48000;
+inline constexpr bool hdmi_rate_ok(unsigned r) { return r == 44100 || r == 48000 || r == 96000; }
+
+// Handoff ring, in engine frames: 2^16 is 0.68 s at 96 kHz and 512 kB pinned. The reader sits a
+// few periods behind the writer, so this only has to outlast a stall of the HDMI thread.
+inline constexpr size_t kHdmiRingFrames = 1u << 16;
+
+// The HDMI PCM's own buffering. The firmware driver reports its position in coarse steps, so
+// generous periods are worth more than a few milliseconds of latency: what a delay measurement
+// needs is for the latency to be constant, not small.
+inline constexpr unsigned kHdmiPeriodMs = 20;
+inline constexpr unsigned kHdmiPeriods = 4;
+
+// How far behind the card's current sample the HDMI reader aims, in engine periods, on top of
+// the HDMI buffer itself. The engine publishes a whole period at a time, so the reader needs at
+// least one period of slack to never find its next chunk not yet written; three leaves room for
+// scheduling jitter.
+inline constexpr unsigned kHdmiRingLagPeriods = 3;
+
+// Past this much latency error the output is re-anchored rather than walked back by the trim.
+inline constexpr double kHdmiResyncS = 0.05;
+
+// How long after an anchor the latency readings are ignored. A driver that has just started
+// reports its queue in a transient way for the first few periods — measured under PipeWire at
+// 70 ms short — and letting that prime the filter trips a resync against nothing.
+inline constexpr double kHdmiSettleS = 0.5;
+
+// Below the audio thread (80): an HDMI hiccup must never cost the Octo a block.
+inline constexpr int kHdmiRtPriority = 60;
 
 // "Genie" convenience helpers (GET /api/genie/sound, GET /api/genie/sync).
 inline constexpr float kGenieSoundThresholdDb = -60.0f;  // peak_db above this reads as "sound"

@@ -29,6 +29,64 @@ std::string read_file(const std::string& path) {
   return ss.str();
 }
 
+// One output's routing, shared by the Octo's outputs and the HDMI pair so the two cannot come to
+// disagree on the file format, the clamps or what an unknown source falls back to.
+json output_to_json(const OutputConfig& o) {
+  return {{"source", {{"type", o.source_type}, {"index", o.source_index}}},
+          {"gain_db", o.gain_db},
+          {"mute", o.mute}};
+}
+
+OutputConfig output_from_json(const json& o) {
+  OutputConfig c;
+  if (o.contains("source")) {
+    const json& src = o["source"];
+    c.source_type = src.value("type", std::string("silence"));
+    if (src.contains("index")) {
+      const auto& idx = src["index"];
+      c.source_index = idx.is_string() ? idx.get<std::string>() : std::to_string(idx.get<int>());
+    }
+  }
+  c.gain_db = o.value("gain_db", 0.0f);
+  c.mute = o.value("mute", false);
+  return c;
+}
+
+void apply_output(const OutputConfig& o, OutputControl& oc) {
+  SourceType type = SourceType::Silence;
+  uint8_t index = 0;
+  if (o.source_type == "input") {
+    type = SourceType::Input;
+    index = static_cast<uint8_t>(std::clamp(std::atoi(o.source_index.c_str()), 0,
+                                            static_cast<int>(kTotalInputs) - 1));
+  } else if (o.source_type == "gen") {
+    GenId g = GenId::Sine;
+    if (parse_gen(o.source_index, &g)) {
+      type = SourceType::Gen;
+      index = static_cast<uint8_t>(g);
+    }
+  }
+  oc.source.store(pack_source(type, index));
+  oc.gain_db.store(std::clamp(o.gain_db, kLevelMinDb, kLevelMaxDb));
+  oc.mute.store(o.mute);
+}
+
+OutputConfig output_from_control(const OutputControl& oc) {
+  OutputConfig c;
+  const uint32_t packed = oc.source.load();
+  const SourceType t = source_type(packed);
+  const uint8_t idx = source_index(packed);
+  c.source_type = to_string(t);
+  if (t == SourceType::Input) {
+    c.source_index = std::to_string(idx);
+  } else if (t == SourceType::Gen) {
+    c.source_index = gen_name(static_cast<GenId>(idx));
+  }
+  c.gain_db = oc.gain_db.load();
+  c.mute = oc.mute.load();
+  return c;
+}
+
 }  // namespace
 
 std::string Config::to_json() const {
@@ -43,16 +101,13 @@ std::string Config::to_json() const {
   for (const auto& i : inputs) j["inputs"].push_back({{"gain_db", i.gain_db}, {"mute", i.mute}});
 
   j["outputs"] = json::array();
-  for (const auto& o : outputs) {
-    j["outputs"].push_back({{"source", {{"type", o.source_type}, {"index", o.source_index}}},
-                            {"gain_db", o.gain_db},
-                            {"mute", o.mute}});
-  }
+  for (const auto& o : outputs) j["outputs"].push_back(output_to_json(o));
 
   j["generators"]["sine"] = {{"freq_hz", sine_freq_hz}, {"level_db", sine_level_db}};
   j["generators"]["noise"] = {{"mode", noise_mode}, {"level_db", noise_level_db}};
   j["generators"]["ping"] = {
       {"variant", ping_variant}, {"interval_s", ping_interval_s}, {"level_db", ping_level_db}};
+  j["generators"]["music"] = {{"level_db", music_level_db}};
 
   j["input_map"] = input_map;
   j["output_map"] = output_map;
@@ -61,6 +116,13 @@ std::string Config::to_json() const {
   j["loopback_offset_samples"] = loopback_offset_samples;
   j["listen"] = {{"codec", listen_codec}, {"bitrate_kbps", listen_bitrate_kbps}};
   j["net"] = {{"enabled", net_enabled}, {"port", net_port}, {"delay_ms", net_delay_ms}};
+  json hdmi_outs = json::array();
+  for (const auto& o : hdmi_outputs) hdmi_outs.push_back(output_to_json(o));
+  j["hdmi"] = {{"enabled", hdmi_enabled},
+               {"device", hdmi_device},
+               {"sample_rate", hdmi_sample_rate},
+               {"outputs", hdmi_outs},
+               {"names", hdmi_names}};
   return j.dump(2);
 }
 
@@ -84,20 +146,8 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
 
     if (j.contains("outputs")) {
       const auto& arr = j.at("outputs");
-      for (size_t i = 0; i < arr.size() && i < kOutputs; ++i) {
-        const auto& o = arr[i];
-        if (o.contains("source")) {
-          const json& src = o["source"];
-          c.outputs[i].source_type = src.value("type", std::string("silence"));
-          if (src.contains("index")) {
-            const auto& idx = src["index"];
-            c.outputs[i].source_index = idx.is_string() ? idx.get<std::string>()
-                                                        : std::to_string(idx.get<int>());
-          }
-        }
-        c.outputs[i].gain_db = o.value("gain_db", 0.0f);
-        c.outputs[i].mute = o.value("mute", false);
-      }
+      for (size_t i = 0; i < arr.size() && i < kOutputs; ++i)
+        c.outputs[i] = output_from_json(arr[i]);
     }
 
     if (j.contains("generators")) {
@@ -115,6 +165,7 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
         c.ping_interval_s = g["ping"].value("interval_s", c.ping_interval_s);
         c.ping_level_db = g["ping"].value("level_db", c.ping_level_db);
       }
+      if (g.contains("music")) c.music_level_db = g["music"].value("level_db", c.music_level_db);
     }
 
     if (j.contains("input_map")) {
@@ -137,6 +188,18 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
       c.listen_codec = j["listen"].value("codec", c.listen_codec);
       c.listen_bitrate_kbps = j["listen"].value("bitrate_kbps", c.listen_bitrate_kbps);
     }
+    if (j.contains("hdmi")) {
+      const json& h = j.at("hdmi");
+      c.hdmi_enabled = h.value("enabled", c.hdmi_enabled);
+      c.hdmi_device = h.value("device", c.hdmi_device);
+      c.hdmi_sample_rate = h.value("sample_rate", c.hdmi_sample_rate);
+      if (h.contains("outputs")) {
+        const auto& arr = h.at("outputs");
+        for (size_t i = 0; i < arr.size() && i < kHdmiChannels; ++i)
+          c.hdmi_outputs[i] = output_from_json(arr[i]);
+      }
+      if (h.contains("names")) c.hdmi_names = h.at("names").get<std::vector<std::string>>();
+    }
   } catch (const std::exception& e) {
     if (err) *err = e.what();
     return false;
@@ -144,6 +207,9 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
 
   c.input_names.resize(kTotalInputs);
   c.output_names.resize(kOutputs);
+  c.hdmi_names.resize(kHdmiChannels);
+  // Not clamped: a rate the HDMI path cannot use falls back to the one every sink accepts.
+  if (!hdmi_rate_ok(c.hdmi_sample_rate)) c.hdmi_sample_rate = kHdmiRateDefault;
   *out = c;
   return true;
 }
@@ -155,25 +221,9 @@ void Config::apply_to(Control& ctl) const {
     ctl.inputs[i].mute.store(inputs[i].mute);
   }
 
-  for (unsigned i = 0; i < kOutputs; ++i) {
-    const OutputConfig& o = outputs[i];
-    SourceType type = SourceType::Silence;
-    uint8_t index = 0;
-    if (o.source_type == "input") {
-      type = SourceType::Input;
-      index = static_cast<uint8_t>(std::clamp(std::atoi(o.source_index.c_str()), 0,
-                                              static_cast<int>(kTotalInputs) - 1));
-    } else if (o.source_type == "gen") {
-      GenId g = GenId::Sine;
-      if (parse_gen(o.source_index, &g)) {
-        type = SourceType::Gen;
-        index = static_cast<uint8_t>(g);
-      }
-    }
-    ctl.outputs[i].source.store(pack_source(type, index));
-    ctl.outputs[i].gain_db.store(std::clamp(o.gain_db, kLevelMinDb, kLevelMaxDb));
-    ctl.outputs[i].mute.store(o.mute);
-  }
+  for (unsigned i = 0; i < kOutputs; ++i) apply_output(outputs[i], ctl.outputs[i]);
+  for (unsigned i = 0; i < kHdmiChannels; ++i) apply_output(hdmi_outputs[i], ctl.hdmi_outputs[i]);
+  ctl.hdmi.enabled.store(hdmi_enabled);
 
   ctl.sine.freq_hz.store(std::clamp(sine_freq_hz, kSineFreqMinHz, kSineFreqMaxHz));
   ctl.sine.level_db.store(std::clamp(sine_level_db, kLevelMinDb, kLevelMaxDb));
@@ -189,6 +239,7 @@ void Config::apply_to(Control& ctl) const {
   ctl.ping.interval_s.store(std::clamp(ping_interval_s, kPingIntervalMinS, kPingIntervalMaxS));
   ctl.ping.level_db.store(std::clamp(ping_level_db, kLevelMinDb, kLevelMaxDb));
   ctl.ping.epoch.fetch_add(1);
+  ctl.music.level_db.store(std::clamp(music_level_db, kLevelMinDb, kLevelMaxDb));
 
   ListenCodec lc = ListenCodec::Opus;
   parse_codec(listen_codec, &lc);
@@ -228,21 +279,10 @@ Config Config::from_control(const Control& ctl, const Config& base) {
     c.inputs[i].mute = ctl.inputs[i].mute.load();
   }
 
-  for (unsigned i = 0; i < kOutputs; ++i) {
-    const uint32_t packed = ctl.outputs[i].source.load();
-    const SourceType t = source_type(packed);
-    const uint8_t idx = source_index(packed);
-    c.outputs[i].source_type = to_string(t);
-    if (t == SourceType::Input) {
-      c.outputs[i].source_index = std::to_string(idx);
-    } else if (t == SourceType::Gen) {
-      c.outputs[i].source_index = gen_name(static_cast<GenId>(idx));
-    } else {
-      c.outputs[i].source_index = "";
-    }
-    c.outputs[i].gain_db = ctl.outputs[i].gain_db.load();
-    c.outputs[i].mute = ctl.outputs[i].mute.load();
-  }
+  for (unsigned i = 0; i < kOutputs; ++i) c.outputs[i] = output_from_control(ctl.outputs[i]);
+  for (unsigned i = 0; i < kHdmiChannels; ++i)
+    c.hdmi_outputs[i] = output_from_control(ctl.hdmi_outputs[i]);
+  c.hdmi_enabled = ctl.hdmi.enabled.load();
 
   c.sine_freq_hz = ctl.sine.freq_hz.load();
   c.sine_level_db = ctl.sine.level_db.load();
@@ -251,6 +291,7 @@ Config Config::from_control(const Control& ctl, const Config& base) {
   c.ping_variant = ping_name(static_cast<PingVariant>(ctl.ping.variant.load()));
   c.ping_interval_s = ctl.ping.interval_s.load();
   c.ping_level_db = ctl.ping.level_db.load();
+  c.music_level_db = ctl.music.level_db.load();
 
   for (unsigned i = 0; i < kInputs; ++i) c.input_map[i] = ctl.input_map[i].load();
   for (unsigned i = 0; i < kOutputs; ++i) c.output_map[i] = ctl.output_map[i].load();

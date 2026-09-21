@@ -19,7 +19,7 @@ struct InputConfig {
 
 struct OutputConfig {
   std::string source_type = "silence";  // silence | input | gen
-  std::string source_index;             // "0".."5" for input, "sine"/"noise"/"ping" for gen
+  std::string source_index;             // "0".."11" for input, a gen_name() for gen
   float gain_db = 0.0f;
   bool mute = false;
 };
@@ -40,6 +40,7 @@ struct Config {
   std::string ping_variant = "tick";
   float ping_interval_s = 2.0f;
   float ping_level_db = -20.0f;
+  float music_level_db = -20.0f;
 
   std::array<uint8_t, kInputs> input_map{{0, 1, 2, 3, 4, 5}};
   std::array<uint8_t, kOutputs> output_map{{0, 1, 2, 3, 4, 5, 6, 7}};
@@ -61,6 +62,16 @@ struct Config {
   bool net_enabled = false;
   int net_port = kNetPort;
   int net_delay_ms = static_cast<int>(kNetDelayDefaultMs);
+
+  // HDMI output. `hdmi_device` is an ALSA name: the firmware driver calls the first HDMI port's
+  // card "b1" once snd_bcm2835.enable_compat_alsa=0 is on the kernel command line, and exposes it
+  // as device 1 of card "ALSA" when it is not. `hdmi_sample_rate` is the rate that PCM is opened
+  // at (never "rate": the image recipe patches every "rate" key in config.json to the card's).
+  bool hdmi_enabled = false;
+  std::string hdmi_device = "hw:b1,0";
+  unsigned hdmi_sample_rate = kHdmiRateDefault;
+  std::array<OutputConfig, kHdmiChannels> hdmi_outputs{};
+  std::vector<std::string> hdmi_names{kHdmiChannels};
 
   std::string to_json() const;
   static bool from_json(const std::string& text, Config* out, std::string* err);

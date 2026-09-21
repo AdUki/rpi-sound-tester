@@ -9,8 +9,10 @@
 #include <algorithm>
 #include <cmath>
 
+#include "output_route.h"
 #include "util/dsp.h"
 #include "util/log.h"
+#include "util/rt.h"
 
 namespace st {
 
@@ -24,17 +26,6 @@ constexpr unsigned kReopenDelayS = 5;
 void sleep_ms(unsigned ms) {
   timespec ts{static_cast<time_t>(ms / 1000), static_cast<long>((ms % 1000) * 1000000L)};
   nanosleep(&ts, nullptr);
-}
-
-void make_realtime() {
-  sched_param p{};
-  p.sched_priority = kRtPriority;
-  if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &p) != 0) {
-    LOG_WARN("could not set SCHED_FIFO {} on the audio thread (running at normal priority)",
-             kRtPriority);
-  } else {
-    LOG_INFO("audio thread running SCHED_FIFO {}", kRtPriority);
-  }
 }
 
 // Touch the stack once up front so no page fault can land inside the audio loop. The
@@ -418,51 +409,45 @@ void AudioEngine::process_block(uint64_t n, size_t frames, float* in_all, float*
 
   ring_.write(ring_block, frames);
 
+  RingBuffer* const hdmi_ring = hdmi_ring_.load(std::memory_order_relaxed);
+  const bool hdmi_on = hdmi_ring && ctl_.hdmi.enabled.load(std::memory_order_relaxed);
+
   // Outputs play at n, undelayed — but capture is held back by cap_delay_frames_, so a ping
   // emitted now shows up in the ring that much later. The log records where it will APPEAR, not
   // where it was emitted, or the scope's ping markers and genie/sync would both aim a full
   // second wide of the arrival the moment a network channel is in use.
+  //
+  // The melody is rendered only while something plays it. It is a pure function of n, so the
+  // blocks it skips cost it nothing: it picks up at the right place in the tune on its own.
+  bool want_music = false;
+  for (const OutputControl& oc : ctl_.outputs) want_music |= routes_gen(oc, GenId::Music);
+  if (hdmi_on)
+    for (const OutputControl& oc : ctl_.hdmi_outputs) want_music |= routes_gen(oc, GenId::Music);
+  if (!want_music) std::fill(gen_music_.begin(), gen_music_.begin() + frames, 0.0f);
   gen_.render(n, frames, ctl_, gen_sine_.data(), gen_noise_.data(), gen_ping_.data(),
-              ctl_.ping_log, cap_delay_frames_);
+              want_music ? gen_music_.data() : nullptr, ctl_.ping_log, cap_delay_frames_);
 
-  const float* gens[3] = {gen_sine_.data(), gen_noise_.data(), gen_ping_.data()};
+  const float* gens[static_cast<size_t>(GenId::Count)] = {gen_sine_.data(), gen_noise_.data(),
+                                                          gen_ping_.data(), gen_music_.data()};
 
   for (unsigned o = 0; o < kOutputs; ++o) {
-    const OutputControl& oc = ctl_.outputs[o];
-    // Every control value is read once per block, never per sample: an atomic load inside
-    // the sample loop would defeat the vectorizer.
-    const uint32_t packed = oc.source.load(std::memory_order_relaxed);
-    const SourceType type = source_type(packed);
-    const uint8_t index = source_index(packed);
-    const float gain = oc.mute.load(std::memory_order_relaxed)
-                           ? 0.0f
-                           : db_to_lin(oc.gain_db.load(std::memory_order_relaxed));
-    const uint64_t identify_until = oc.identify_until.load(std::memory_order_relaxed);
+    route_output<kOutputs>(ctl_.outputs[o], n, frames, in_all, gens, gen_, identify_frames_,
+                           out8 + o);
+  }
 
-    const float* src = nullptr;
-    size_t stride = 1;
-    if (type == SourceType::Input && index < kTotalInputs) {
-      src = in_all + index;
-      stride = kTotalInputs;
-    } else if (type == SourceType::Gen && index < static_cast<uint8_t>(GenId::Count)) {
-      src = gens[index];
-    }
-
-    if (identify_until > n) {
-      // Identify overrides whatever is routed here, then reverts on its own. Rare and
-      // brief, so it gets the slow path all to itself.
-      for (size_t i = 0; i < frames; ++i) {
-        const uint64_t t = n + i;
-        out8[i * kOutputs + o] =
-            t < identify_until ? gen_.identify_sample(identify_frames_ - (identify_until - t))
-            : src              ? gain * src[i * stride]
-                               : 0.0f;
+  // The HDMI pair, rendered here at the same n by the same code as the DACs, then handed to the
+  // HDMI thread. Written whether or not anything is playing it, so the handoff ring's counter never
+  // falls out of step with the capture ring's; that write is a memcpy and an atomic store.
+  if (hdmi_ring) {
+    if (hdmi_on) {
+      for (unsigned c = 0; c < kHdmiChannels; ++c) {
+        route_output<kHdmiChannels>(ctl_.hdmi_outputs[c], n, frames, in_all, gens, gen_,
+                                    identify_frames_, hdmi_block_.data() + c);
       }
-    } else if (!src) {
-      for (size_t i = 0; i < frames; ++i) out8[i * kOutputs + o] = 0.0f;
     } else {
-      for (size_t i = 0; i < frames; ++i) out8[i * kOutputs + o] = gain * src[i * stride];
+      std::fill(hdmi_block_.begin(), hdmi_block_.begin() + frames * kHdmiChannels, 0.0f);
     }
+    hdmi_ring->write(hdmi_block_.data(), frames);
   }
 }
 
@@ -593,7 +578,7 @@ void AudioEngine::run_sim() {
 void* AudioEngine::thread_entry(void* self) {
   auto* e = static_cast<AudioEngine*>(self);
   prefault_stack();
-  make_realtime();
+  make_realtime(kRtPriority, "audio");
 
   if (e->opt_.sim) {
     LOG_INFO("simulator: {} Hz, period {}, virtual loopback OUT->IN (stagger {} frames/ch)",
@@ -664,9 +649,11 @@ void AudioEngine::size_buffers() {
     cap_delay_.assign(cap_delay_len_ * kInputs, 0.0f);
   }
   out8_.assign(static_cast<size_t>(opt_.period) * kOutputs, 0.0f);
+  hdmi_block_.assign(static_cast<size_t>(opt_.period) * kHdmiChannels, 0.0f);
   gen_sine_.assign(opt_.period, 0.0f);
   gen_noise_.assign(opt_.period, 0.0f);
   gen_ping_.assign(opt_.period, 0.0f);
+  gen_music_.assign(opt_.period, 0.0f);
   gen_.init(opt_.rate);
   identify_frames_ = static_cast<uint64_t>(kIdentifySeconds * opt_.rate);
 }

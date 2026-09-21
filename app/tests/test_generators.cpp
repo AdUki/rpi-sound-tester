@@ -1,5 +1,6 @@
 #include "generators.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -19,7 +20,7 @@ void render_blocks(Generators& g, Control& ctl, PingLog& log, size_t blocks, siz
                    std::vector<float>* sine, std::vector<float>* noise, std::vector<float>* ping) {
   std::vector<float> bs(period), bn(period), bp(period);
   for (size_t b = 0; b < blocks; ++b) {
-    g.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), log);
+    g.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), nullptr, log);
     if (sine) sine->insert(sine->end(), bs.begin(), bs.end());
     if (noise) noise->insert(noise->end(), bn.begin(), bn.end());
     if (ping) ping->insert(ping->end(), bp.begin(), bp.end());
@@ -101,7 +102,7 @@ void test_ping_interval_change_reschedules() {
   ctl.ping.epoch.fetch_add(1);
   std::vector<float> bs(1024), bn(1024), bp(1024);
   for (size_t b = 200; b < 800; ++b) {
-    g.render(b * 1024, 1024, ctl, bs.data(), bn.data(), bp.data(), log);
+    g.render(b * 1024, 1024, ctl, bs.data(), bn.data(), bp.data(), nullptr, log);
   }
 
   const auto pings = log.recent();
@@ -132,8 +133,8 @@ void test_ping_log_carries_the_capture_delay() {
   Generators g2;
   g2.init(kRate);
   for (size_t b = 0; b < 200; ++b) {
-    g.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), plain, 0);
-    g2.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), shifted, offset);
+    g.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), nullptr, plain, 0);
+    g2.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), nullptr, shifted, offset);
   }
 
   const auto a = plain.recent();
@@ -232,6 +233,117 @@ void test_noise_is_bounded_and_nonzero() {
   }
 }
 
+
+// ---- Music -------------------------------------------------------------------------------------
+
+// Renders [start, start + total) of the melody bus in blocks of `block` frames.
+std::vector<float> render_music(Generators& g, uint64_t start, size_t total, size_t block,
+                                float amp) {
+  std::vector<float> out(total);
+  for (size_t done = 0; done < total; done += block) {
+    const size_t len = std::min(block, total - done);
+    g.render_music(start + done, len, amp, out.data() + done);
+  }
+  return out;
+}
+
+// The melody is a pure function of the absolute index. Block size must not matter, and neither
+// may when rendering began — a sink that starts listening mid-tune, or an engine that skipped the
+// blocks nobody was routed to, hears exactly what it would have heard anyway.
+void test_music_is_pure_in_n() {
+  Generators a, b, c;
+  a.init(kRate);
+  b.init(kRate);
+  c.init(kRate);
+  const size_t total = 3 * 96000;
+  const uint64_t start = 5 * 96000 + 123;  // mid-loop, mid-note
+  const auto x = render_music(a, start, total, 1024, 0.5f);
+  const auto y = render_music(b, start, total, 777, 0.5f);
+  CHECK(x == y);
+
+  // A fresh instance that starts half-way through, against the tail of the first rendering.
+  const size_t skip = 100000;
+  const auto z = render_music(c, start + skip, total - skip, 512, 0.5f);
+  bool same = true;
+  for (size_t i = 0; i < z.size(); ++i) same &= z[i] == x[skip + i];
+  CHECK(same);
+
+  // And it goes through Generators::render unchanged.
+  Control ctl;
+  ctl.music.level_db.store(-6.0f);
+  PingLog log;
+  std::vector<float> bs(1024), bn(1024), bp(1024), bm(1024), direct(1024);
+  Generators d;
+  d.init(kRate);
+  d.render(start, 1024, ctl, bs.data(), bn.data(), bp.data(), bm.data(), log);
+  d.render_music(start, 1024, db_to_lin(-6.0f), direct.data());
+  CHECK(bm == direct);
+}
+
+void test_music_loops_seamlessly() {
+  Generators g;
+  g.init(kRate);
+  const uint64_t L = g.music_loop_frames();
+  CHECK_EQ(L, static_cast<uint64_t>(12.8 * kRate));
+
+  // Exactly periodic: loop k and loop k+1 are the same samples.
+  const auto x = render_music(g, 0, 2 * L, 1024, 1.0f);
+  bool periodic = true;
+  for (size_t i = 0; i < L; ++i) periodic &= x[i] == x[i + L];
+  CHECK(periodic);
+
+  // And not trivially so: there is sound in the loop.
+  float peak = 0.0f;
+  for (size_t i = 0; i < L; ++i) peak = std::max(peak, std::fabs(x[i]));
+  CHECK(peak > 0.5f);
+}
+
+// No clicks anywhere, including the loop seam and every note boundary: the largest step between
+// adjacent samples stays within what the fastest partial at full envelope can produce. A note cut
+// off mid-waveform would jump by a sizeable fraction of full scale.
+void test_music_has_no_clicks() {
+  Generators g;
+  g.init(kRate);
+  const uint64_t L = g.music_loop_frames();
+  const float amp = 1.0f;
+  const auto x = render_music(g, L - 96000, 2 * 96000 + L, 1000, amp);  // spans a seam and a loop
+
+  const double f_max = 440.0 * std::pow(2.0, (79 - 69) / 12.0);  // G5, the highest note
+  // Carrier slope w(1 + 2 * 0.25) plus the 5 ms attack's own slope, with a margin.
+  const double bound = 1.2 * amp * (2.0 * kPi * f_max * 1.5 + 1.0 / 0.005) / kRate;
+  double worst = 0.0;
+  for (size_t i = 1; i < x.size(); ++i)
+    worst = std::max(worst, static_cast<double>(std::fabs(x[i] - x[i - 1])));
+  CHECK(worst <= bound);
+  CHECK(worst > 0.1 * bound);  // it does move
+}
+
+void test_music_level() {
+  Generators g;
+  g.init(kRate);
+  const uint64_t L = g.music_loop_frames();
+  for (float db : {0.0f, -20.0f}) {
+    const float amp = db_to_lin(db);
+    const auto x = render_music(g, 0, L, 4096, amp);
+    float peak = 0.0f;
+    for (float v : x) {
+      CHECK(std::isfinite(v));
+      peak = std::max(peak, std::fabs(v));
+    }
+    CHECK(peak <= amp);
+    CHECK(peak >= 0.5f * amp);
+  }
+}
+
+// The tune lasts the same time at any rate: the grid is in seconds, not frames.
+void test_music_is_rate_independent() {
+  Generators a, b;
+  a.init(48000.0);
+  b.init(96000.0);
+  CHECK_EQ(b.music_loop_frames(), 2 * a.music_loop_frames());
+  CHECK_EQ(a.music_loop_frames(), static_cast<uint64_t>(12.8 * 48000));
+}
+
 }  // namespace
 
 int main() {
@@ -243,5 +355,10 @@ int main() {
   test_sine_frequency_and_level();
   test_sine_phase_is_continuous_across_blocks();
   test_noise_is_bounded_and_nonzero();
+  test_music_is_pure_in_n();
+  test_music_loops_seamlessly();
+  test_music_has_no_clicks();
+  test_music_level();
+  test_music_is_rate_independent();
   return report("generators");
 }

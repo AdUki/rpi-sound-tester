@@ -30,6 +30,9 @@ void test_json_round_trip() {
   a.ping_variant = "bong";
   a.ping_interval_s = 3.5f;
   a.ping_level_db = -24.0f;
+  a.music_level_db = -9.0f;
+  a.outputs[2].source_type = "gen";
+  a.outputs[2].source_index = "music";
   a.input_map = {5, 4, 3, 2, 1, 0};
   a.output_map = {7, 6, 5, 4, 3, 2, 1, 0};
   a.input_names[0] = "left speaker";
@@ -66,6 +69,8 @@ void test_json_round_trip() {
   CHECK_EQ(b.ping_variant, std::string("bong"));
   CHECK_EQ(b.ping_interval_s, 3.5f);
   CHECK_EQ(b.ping_level_db, -24.0f);
+  CHECK_EQ(b.music_level_db, -9.0f);
+  CHECK_EQ(b.outputs[2].source_index, std::string("music"));
   CHECK_EQ(b.input_map[0], 5);
   CHECK_EQ(b.output_map[0], 7);
   CHECK_EQ(b.input_names[0], std::string("left speaker"));
@@ -115,6 +120,9 @@ void test_control_round_trip() {
   a.outputs[2].gain_db = -6.0f;
   a.outputs[5].source_type = "gen";
   a.outputs[5].source_index = "noise";
+  a.outputs[6].source_type = "gen";
+  a.outputs[6].source_index = "music";
+  a.music_level_db = -14.0f;
   a.inputs[1].gain_db = 12.0f;
   a.noise_mode = "pink";
   a.ping_variant = "bing";
@@ -133,6 +141,8 @@ void test_control_round_trip() {
   CHECK_EQ(source_index(ctl.outputs[2].source.load()), 4);
   CHECK_EQ(source_type(ctl.outputs[5].source.load()), SourceType::Gen);
   CHECK_EQ(source_index(ctl.outputs[5].source.load()), static_cast<uint8_t>(GenId::Noise));
+  CHECK_EQ(source_index(ctl.outputs[6].source.load()), static_cast<uint8_t>(GenId::Music));
+  CHECK_EQ(ctl.music.level_db.load(), -14.0f);
   CHECK_EQ(ctl.input_map[0].load(), 1);
 
   const Config b = Config::from_control(ctl, a);
@@ -142,6 +152,8 @@ void test_control_round_trip() {
   CHECK_EQ(b.outputs[2].gain_db, -6.0f);
   CHECK_EQ(b.outputs[5].source_type, std::string("gen"));
   CHECK_EQ(b.outputs[5].source_index, std::string("noise"));
+  CHECK_EQ(b.outputs[6].source_index, std::string("music"));
+  CHECK_EQ(b.music_level_db, -14.0f);
   CHECK_EQ(b.noise_mode, std::string("pink"));
   CHECK_EQ(b.ping_variant, std::string("bing"));
   CHECK_EQ(b.input_map[0], 1);
@@ -170,6 +182,7 @@ void test_saved_values_are_clamped() {
   c.outputs[0].gain_db = 10.0f;
   c.sine_level_db = 10.0f;
   c.ping_interval_s = 0.01f;
+  c.music_level_db = 6.0f;
 
   Control ctl;
   c.apply_to(ctl);
@@ -179,6 +192,7 @@ void test_saved_values_are_clamped() {
   CHECK_EQ(ctl.outputs[0].gain_db.load(), kLevelMaxDb);
   CHECK_EQ(ctl.sine.level_db.load(), kLevelMaxDb);
   CHECK_EQ(ctl.ping.interval_s.load(), kPingIntervalMinS);
+  CHECK_EQ(ctl.music.level_db.load(), kLevelMaxDb);
 }
 
 // A hand-edited output source may omit "index" entirely; the parse must fall back, not abort
@@ -189,6 +203,74 @@ void test_source_without_index_parses() {
   CHECK(Config::from_json(R"({"outputs": [{"source": {"type": "silence"}}]})", &c, &err));
   CHECK_EQ(c.outputs[0].source_type, std::string("silence"));
   CHECK_EQ(c.outputs[0].source_index, std::string(""));
+}
+
+// The HDMI block rides the same file and the same Config<->Control path as everything else.
+void test_hdmi_round_trip() {
+  Config a;
+  a.hdmi_enabled = true;
+  a.hdmi_device = "hw:ALSA,1";
+  a.hdmi_sample_rate = 44100;
+  a.hdmi_outputs[0].source_type = "gen";
+  a.hdmi_outputs[0].source_index = "music";
+  a.hdmi_outputs[0].gain_db = -3.0f;
+  a.hdmi_outputs[1].source_type = "input";
+  a.hdmi_outputs[1].source_index = "7";
+  a.hdmi_outputs[1].mute = true;
+  a.hdmi_names[1] = "tv right";
+
+  Config b;
+  std::string err;
+  CHECK(Config::from_json(a.to_json(), &b, &err));
+  CHECK(b.hdmi_enabled);
+  CHECK_EQ(b.hdmi_device, std::string("hw:ALSA,1"));
+  CHECK_EQ(b.hdmi_sample_rate, 44100u);
+  CHECK_EQ(b.hdmi_outputs[0].source_index, std::string("music"));
+  CHECK_EQ(b.hdmi_outputs[0].gain_db, -3.0f);
+  CHECK_EQ(b.hdmi_outputs[1].source_type, std::string("input"));
+  CHECK_EQ(b.hdmi_outputs[1].source_index, std::string("7"));
+  CHECK(b.hdmi_outputs[1].mute);
+  CHECK_EQ(b.hdmi_names[1], std::string("tv right"));
+
+  Control ctl;
+  b.apply_to(ctl);
+  CHECK(ctl.hdmi.enabled.load());
+  CHECK_EQ(source_type(ctl.hdmi_outputs[0].source.load()), SourceType::Gen);
+  CHECK_EQ(source_index(ctl.hdmi_outputs[0].source.load()), static_cast<uint8_t>(GenId::Music));
+  CHECK_EQ(source_index(ctl.hdmi_outputs[1].source.load()), 7);
+  // The Octo's outputs are untouched by the HDMI pair.
+  CHECK_EQ(source_type(ctl.outputs[0].source.load()), SourceType::Silence);
+
+  ctl.hdmi.enabled.store(false);
+  ctl.hdmi_outputs[1].gain_db.store(-12.0f);
+  const Config c = Config::from_control(ctl, b);
+  CHECK(!c.hdmi_enabled);
+  CHECK_EQ(c.hdmi_outputs[1].gain_db, -12.0f);
+  CHECK_EQ(c.hdmi_outputs[0].source_index, std::string("music"));
+  CHECK_EQ(c.hdmi_device, std::string("hw:ALSA,1"));  // not live: carried over from the base
+}
+
+// A config written before HDMI existed must load with HDMI off, and a rate the HDMI path cannot
+// use falls back to the one every sink accepts rather than being passed to the driver.
+void test_hdmi_defaults_and_bad_values() {
+  Config c;
+  std::string err;
+  CHECK(Config::from_json(R"({"rate": 96000})", &c, &err));
+  CHECK(!c.hdmi_enabled);
+  CHECK_EQ(c.hdmi_device, std::string("hw:b1,0"));
+  CHECK_EQ(c.hdmi_sample_rate, kHdmiRateDefault);
+  CHECK_EQ(c.hdmi_names.size(), static_cast<size_t>(kHdmiChannels));
+
+  CHECK(Config::from_json(R"({"hdmi": {"sample_rate": 22050,
+      "outputs": [{"source": {"type": "gen", "index": "nope"}, "gain_db": 12.0}]}})", &c, &err));
+  CHECK_EQ(c.hdmi_sample_rate, kHdmiRateDefault);
+  Control ctl;
+  c.apply_to(ctl);
+  CHECK_EQ(source_type(ctl.hdmi_outputs[0].source.load()), SourceType::Silence);
+  CHECK_EQ(ctl.hdmi_outputs[0].gain_db.load(), kLevelMaxDb);
+
+  // The shipped defaults parse, and ship HDMI off.
+  CHECK(!Config{}.hdmi_enabled);
 }
 
 void test_garbage_is_rejected() {
@@ -208,5 +290,7 @@ int main() {
   test_source_without_index_parses();
   test_garbage_is_rejected();
   test_capture_delay_is_zero_unless_network_input_is_on();
+  test_hdmi_round_trip();
+  test_hdmi_defaults_and_bad_values();
   return report("config");
 }

@@ -135,6 +135,18 @@
 
   <h2>Outputs</h2>
   <div id="outputs" class="grid"></div>
+
+  <!-- The Pi's own HDMI audio. Routed exactly like the outputs above and on the same sample axis,
+       so a ping through a TV can be measured like one through a DAC. -->
+  <div id="hdmisec" hidden>
+    <h2>HDMI output</h2>
+    <div class="hdmibar">
+      <label class="hdmion"><input type="checkbox" id="hdmion"> On</label>
+      <span id="hdmistate" class="pill">off</span>
+      <span id="hdmidetail" class="muted small mono"></span>
+    </div>
+    <div id="hdmiouts" class="grid"></div>
+  </div>
 </section>
 
 <section id="scope" class="panel">
@@ -292,6 +304,25 @@
       (440 Hz, 250 ms) ring for many cycles and are meant to be heard, not measured.</p>
     <h4>Recent emissions</h4>
     <div id="pinglog" class="mono small"></div>
+  </div>
+  <div class="card">
+    <h3>Music</h3>
+    <p class="muted small">A 12.8 s loop of <em>Ode to Joy</em> with a bass line. It is there to
+      be heard: route it to a speaker, a TV or an amplifier to check it plays. Pick
+      <strong>Music</strong> from an output's Source list.</p>
+    <label>Level <input type="range" id="musiclevel" min="-60" max="0" step="0.5">
+      <span id="musiclevelv" class="mono val"></span> dBFS</label>
+  </div>
+
+  <div class="card">
+    <h3>HDMI output</h3>
+    <p class="muted small">The Pi's own HDMI audio. On the image it is <span class="mono">hw:b1,0</span>;
+      a kernel booted without <span class="mono">snd_bcm2835.enable_compat_alsa=0</span> calls it
+      <span class="mono">hw:ALSA,1</span> instead. 48 kHz is the rate every TV accepts.</p>
+    <label>Device <input type="text" id="hdmidev" class="mono" spellcheck="false"></label>
+    <label>Rate <select id="hdmirate"></select> Hz</label>
+    <button id="hdmiapply">Apply</button>
+    <span id="hdmimsg" class="muted small"></span>
   </div>
 
   <div class="card wide">

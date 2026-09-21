@@ -109,6 +109,82 @@ int effective_kbps(const BitrateOverride& b, const Control& ctl) {
   return b.fixed ? b.kbps : ctl.listen.bitrate_kbps.load();
 }
 
+// One output's state and its PUT body, shared by the Octo's outputs and the HDMI pair so the two
+// routes accept exactly the same sources and clamp exactly alike.
+json output_json(const OutputControl& oc, unsigned ch, const std::string& name) {
+  const uint32_t packed = oc.source.load();
+  const SourceType t = source_type(packed);
+  const uint8_t idx = source_index(packed);
+  json src{{"type", to_string(t)}};
+  if (t == SourceType::Input) {
+    src["index"] = idx;
+  } else if (t == SourceType::Gen) {
+    src["index"] = gen_name(static_cast<GenId>(idx));
+  }
+  return {{"ch", ch},
+          {"source", src},
+          {"gain_db", oc.gain_db.load()},
+          {"mute", oc.mute.load()},
+          {"name", name}};
+}
+
+// False, with the 400 already sent, when the body names a source that does not exist.
+bool apply_output_put(OutputControl& oc, const json& j, httplib::Response& res) {
+  if (j.contains("source")) {
+    const std::string type = j["source"].value("type", "silence");
+    SourceType t = SourceType::Silence;
+    uint8_t index = 0;
+    if (type == "input") {
+      const auto& iv = j["source"].at("index");
+      const int i = iv.is_string() ? std::atoi(iv.get<std::string>().c_str()) : iv.get<int>();
+      if (i < 0 || i >= static_cast<int>(kTotalInputs)) {
+        send_error(res, 400, "bad input index");
+        return false;
+      }
+      t = SourceType::Input;
+      index = static_cast<uint8_t>(i);
+    } else if (type == "gen") {
+      GenId g;
+      if (!parse_gen(j["source"].at("index").get<std::string>(), &g)) {
+        send_error(res, 400, "bad generator name");
+        return false;
+      }
+      t = SourceType::Gen;
+      index = static_cast<uint8_t>(g);
+    } else if (type != "silence") {
+      send_error(res, 400, "bad source type");
+      return false;
+    }
+    oc.source.store(pack_source(t, index));
+  }
+  if (j.contains("gain_db")) {
+    oc.gain_db.store(std::clamp(j["gain_db"].get<float>(), kLevelMinDb, kLevelMaxDb));
+  }
+  if (j.contains("mute")) oc.mute.store(j["mute"].get<bool>());
+  return true;
+}
+
+json hdmi_status_json(const HdmiStatus& h) {
+  return {{"enabled", h.enabled},
+          {"open", h.open},
+          {"playing", h.playing},
+          {"device", h.device},
+          {"sample_rate", h.sample_rate},
+          {"device_rate", h.device_rate},
+          {"period_frames", h.period_frames},
+          {"buffer_frames", h.buffer_frames},
+          {"latency_ms", h.latency_ms},
+          {"target_ms", h.target_ms},
+          {"ring_ms", h.ring_ms},
+          {"alsa_ms", h.alsa_ms},
+          {"trim_ppm", h.trim_ppm},
+          {"xruns", h.xruns},
+          {"underruns", h.underruns},
+          {"overruns", h.overruns},
+          {"resyncs", h.resyncs},
+          {"error", h.error}};
+}
+
 json meters_json(const AnalysisSnapshot& s) {
   json rms = json::array(), peak = json::array();
   for (unsigned c = 0; c < kTotalInputs; ++c) {
@@ -248,12 +324,13 @@ void WebServer::install_routes() {
       si = sys_;
     }
     // Copies, because a concurrent /api/config/save may replace d_.config.
-    std::vector<std::string> in_names, out_names;
+    std::vector<std::string> in_names, out_names, hdmi_names;
     int64_t loopback_offset = 0;
     {
       std::lock_guard<std::mutex> lk(config_m_);
       in_names = d_.config.input_names;
       out_names = d_.config.output_names;
+      hdmi_names = d_.config.hdmi_names;
       loopback_offset = d_.config.loopback_offset_samples;
     }
 
@@ -267,22 +344,13 @@ void WebServer::install_routes() {
                          {"loopback_offset_samples", loopback_offset}});
 
     json outs = json::array();
-    for (unsigned i = 0; i < kOutputs; ++i) {
-      const uint32_t packed = d_.ctl.outputs[i].source.load();
-      const SourceType t = source_type(packed);
-      const uint8_t idx = source_index(packed);
-      json src{{"type", to_string(t)}};
-      if (t == SourceType::Input) {
-        src["index"] = idx;
-      } else if (t == SourceType::Gen) {
-        src["index"] = gen_name(static_cast<GenId>(idx));
-      }
-      outs.push_back({{"ch", i},
-                      {"source", src},
-                      {"gain_db", d_.ctl.outputs[i].gain_db.load()},
-                      {"mute", d_.ctl.outputs[i].mute.load()},
-                      {"name", out_names[i]}});
-    }
+    for (unsigned i = 0; i < kOutputs; ++i)
+      outs.push_back(output_json(d_.ctl.outputs[i], i, out_names[i]));
+
+    json hdmi = hdmi_status_json(d_.hdmi.status());
+    hdmi["outputs"] = json::array();
+    for (unsigned i = 0; i < kHdmiChannels; ++i)
+      hdmi["outputs"].push_back(output_json(d_.ctl.hdmi_outputs[i], i, hdmi_names[i]));
 
     // A network channel with no name in config.json takes the sender's: the dashboard card then
     // reads "NET 1 — thinkpad.local" with nothing to configure, which is the whole point of
@@ -325,6 +393,7 @@ void WebServer::install_routes() {
     json j{
         {"inputs", ins},
         {"outputs", outs},
+        {"hdmi", hdmi},
         {"generators",
          {{"sine", {{"freq_hz", d_.ctl.sine.freq_hz.load()}, {"level_db", d_.ctl.sine.level_db.load()}}},
           {"noise",
@@ -333,7 +402,8 @@ void WebServer::install_routes() {
           {"ping",
            {{"variant", ping_name(static_cast<PingVariant>(d_.ctl.ping.variant.load()))},
             {"interval_s", d_.ctl.ping.interval_s.load()},
-            {"level_db", d_.ctl.ping.level_db.load()}}}}},
+            {"level_db", d_.ctl.ping.level_db.load()}}},
+          {"music", {{"level_db", d_.ctl.music.level_db.load()}}}}},
         {"channel_map", {{"input_map", imap}, {"output_map", omap}}},
         {"capture", cap},
         {"engine",
@@ -374,7 +444,11 @@ void WebServer::install_routes() {
           {"net_delay_min_ms", kNetDelayMinMs},
           {"net_delay_max_ms", kNetDelayMaxMs},
           {"net", true},
-          {"pinned_mb", (d_.ring.pinned_bytes() + d_.capture.pinned_bytes()) / (1024 * 1024)}}},
+          {"hdmi", true},
+          {"hdmi_rates", json::array({44100, 48000, 96000})},
+          {"pinned_mb",
+           (d_.ring.pinned_bytes() + d_.capture.pinned_bytes() + d_.hdmi.pinned_bytes()) /
+               (1024 * 1024)}}},
     };
     send_json(res, j);
   });
@@ -461,39 +535,82 @@ void WebServer::install_routes() {
 
   svr.Put("/api/outputs/:ch", json_channel_route("ch", kOutputs, "no such output",
       [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response& res) {
-    if (j.contains("source")) {
-      const std::string type = j["source"].value("type", "silence");
-      SourceType t = SourceType::Silence;
-      uint8_t index = 0;
-      if (type == "input") {
-        const auto& iv = j["source"].at("index");
-        const int i = iv.is_string() ? std::atoi(iv.get<std::string>().c_str()) : iv.get<int>();
-        if (i < 0 || i >= static_cast<int>(kTotalInputs)) return send_error(res, 400, "bad input index");
-        t = SourceType::Input;
-        index = static_cast<uint8_t>(i);
-      } else if (type == "gen") {
-        GenId g;
-        if (!parse_gen(j["source"].at("index").get<std::string>(), &g)) {
-          return send_error(res, 400, "bad generator name");
-        }
-        t = SourceType::Gen;
-        index = static_cast<uint8_t>(g);
-      } else if (type != "silence") {
-        return send_error(res, 400, "bad source type");
-      }
-      d_.ctl.outputs[ch].source.store(pack_source(t, index));
-    }
-    if (j.contains("gain_db")) {
-      d_.ctl.outputs[ch].gain_db.store(
-          std::clamp(j["gain_db"].get<float>(), kLevelMinDb, kLevelMaxDb));
-    }
-    if (j.contains("mute")) d_.ctl.outputs[ch].mute.store(j["mute"].get<bool>());
+    apply_output_put(d_.ctl.outputs[ch], j, res);
   }));
 
   svr.Post("/api/outputs/:ch/identify", [this](const httplib::Request& req, httplib::Response& res) {
     unsigned ch = 0;
     if (!parse_index(req, "ch", kOutputs, &ch)) return send_error(res, 404, "no such output");
     d_.ctl.outputs[ch].identify_until.store(d_.ring.counter() + d_.engine.identify_frames());
+    send_json(res, json{{"ok", true}});
+  });
+
+  // ---- HDMI output ------------------------------------------------------------------------
+  //
+  // L and R route exactly like the Octo's outputs — same sources, same clamps, same Identify —
+  // and play at the same n. Only the link itself (on/off, device, rate) is configured here.
+  svr.Get("/api/hdmi", [this](const httplib::Request&, httplib::Response& res) {
+    json j = hdmi_status_json(d_.hdmi.status());
+    std::vector<std::string> names;
+    {
+      std::lock_guard<std::mutex> lk(config_m_);
+      names = d_.config.hdmi_names;
+    }
+    j["outputs"] = json::array();
+    for (unsigned i = 0; i < kHdmiChannels; ++i)
+      j["outputs"].push_back(output_json(d_.ctl.hdmi_outputs[i], i, names[i]));
+    send_json(res, j);
+  });
+
+  // Body: {"enabled": bool, "device": "hw:b1,0", "sample_rate": 48000}. A new device or rate
+  // restarts the HDMI thread; the Octo is not touched either way.
+  svr.Put("/api/hdmi", json_route([this](const json& j, const httplib::Request&,
+                                         httplib::Response& res) {
+    std::string device = d_.hdmi.device();
+    unsigned sample_rate = d_.hdmi.sample_rate();
+    if (j.contains("device")) {
+      device = j["device"].get<std::string>();
+      if (device.empty()) return send_error(res, 400, "device must not be empty");
+    }
+    if (j.contains("sample_rate")) {
+      sample_rate = j["sample_rate"].get<unsigned>();
+      if (!hdmi_rate_ok(sample_rate)) {
+        return send_error(res, 400, "sample_rate must be 44100, 48000 or 96000");
+      }
+    }
+    if (device != d_.hdmi.device() || sample_rate != d_.hdmi.sample_rate()) {
+      d_.hdmi.configure(device, sample_rate);
+      // Not live state, so it rides the config rather than Control; a later save keeps it.
+      std::lock_guard<std::mutex> lk(config_m_);
+      d_.config.hdmi_device = device;
+      d_.config.hdmi_sample_rate = sample_rate;
+    }
+    if (j.contains("enabled")) {
+      const bool on = j["enabled"].get<bool>();
+      // The audio thread starts rendering the pair before the HDMI thread goes looking for it, and
+      // stops only after that thread is gone.
+      if (on) {
+        d_.ctl.hdmi.enabled.store(true);
+        d_.hdmi.start();
+      } else {
+        d_.hdmi.stop();
+        d_.ctl.hdmi.enabled.store(false);
+      }
+    }
+    send_json(res, hdmi_status_json(d_.hdmi.status()));
+  }));
+
+  svr.Put("/api/hdmi/:ch", json_channel_route("ch", kHdmiChannels, "no such HDMI channel",
+      [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response& res) {
+    apply_output_put(d_.ctl.hdmi_outputs[ch], j, res);
+  }));
+
+  svr.Post("/api/hdmi/:ch/identify", [this](const httplib::Request& req, httplib::Response& res) {
+    unsigned ch = 0;
+    if (!parse_index(req, "ch", kHdmiChannels, &ch)) {
+      return send_error(res, 404, "no such HDMI channel");
+    }
+    d_.ctl.hdmi_outputs[ch].identify_until.store(d_.ring.counter() + d_.engine.identify_frames());
     send_json(res, json{{"ok", true}});
   });
 
@@ -539,6 +656,13 @@ void WebServer::install_routes() {
     }
     // Tells the generator to reschedule from the current sample.
     d_.ctl.ping.epoch.fetch_add(1);
+  }));
+
+  svr.Put("/api/generators/music", json_route([this](const json& j, const httplib::Request&,
+                                                     httplib::Response&) {
+    if (j.contains("level_db")) {
+      d_.ctl.music.level_db.store(std::clamp(j["level_db"].get<float>(), kLevelMinDb, kLevelMaxDb));
+    }
   }));
 
   svr.Put("/api/channel-map", json_route([this](const json& j, const httplib::Request&,
@@ -1204,6 +1328,14 @@ void WebServer::run_publisher() {
                {"sync_errors", d_.kmsg.sync_errors()},
                {"listen_streams", listen_streams_.load()},
                {"engine_running", es.running}};
+        const HdmiStatus hs = d_.hdmi.status();
+        j["hdmi"] = {{"enabled", hs.enabled},
+                     {"playing", hs.playing},
+                     {"latency_ms", hs.latency_ms},
+                     {"trim_ppm", hs.trim_ppm},
+                     {"xruns", hs.xruns},
+                     {"resyncs", hs.resyncs},
+                     {"error", hs.error}};
         j.update(sysinfo_json(si));
         hub_.publish(std::make_shared<WsMessage>(WsMessage{j.dump(), false}));
       }

@@ -31,7 +31,8 @@
   "generators": {
     "sine": { "freq_hz": 440.0, "level_db": -20.0 },
     "noise": { "mode": "white", "level_db": -20.0 },
-    "ping": { "variant": "tick", "interval_s": 2.0, "level_db": -20.0 }
+    "ping": { "variant": "tick", "interval_s": 2.0, "level_db": -20.0 },
+    "music": { "level_db": -20.0 }
   },
   "input_map": [0, 1, 2, 3, 4, 5],
   "output_map": [0, 1, 2, 3, 4, 5, 6, 7],
@@ -39,5 +40,15 @@
   "output_names": ["", "", "", "", "", "", "", ""],
   "loopback_offset_samples": 0,
   "listen": { "codec": "opus", "bitrate_kbps": 96 },
-  "net": { "enabled": false, "port": 4010, "delay_ms": 1000 }
+  "net": { "enabled": false, "port": 4010, "delay_ms": 1000 },
+  "hdmi": {
+    "enabled": false,
+    "device": "hw:b1,0",
+    "sample_rate": 48000,
+    "outputs": [
+      { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
+      { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false }
+    ],
+    "names": ["", ""]
+  }
 }

@@ -738,9 +738,9 @@ function sourceValue(src) {
 function setPingVariant(variant) {
   if (state.generators && state.generators.ping) state.generators.ping.variant = variant;
   const val = 'ping:' + variant;
-  state.outputs.forEach(o => {
-    const el = $('src' + o.ch);
-    if (el && el.value.startsWith('ping:')) el.value = val;
+  // Every sink's Source list, the HDMI pair's included: one generator, one variant.
+  document.querySelectorAll('select.outsrc').forEach(el => {
+    if (el.value.startsWith('ping:')) el.value = val;
   });
   return put('/generators/ping', {variant});
 }
@@ -759,52 +759,116 @@ function optsFor(sel) {
       '<option value="ping:tick">Test: tick</option>',
       '<option value="ping:bing">Test: bing</option>',
       '<option value="ping:bong">Test: bong</option>',
+      '<option value="genmusic">Music</option>',
     ])
     .join('');
 }
 
-function buildOutputs() {
-  $('outputs').innerHTML = state.outputs.map(o => `
+// One card per channel, for any sink that routes like the Octo's DACs: the DACs themselves and
+// the HDMI pair. `p` prefixes every element id so the two sets never collide, and `path` is the
+// REST collection the card talks to (/outputs or /hdmi) — same body, same Identify, same clamps.
+function buildOutputCards(el, outs, p, label, path) {
+  el.innerHTML = outs.map(o => `
     <div class="card">
       <div class="chan-head">
-        <span class="chan-name">OUT ${o.ch + 1}${o.name ? ' — ' + o.name : ''}</span>
-        <button id="id${o.ch}">Identify</button>
+        <span class="chan-name">${label(o.ch)}${o.name ? ' — ' + o.name : ''}</span>
+        <button id="${p}id${o.ch}">Identify</button>
       </div>
-      <label>Source <select id="src${o.ch}">${optsFor(sourceValue(o.source))}</select></label>
-      <label>Gain <input type="range" id="gain${o.ch}" min="-60" max="0" step="0.5">
-        <span id="gainv${o.ch}" class="mono val"></span> dB</label>
-      <label><input type="checkbox" id="mute${o.ch}"> Mute</label>
+      <label>Source <select id="${p}src${o.ch}" class="outsrc">${optsFor(sourceValue(o.source))}</select></label>
+      <label>Gain <input type="range" id="${p}gain${o.ch}" min="-60" max="0" step="0.5">
+        <span id="${p}gainv${o.ch}" class="mono val"></span> dB</label>
+      <label><input type="checkbox" id="${p}mute${o.ch}"> Mute</label>
     </div>`).join('');
 
-  state.outputs.forEach(o => {
+  outs.forEach(o => {
     const c = o.ch;
-    $('src' + c).value = sourceValue(o.source);
-    $('gain' + c).value = o.gain_db;
-    $('gainv' + c).textContent = o.gain_db.toFixed(1);
-    $('mute' + c).checked = o.mute;
+    $(p + 'src' + c).value = sourceValue(o.source);
+    $(p + 'gain' + c).value = o.gain_db;
+    $(p + 'gainv' + c).textContent = o.gain_db.toFixed(1);
+    $(p + 'mute' + c).checked = o.mute;
 
-    $('src' + c).onchange = e => {
+    $(p + 'src' + c).onchange = e => {
       const v = e.target.value;
       if (v.startsWith('ping:')) {
         // A ping sound: set the shared variant and route this output to the ping generator.
         setPingVariant(v.slice(5)).catch(err => toast(err.message));
-        put(`/outputs/${c}`, {source: {type: 'gen', index: 'ping'}}).catch(err => toast(err.message));
+        put(`${path}/${c}`, {source: {type: 'gen', index: 'ping'}}).catch(err => toast(err.message));
         return;
       }
       let source;
       if (v === 'silence') source = {type: 'silence'};
       else if (v.startsWith('in')) source = {type: 'input', index: parseInt(v.slice(2), 10)};
       else source = {type: 'gen', index: v.slice(3)};
-      put(`/outputs/${c}`, {source}).catch(err => toast(err.message));
+      put(`${path}/${c}`, {source}).catch(err => toast(err.message));
     };
-    $('gain' + c).oninput = e => {
-      $('gainv' + c).textContent = parseFloat(e.target.value).toFixed(1);
-      put(`/outputs/${c}`, {gain_db: parseFloat(e.target.value)}).catch(err => toast(err.message));
+    $(p + 'gain' + c).oninput = e => {
+      $(p + 'gainv' + c).textContent = parseFloat(e.target.value).toFixed(1);
+      put(`${path}/${c}`, {gain_db: parseFloat(e.target.value)}).catch(err => toast(err.message));
     };
-    $('mute' + c).onchange = e =>
-      put(`/outputs/${c}`, {mute: e.target.checked}).catch(err => toast(err.message));
-    $('id' + c).onclick = () => post(`/outputs/${c}/identify`).catch(err => toast(err.message));
+    $(p + 'mute' + c).onchange = e =>
+      put(`${path}/${c}`, {mute: e.target.checked}).catch(err => toast(err.message));
+    $(p + 'id' + c).onclick = () => post(`${path}/${c}/identify`).catch(err => toast(err.message));
   });
+}
+
+function buildOutputs() {
+  buildOutputCards($('outputs'), state.outputs, '', ch => `OUT ${ch + 1}`, '/outputs');
+  buildHdmi();
+}
+
+// ---------------------------------------------------------------- HDMI output
+//
+// The Pi's own HDMI audio, as a stereo sink beside the DACs. It plays at the same sample index as
+// every other output, a fixed latency later, so the one thing worth watching here besides "is it
+// playing" is that latency holding still.
+
+function buildHdmi() {
+  const h = state.hdmi;
+  $('hdmisec').hidden = !h;   // an older daemon has no HDMI output
+  if (!h) return;
+  buildOutputCards($('hdmiouts'), h.outputs, 'h', ch => (ch === 0 ? 'HDMI L' : 'HDMI R'), '/hdmi');
+  $('hdmion').checked = !!h.enabled;
+  $('hdmion').onchange = e => put('/hdmi', {enabled: e.target.checked})
+    .then(renderHdmi)
+    .catch(err => { toast(err.message); e.target.checked = !e.target.checked; });
+
+  $('hdmidev').value = h.device;
+  const rates = (state.limits && state.limits.hdmi_rates) || [44100, 48000, 96000];
+  $('hdmirate').innerHTML = rates.map(r => `<option value="${r}">${r}</option>`).join('');
+  $('hdmirate').value = String(h.sample_rate);
+  $('hdmiapply').onclick = () => {
+    const device = $('hdmidev').value.trim();
+    put('/hdmi', {device, sample_rate: parseInt($('hdmirate').value, 10)})
+      .then(r => { renderHdmi(r); $('hdmimsg').textContent = 'applied — the HDMI output restarts'; })
+      .catch(err => { $('hdmimsg').textContent = err.message; });
+  };
+  renderHdmi(h);
+}
+
+// Takes either the full status (/api/hdmi, /api/state) or the compact one in the 1 Hz system
+// frame; everything it reads is in both.
+function renderHdmi(h) {
+  if (!h || !$('hdmistate')) return;
+  const pill = $('hdmistate'), detail = $('hdmidetail');
+  if (document.activeElement !== $('hdmion')) $('hdmion').checked = !!h.enabled;
+  if (!h.enabled) {
+    pill.textContent = 'off';
+    pill.className = 'pill';
+    detail.textContent = '';
+  } else if (h.playing) {
+    pill.textContent = 'playing';
+    pill.className = 'pill ' + (h.xruns || h.resyncs ? 'warn' : 'good');
+    const t = Math.round(h.trim_ppm);   // and never "-0"
+    const trim = t > 0 ? '+' + t : t < 0 ? String(t) : '0';
+    detail.textContent = `latency ${h.latency_ms.toFixed(1)} ms · clock trim ${trim} ppm` +
+      ` · xruns ${h.xruns} · resyncs ${h.resyncs}`;
+    detail.title = 'Engine to HDMI driver, held constant. The TV or receiver adds its own, also ' +
+      'constant — calibrate it once with a ping through an HDMI audio extractor.';
+  } else {
+    pill.textContent = h.error ? 'no device' : 'starting';
+    pill.className = 'pill ' + (h.error ? 'bad' : 'warn');
+    detail.textContent = h.error || '';
+  }
 }
 
 // A live bar spectrum-analyser per input. The daemon pushes 240 log-spaced dB bins at 5 Hz; we fold
@@ -914,6 +978,10 @@ function bindGenerators() {
   $('pinginterval').value = g.ping.interval_s;
   $('pinglevel').value = g.ping.level_db;
   $('pinglevelv').textContent = g.ping.level_db.toFixed(1);
+  // An older daemon has no music generator; leave the card inert rather than throw.
+  const music = g.music || {level_db: -20};
+  $('musiclevel').value = music.level_db;
+  $('musiclevelv').textContent = music.level_db.toFixed(1);
 
   $('sinefreq').onchange = e => put('/generators/sine', {freq_hz: parseFloat(e.target.value)}).catch(report);
   $('sinelevel').oninput = e => {
@@ -929,6 +997,10 @@ function bindGenerators() {
   $('pinglevel').oninput = e => {
     $('pinglevelv').textContent = parseFloat(e.target.value).toFixed(1);
     put('/generators/ping', {level_db: parseFloat(e.target.value)}).catch(report);
+  };
+  $('musiclevel').oninput = e => {
+    $('musiclevelv').textContent = parseFloat(e.target.value).toFixed(1);
+    put('/generators/music', {level_db: parseFloat(e.target.value)}).catch(report);
   };
   // The 1 s ping poll is started (and stopped) with the live feed, not here.
 }
@@ -975,13 +1047,11 @@ function applyNetAvailability(active) {
 // them from state.outputs, which is only fetched at boot, so any routing the operator has changed
 // since would visibly snap back to its old value while the daemon kept the new one.
 function refreshOutputSourceOptions() {
-  for (let c = 0; c < NOUT; c++) {
-    const sel = $('src' + c);
-    if (!sel) continue;
+  document.querySelectorAll('select.outsrc').forEach(sel => {
     const cur = sel.value;
     sel.innerHTML = optsFor(cur);
     sel.value = cur;
-  }
+  });
 }
 
 // The heading and its explanation belong to the cards under it: with no sender there is nothing
@@ -2476,6 +2546,12 @@ function buildSystem() {
     ['Saved config', s.has_saved_config ? 'yes (data partition)' : 'no (image defaults)'],
     ['Loopback offset', s.loopback_offset_samples + ' samples'],
   ];
+  const h = state.hdmi;
+  if (h) {
+    rows.push(['HDMI output', !h.enabled ? 'off'
+      : `${h.device}, ${h.device_rate || h.sample_rate} Hz` +
+        (h.playing ? `, latency ${h.latency_ms.toFixed(1)} ms` : h.error ? ` — ${h.error}` : ', starting')]);
+  }
   if (e.last_error) rows.push(['Last error', e.last_error]);
   $('systable').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
 
@@ -2549,6 +2625,7 @@ function onSystem(s) {
   $('syncbanner').classList.toggle('hidden', !s.sync_errors);
   renderHost(s);
   renderPower(s.throttle);
+  if (s.hdmi) renderHdmi(s.hdmi);
 }
 
 // The single push feed carries every live visual: the waveform envelope, the spectrum, the meters
@@ -2607,6 +2684,10 @@ function pollState() {
     }
     buildSystem();
     syncInputLevels(s2.inputs);
+    if (s2.hdmi) {
+      state.hdmi = s2.hdmi;
+      renderHdmi(s2.hdmi);
+    }
   }).catch(() => {});
   // Only while the panel is on screen — the same discipline refreshPings() uses, so a background
   // tab costs the daemon nothing.

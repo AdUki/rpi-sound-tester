@@ -13,7 +13,7 @@
 namespace st {
 
 enum class SourceType : uint8_t { Silence = 0, Input = 1, Gen = 2 };
-enum class GenId : uint8_t { Sine = 0, Noise = 1, Ping = 2, Count = 3 };
+enum class GenId : uint8_t { Sine = 0, Noise = 1, Ping = 2, Music = 3, Count = 4 };
 enum class NoiseMode : uint8_t { White = 0, Pink = 1 };
 enum class PingVariant : uint8_t { Tick = 0, Bing = 1, Bong = 2 };
 
@@ -63,6 +63,12 @@ struct PingControl {
   std::atomic<float> level_db{-20.0f};
   // Bumped on every change so the generator knows to reschedule its next emission.
   std::atomic<uint32_t> epoch{0};
+};
+
+// A short melody in a loop, for listening rather than measuring: a sink that plays this is
+// visibly and audibly alive. The tune itself is fixed (generators.cpp); only the level is live.
+struct MusicControl {
+  std::atomic<float> level_db{-20.0f};
 };
 
 // Default listen codec and per-channel Opus bitrate. Not read by the audio thread — these live
@@ -181,14 +187,25 @@ struct NetControl {
   std::atomic<uint32_t> delay_frames{0};
 };
 
+// The HDMI output. `enabled` is what the audio thread reads: while it is off, the HDMI pair is
+// neither rendered nor keeps the melody alive. The device and its rate are not live values; they
+// belong to the HDMI thread and the config.
+struct HdmiControl {
+  std::atomic<bool> enabled{false};
+};
+
 // Written by web handlers, read by the audio thread at the top of each block. Scalars are
 // independent atomics; tearing across a block boundary there is benign.
 struct Control {
   std::array<InputControl, kTotalInputs> inputs;
   std::array<OutputControl, kOutputs> outputs;
+  // HDMI L and R: routed exactly like the Octo's outputs, and on the same sample axis.
+  std::array<OutputControl, kHdmiChannels> hdmi_outputs;
+  HdmiControl hdmi;
   SineControl sine;
   NoiseControl noise;
   PingControl ping;
+  MusicControl music;
   ListenControl listen;
   NetControl net;
 
@@ -219,6 +236,7 @@ inline const char* gen_name(GenId g) {
     case GenId::Sine: return "sine";
     case GenId::Noise: return "noise";
     case GenId::Ping: return "ping";
+    case GenId::Music: return "music";
     default: return "?";
   }
 }
@@ -227,6 +245,7 @@ inline bool parse_gen(const std::string& s, GenId* out) {
   if (s == "sine") { *out = GenId::Sine; return true; }
   if (s == "noise") { *out = GenId::Noise; return true; }
   if (s == "ping") { *out = GenId::Ping; return true; }
+  if (s == "music") { *out = GenId::Music; return true; }
   return false;
 }
 

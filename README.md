@@ -9,8 +9,9 @@ Plug a device into the sound card, open `http://soundtester.local`, and you get:
   right, both or neither, and channels sharing an ear are mixed — per-channel level/peak meters,
   spectrum, THD+N, a 6-lane scope you can freeze, and up to +40 dB of digital make-up gain for
   a device too quiet to read.
-- **Outputs (8):** route any input to any output; sine, white/pink noise, and tick/bing/bong
-  pings.
+- **Outputs (8 + HDMI):** route any input to any output; sine, white/pink noise, tick/bing/bong
+  pings, and a short looping melody. The Pi's own HDMI audio is a stereo output too, on the same
+  sample axis, so a TV or AV receiver's latency can be measured like a DAC's.
 - **Multiroom sync measurement:** freeze the capture, bracket a ping, and get the delay
   between two inputs **to the sample** — with a confidence number that tells you when not to
   trust it.

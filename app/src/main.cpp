@@ -11,6 +11,7 @@
 #include "config.h"
 #include "constants.h"
 #include "control.h"
+#include "hdmi_out.h"
 #include "kmsg_watch.h"
 #include "ring_buffer.h"
 #include "util/log.h"
@@ -53,6 +54,7 @@ int main(int argc, char** argv) {
   unsigned period = 0;
   int port = 80;
   int net_port = 0;  // 0 = whatever the config says
+  std::string hdmi_device;
   std::string www = "/usr/share/soundtester/www";
   std::string config_path = "/etc/soundtester/config.json";
   std::string data_dir = "/data";
@@ -65,6 +67,9 @@ int main(int argc, char** argv) {
   app.add_option("--period", period, "Period size in frames (default 1024)");
   app.add_option("--port", port, "HTTP port (default 80)");
   app.add_option("--net-port", net_port, "TCP port for network audio input (default 4010)");
+  app.add_option("--hdmi-device", hdmi_device,
+                 "ALSA device for the HDMI output, and turn it on (e.g. hw:b1,0, or default to "
+                 "hear it through a desktop's speakers)");
   app.add_option("--www", www, "Directory of static web files");
   app.add_option("--config", config_path, "Path to the default config");
   app.add_option("--data-dir", data_dir, "Where saved settings live (the writable partition)");
@@ -89,6 +94,14 @@ int main(int argc, char** argv) {
   if (!device.empty()) cfg.device = device;
   if (rate) cfg.rate = rate;
   if (period) cfg.period = period;
+  if (!hdmi_device.empty()) {
+    cfg.hdmi_device = hdmi_device;
+    cfg.hdmi_enabled = true;
+  } else if (sim) {
+    // A simulated run is a desktop: a saved config asking for the Pi's HDMI card would only fill
+    // the log with a device that does not exist here. The console can still turn it on.
+    cfg.hdmi_enabled = false;
+  }
 
   st::Control ctl;
   cfg.apply_to(ctl);
@@ -113,6 +126,11 @@ int main(int argc, char** argv) {
   engine.set_net(&net);
   if (cfg.net_enabled) net.start(static_cast<uint16_t>(cfg.net_port));
 
+  // Same rule: its ring is handed to the engine before the audio thread exists, and a device that
+  // will not open is reported, never fatal.
+  st::HdmiOutput hdmi(ctl, engine, cfg.hdmi_device, cfg.hdmi_sample_rate);
+  engine.set_hdmi_ring(&hdmi.ring());
+
   // A card that will not open is never fatal: the audio thread keeps retrying and the web
   // console comes up regardless, reporting the failure in /api/state. Only a thread that
   // cannot be created is fatal.
@@ -120,6 +138,8 @@ int main(int argc, char** argv) {
     LOG_ERROR("could not create the audio thread");
     return 1;
   }
+
+  if (cfg.hdmi_enabled) hdmi.start();
 
   st::Analysis analysis(ring, engine.rate());
   analysis.start();
@@ -136,7 +156,7 @@ int main(int argc, char** argv) {
   // systemctl the host.
   wopt.allow_reboot = !sim;
 
-  st::Deps deps{ctl, net, ring, engine, analysis, capture, kmsg, store, cfg};
+  st::Deps deps{ctl, net, hdmi, ring, engine, analysis, capture, kmsg, store, cfg};
   st::WebServer server(deps, wopt);
   g_server = &server;
 
@@ -150,6 +170,7 @@ int main(int argc, char** argv) {
   LOG_INFO("shutting down");
   kmsg.stop();
   analysis.stop();
+  hdmi.stop();
   engine.stop();
   g_server = nullptr;
   return ok ? 0 : 1;

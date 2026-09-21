@@ -13,6 +13,7 @@
 #include "capture.h"
 #include "config.h"
 #include "control.h"
+#include "hdmi_out.h"
 #include "kmsg_watch.h"
 #include "net_audio.h"
 #include "ring_buffer.h"
@@ -34,6 +35,7 @@ struct WebOptions {
 struct Deps {
   Control& ctl;
   NetAudioServer& net;
+  HdmiOutput& hdmi;
   RingBuffer& ring;
   AudioEngine& engine;
   Analysis& analysis;

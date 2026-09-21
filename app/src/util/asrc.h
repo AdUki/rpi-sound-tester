@@ -112,4 +112,48 @@ class Asrc {
   std::vector<float> scratch_;
 };
 
+// Smooths the measured lead (or latency) before it is allowed to steer a converter. Written for
+// the network input and shared with the HDMI output, which follows a foreign clock the same way.
+//
+// The raw measurement is noisy for two reasons that have nothing to do with the clocks it is
+// meant to be tracking: packets arrive with whatever jitter the network adds, and the reader
+// position they are measured against only advances once per audio block. Feeding that straight
+// into the trim makes the loop chase noise — at a five-second time constant, one block of
+// quantisation alone is worth half the trim's whole authority.
+//
+// An exponential moving average, with its coefficient derived from the actual interval between
+// packets so the time constant is in seconds rather than in packets. Packet sizes and rates vary;
+// a fixed coefficient would mean a different filter for every sender.
+struct LeadFilter {
+  double avg = 0.0;
+  bool primed = false;
+
+  void reset() {
+    avg = 0.0;
+    primed = false;
+  }
+
+  // First measurement after an anchor is taken as-is: there is nothing to average it with, and
+  // starting from zero would spend the first seconds pretending the stream was badly out.
+  double update(double lead, double dt_s, double tau_s) {
+    if (!primed) {
+      avg = lead;
+      primed = true;
+      return avg;
+    }
+    const double a = dt_s <= 0.0 ? 0.0 : dt_s / (tau_s + dt_s);
+    avg += a * (lead - avg);
+    return avg;
+  }
+};
+
+// The trim to hold `lead` at `target`, as a multiplier on the converter's nominal ratio.
+// Proportional, and clamped: `max_dev` is far more than two crystals can differ by, and small
+// enough that the correction is never audible as a pitch step.
+inline double asrc_trim(double lead, double target, double rate, double tau_s, double max_dev) {
+  const double err = target - lead;
+  const double trim = 1.0 + err / (rate * tau_s);
+  return trim < 1.0 - max_dev ? 1.0 - max_dev : (trim > 1.0 + max_dev ? 1.0 + max_dev : trim);
+}
+
 }  // namespace st

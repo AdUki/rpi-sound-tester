@@ -41,6 +41,9 @@ DEVICE  ?=
 # Simulator: input channel c is fed from output c, delayed by c*STAGGER frames, so every
 # channel pair has a known delay to measure.
 STAGGER ?= 137
+# The HDMI output's ALSA device, which also turns it on. Off in the simulator unless given:
+#   make run HDMI=default     # hear it through this machine's speakers
+HDMI    ?=
 DISK    ?=
 
 # What `make configure` writes. Neither is tracked by git.
@@ -95,14 +98,14 @@ test: build ## Run the test suite
 	@ctest --test-dir $(BUILD) --output-on-failure
 
 .PHONY: run
-run: build ## Run it: simulated card by default, or DEVICE=hw:... for a real one
+run: build ## Run it: simulated card by default, or DEVICE=hw:... for a real one; HDMI=dev adds the HDMI output
 	@mkdir -p /tmp/soundtester
 ifeq ($(DEVICE),)
 	@echo -e "$(BOLD)http://localhost:$(PORT)$(OFF)  $(DIM)simulated card, each channel delayed $(STAGGER) frames$(OFF)"
-	@$(BIN) --sim --sim-stagger $(STAGGER) --port $(PORT) \
+	@$(BIN) --sim --sim-stagger $(STAGGER) --port $(PORT) $(if $(HDMI),--hdmi-device $(HDMI)) \
 	        --www $(APP)/www --config $(APP)/config/default-config.json --data-dir /tmp/soundtester
 else
-	@$(BIN) --device $(DEVICE) --port $(PORT) \
+	@$(BIN) --device $(DEVICE) --port $(PORT) $(if $(HDMI),--hdmi-device $(HDMI)) \
 	        --www $(APP)/www --config $(APP)/config/default-config.json --data-dir /tmp/soundtester
 endif
 

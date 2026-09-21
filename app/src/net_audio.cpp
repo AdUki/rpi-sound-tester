@@ -28,12 +28,6 @@ namespace {
 // the writer clear of the reader even if the audio thread advances while the check is in flight.
 constexpr uint64_t kGuardFrames = 2 * kDefaultPeriod;
 
-// How quickly the ratio trim closes a residual offset, and how far it may stray from nominal.
-// 0.2% is far more than two crystals can differ by, and small enough that the audio does not
-// audibly change pitch while it is being applied.
-constexpr double kAsrcTauS = 5.0;
-constexpr double kAsrcTrimMax = 0.002;
-
 // Reads exactly n bytes unless the connection dies or the server is stopping. The poll timeout is
 // what lets a parked connection notice a shutdown instead of holding teardown open.
 bool read_exact(int fd, void* buf, size_t n, const std::atomic<bool>& running) {

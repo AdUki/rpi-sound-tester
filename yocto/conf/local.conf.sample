@@ -11,7 +11,8 @@ MACHINE ?= "raspberrypi3"
 # MACHINE=raspberrypi3 (32-bit) on purpose:
 #   - its defconfig (bcm2709_defconfig) already carries
 #     CONFIG_SND_AUDIOINJECTOR_OCTO_SOUNDCARD=m
-#   - unlike raspberrypi3-64, it does not hard-code dtparam=audio=on into config.txt
+#   - unlike raspberrypi3-64, it does not hard-code dtparam=audio into config.txt, so the
+#     line below is the only one that decides it
 # A Pi 4 works too (MACHINE=raspberrypi4). The Octo has no working configuration on a Pi 5
 # at all — see docs/octo-known-issues.md.
 
@@ -64,7 +65,14 @@ RPI_KERNEL_DEVICETREE_OVERLAYS = " \
 # so on an Ethernet-only build the brcmfmac driver would otherwise probe a radio it can never
 # use: four "Direct firmware load ... failed with error -2" lines in dmesg and a 1.1 s SDIO
 # busy-wait. Set SOUNDTESTER_WIFI_SSID and the overlay disappears.
-RPI_EXTRA_CONFIG = '\n# Audio Injector Octo\ndtoverlay=audioinjector-addons,non-stop-clocks\n${@"" if d.getVar("SOUNDTESTER_WIFI_SSID") else "dtoverlay=disable-wifi\\n"}'
+#
+# The Pi's own HDMI audio is the daemon's second output. dtparam=audio=on brings up the firmware
+# audio driver (snd_bcm2835, over VCHIQ): a different block from the I2S the Octo uses, on other
+# pins. hdmi_force_hotplug=1 makes the firmware report the HDMI port even when the TV was off at
+# boot, or the driver creates no HDMI card at all; hdmi_drive=2 is HDMI mode, i.e. with audio,
+# rather than DVI. If a sink stays silent, add hdmi_force_edid_audio=1 (for EDIDs that do not
+# admit to audio), and hdmi_group=1 + hdmi_mode=4 if it will not take the 640x480 fallback mode.
+RPI_EXTRA_CONFIG = '\n# Audio Injector Octo\ndtoverlay=audioinjector-addons,non-stop-clocks\n${@"" if d.getVar("SOUNDTESTER_WIFI_SSID") else "dtoverlay=disable-wifi\\n"}\n# HDMI audio (soundtesterd HDMI output)\ndtparam=audio=on\nhdmi_force_hotplug=1\nhdmi_drive=2\n'
 
 # busybox's syslogd/klogd ship with packagegroup-core-boot, and on a systemd image they are pure
 # duplication: journald already reads /dev/kmsg directly, so klogd re-injects every kernel line
@@ -80,6 +88,12 @@ VIRTUAL-RUNTIME_base-utils-syslog = ""
 # meta-raspberrypi's rpi-cmdline.bb builds cmdline.txt from its own CMDLINE variable and
 # never sees oe-core's automatic "ro" append, so ask for it explicitly.
 CMDLINE_ROOTFS:append = " ro"
+
+# Pins the name of the HDMI audio card. snd_bcm2835 on this kernel defaults to a "compat" mode in
+# which HDMI is device 1 of a card called ALSA; with it off, the first HDMI port is its own card,
+# "b1", which is what the daemon's default hdmi.device (hw:b1,0) names. Some firmware versions add
+# this option themselves and some do not, so it is not left to them.
+CMDLINE:append = " snd_bcm2835.enable_compat_alsa=0"
 
 # Headless bench instrument.
 DISABLE_VC4GRAPHICS = "1"
