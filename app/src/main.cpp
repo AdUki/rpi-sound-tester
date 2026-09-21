@@ -94,6 +94,7 @@ int main(int argc, char** argv) {
   if (!device.empty()) cfg.device = device;
   if (rate) cfg.rate = rate;
   if (period) cfg.period = period;
+  if (net_port > 0) cfg.net_port = net_port;
   if (!hdmi_device.empty()) {
     cfg.hdmi_device = hdmi_device;
     cfg.hdmi_enabled = true;
@@ -121,10 +122,9 @@ int main(int argc, char** argv) {
   // Wired in before start(), so the audio thread never sees a half-constructed server. A bind
   // failure is reported through /api/net, not fatal — same reasoning as a card that will not
   // open: taking the console down removes the only way to find out what went wrong.
-  if (net_port > 0) cfg.net_port = net_port;  // the flag wins, like --device and --port
-  st::NetAudioServer net(ctl, engine.rate(), static_cast<uint16_t>(cfg.net_port));
+  st::NetAudioServer net(ctl, engine.rate());
   engine.set_net(&net);
-  if (cfg.net_enabled) net.start(static_cast<uint16_t>(cfg.net_port));
+  if (cfg.net_enabled) net.start(ctl.net.port.load());
 
   // Same rule: its ring is handed to the engine before the audio thread exists, and a device that
   // will not open is reported, never fatal.

@@ -73,14 +73,14 @@ void test_sample_sizes_match_the_formats() {
 
 void test_a_sender_gets_the_lowest_free_run() {
   Control ctl;
-  NetAudioServer net(ctl, kRate, kNetPort);
+  NetAudioServer net(ctl, kRate);
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", 1), 0);
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.2", 1), 1);
 }
 
 void test_a_multichannel_sender_gets_adjacent_channels() {
   Control ctl;
-  NetAudioServer net(ctl, kRate, kNetPort);
+  NetAudioServer net(ctl, kRate);
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", 1), 0);
   // A pair cannot start at 1 if that would run past a taken channel; here 1..2 are free.
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.2", 2), 1);
@@ -91,7 +91,7 @@ void test_a_multichannel_sender_gets_adjacent_channels() {
 // channel owned by no one.
 void test_a_run_that_does_not_fit_claims_nothing() {
   Control ctl;
-  NetAudioServer net(ctl, kRate, kNetPort);
+  NetAudioServer net(ctl, kRate);
   // Take one in the middle so no run of the full width can fit.
   CHECK_EQ(net.claim_channels(2, "10.0.0.9", 1), 2);
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", kNetInputs), -1);
@@ -104,7 +104,7 @@ void test_a_run_that_does_not_fit_claims_nothing() {
 
 void test_an_explicit_channel_wins_and_can_be_refused() {
   Control ctl;
-  NetAudioServer net(ctl, kRate, kNetPort);
+  NetAudioServer net(ctl, kRate);
   CHECK_EQ(net.claim_channels(3, "10.0.0.1", 1), 3);
   CHECK_EQ(net.claim_channels(3, "10.0.0.2", 1), -1);  // taken: no silent fallback elsewhere
   CHECK_EQ(net.claim_channels(kNetInputs, "10.0.0.2", 1), 0);  // out of range = "any"
@@ -114,7 +114,7 @@ void test_an_explicit_channel_wins_and_can_be_refused() {
 // output routed to NET 4 still means that machine.
 void test_a_returning_sender_gets_its_old_channel() {
   Control ctl;
-  NetAudioServer net(ctl, kRate, kNetPort);
+  NetAudioServer net(ctl, kRate);
   const int first = net.claim_channels(3, "10.0.0.7", 2);
   CHECK_EQ(first, 3);
   net.release_channels(3, 2);
@@ -131,7 +131,7 @@ void test_a_returning_sender_gets_its_old_channel() {
 // went on driving only NET 1 after a stereo sender took NET 1+2.
 void test_a_mixer_follows_its_sender_onto_the_whole_run() {
   Control ctl;
-  NetAudioServer net(ctl, kRate, kNetPort);
+  NetAudioServer net(ctl, kRate);
 
   // Nothing known about this machine yet: one channel, and it is the first one.
   auto run = net.mixer_run("10.0.0.7", ST_CTL_ANY_CHANNEL);
@@ -158,7 +158,7 @@ void test_a_mixer_follows_its_sender_onto_the_whole_run() {
 // widens to the run that channel belongs to: half of a stereo pair is not a source.
 void test_a_pinned_mixer_stays_on_its_channel() {
   Control ctl;
-  NetAudioServer net(ctl, kRate, kNetPort);
+  NetAudioServer net(ctl, kRate);
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2), 0);
 
   auto run = net.mixer_run("10.0.0.7", 4);
@@ -173,7 +173,7 @@ void test_a_pinned_mixer_stays_on_its_channel() {
 
 void test_a_channel_is_only_in_use_once_it_has_been() {
   Control ctl;
-  NetAudioServer net(ctl, kRate, kNetPort);
+  NetAudioServer net(ctl, kRate);
   CHECK(!net.channel_in_use(0));
   CHECK_EQ(net.claim_channels(0, "10.0.0.1", 1), 0);
   CHECK(net.channel_in_use(0));

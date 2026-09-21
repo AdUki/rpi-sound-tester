@@ -316,8 +316,10 @@ machine cannot be told apart by address — pin those with a port or a channel.
 ```json
 {"enabled": true, "delay_ms": 1000, "port": 4010}
 ```
-Changing the port rebinds the listener and drops any connected sender. A bind that fails still
-answers 200 — check `listening` and `error`.
+`port` is 1–65529, so the six per-channel ports above it exist too. Changing it rebinds the
+listener and drops any connected sender; with network input off it is only remembered, for the
+next enable. Either way `config/save` keeps it. A bind that fails still answers 200 — check
+`listening` and `error`.
 
 ### On the sending machine
 ```sh

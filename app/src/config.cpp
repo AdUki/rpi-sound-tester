@@ -253,6 +253,7 @@ void Config::apply_to(Control& ctl) const {
   const unsigned dms = static_cast<unsigned>(std::clamp(
       net_delay_ms, static_cast<int>(kNetDelayMinMs), static_cast<int>(kNetDelayMaxMs)));
   ctl.net.enabled.store(net_enabled);
+  ctl.net.port.store(static_cast<uint16_t>(std::clamp(net_port, kNetPortMin, kNetPortMax)));
   ctl.net.delay_ms.store(dms);
   ctl.net.delay_frames.store(net_enabled ? static_cast<uint32_t>(1ull * dms * rate / 1000) : 0);
 
@@ -299,6 +300,7 @@ Config Config::from_control(const Control& ctl, const Config& base) {
   c.listen_codec = codec_name(static_cast<ListenCodec>(ctl.listen.codec.load()));
   c.listen_bitrate_kbps = ctl.listen.bitrate_kbps.load();
   c.net_enabled = ctl.net.enabled.load();
+  c.net_port = ctl.net.port.load();
   c.net_delay_ms = static_cast<int>(ctl.net.delay_ms.load());
   return c;
 }

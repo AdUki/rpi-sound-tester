@@ -736,6 +736,16 @@ void WebServer::install_routes() {
                                         httplib::Response& res) {
     const double rate = d_.engine.rate();
 
+    // Checked before anything is applied, so a rejected body changes nothing.
+    int want_port = d_.net.port();
+    if (j.contains("port")) {
+      want_port = j["port"].get<int>();
+      if (want_port < kNetPortMin || want_port > kNetPortMax) {
+        return send_error(res, 400, "port must be " + std::to_string(kNetPortMin) + ".." +
+                                        std::to_string(kNetPortMax));
+      }
+    }
+
     if (j.contains("delay_ms")) {
       const unsigned ms = static_cast<unsigned>(std::clamp<int>(
           j["delay_ms"].get<int>(), static_cast<int>(kNetDelayMinMs),
@@ -750,17 +760,13 @@ void WebServer::install_routes() {
     const unsigned ms = d_.ctl.net.delay_ms.load();
     d_.ctl.net.delay_frames.store(on ? static_cast<uint32_t>(1ull * ms * rate / 1000) : 0);
 
-    int want_port = d_.net.port();
-    if (j.contains("port")) {
-      want_port = j["port"].get<int>();
-      if (want_port < 1 || want_port > 65535) return send_error(res, 400, "port out of range");
-    }
-
     if (!on) {
       d_.net.stop();
+      // Remembered while off: enabling later binds here, and a save keeps it.
+      d_.net.set_port(static_cast<uint16_t>(want_port));
     } else if (!d_.net.listening() || d_.net.port() != want_port) {
       d_.net.stop();
-      d_.net.start(static_cast<uint16_t>(want_port));
+      d_.net.start(static_cast<uint16_t>(want_port));  // becomes the configured port either way
     }
 
     send_json(res, json{{"enabled", on},

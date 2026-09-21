@@ -181,10 +181,15 @@ inline uint64_t mono_ns() {
 // instant on a network channel as on an ADC channel. It is derived from enabled/delay_ms by the
 // API layer rather than recomputed per block, and is 0 whenever network input is off — which is
 // what keeps a local-only device bit-identical to how it behaved before any of this existed.
+//
+// `port` is the configured base port, whether or not anything is bound to it: the server reads it
+// when it starts, the API writes it, and a save takes it from here like every other setting. The
+// audio thread never reads it.
 struct NetControl {
   std::atomic<bool> enabled{false};
   std::atomic<uint32_t> delay_ms{kNetDelayDefaultMs};
   std::atomic<uint32_t> delay_frames{0};
+  std::atomic<uint16_t> port{kNetPort};
 };
 
 // The HDMI output. `enabled` is what the audio thread reads: while it is off, the HDMI pair is

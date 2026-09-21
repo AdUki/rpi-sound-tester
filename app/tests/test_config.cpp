@@ -205,6 +205,27 @@ void test_source_without_index_parses() {
   CHECK_EQ(c.outputs[0].source_index, std::string(""));
 }
 
+// The network port rides Control like every other saved setting. It used to live only in the
+// server, so a port changed through the API was never saved.
+void test_net_port_rides_the_control_path() {
+  Config c;
+  c.net_port = 4321;
+  Control ctl;
+  c.apply_to(ctl);
+  CHECK_EQ(ctl.net.port.load(), 4321);
+
+  ctl.net.port.store(4555);  // what PUT /api/net does, enabled or not
+  CHECK_EQ(Config::from_control(ctl, c).net_port, 4555);
+
+  // A hand-edited file cannot ask for a port whose per-channel ports would run off the end.
+  c.net_port = 70000;
+  c.apply_to(ctl);
+  CHECK_EQ(static_cast<int>(ctl.net.port.load()), kNetPortMax);
+  c.net_port = 0;
+  c.apply_to(ctl);
+  CHECK_EQ(static_cast<int>(ctl.net.port.load()), kNetPortMin);
+}
+
 // The HDMI block rides the same file and the same Config<->Control path as everything else.
 void test_hdmi_round_trip() {
   Config a;
@@ -290,6 +311,7 @@ int main() {
   test_source_without_index_parses();
   test_garbage_is_rejected();
   test_capture_delay_is_zero_unless_network_input_is_on();
+  test_net_port_rides_the_control_path();
   test_hdmi_round_trip();
   test_hdmi_defaults_and_bad_values();
   return report("config");

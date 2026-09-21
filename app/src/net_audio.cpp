@@ -199,9 +199,7 @@ size_t timeline_frames(double rate) {
 }
 }  // namespace
 
-NetAudioServer::NetAudioServer(Control& ctl, double rate, uint16_t port)
-    : ctl_(ctl), rate_(rate) {
-  port_ = port;
+NetAudioServer::NetAudioServer(Control& ctl, double rate) : ctl_(ctl), rate_(rate) {
   const size_t frames = timeline_frames(rate);
   chans_.reserve(kNetInputs);
   for (unsigned c = 0; c < kNetInputs; ++c) chans_.push_back(std::make_unique<Channel>(frames));
@@ -213,7 +211,7 @@ NetAudioServer::~NetAudioServer() { stop(); }
 
 bool NetAudioServer::start(uint16_t port) {
   if (running_.load()) return true;
-  port_ = port;
+  ctl_.net.port.store(port);
 
   // Bind on the caller's thread so start() can report a real result. Doing it inside the accept
   // thread would make listening() race every caller that checks it right after enabling.
@@ -235,15 +233,15 @@ bool NetAudioServer::start(uint16_t port) {
     return true;
   };
 
-  if (!bind_one(port_, -1)) {
-    set_error("bind port " + std::to_string(port_) + ": " + strerror(errno));
+  if (!bind_one(port, -1)) {
+    set_error("bind port " + std::to_string(port) + ": " + strerror(errno));
     return false;
   }
   // The per-channel ports are a convenience, not the service: if one is taken, say so and carry
   // on rather than refusing to accept audio at all.
   unsigned pinned = 0;
   for (unsigned c = 0; c < kNetInputs; ++c) {
-    if (bind_one(static_cast<uint16_t>(port_ + 1 + c), static_cast<int>(c))) ++pinned;
+    if (bind_one(static_cast<uint16_t>(port + 1 + c), static_cast<int>(c))) ++pinned;
   }
   if (pinned != kNetInputs) {
     LOG_WARN("net: only {} of {} per-channel ports could be bound", pinned, kNetInputs);
@@ -252,8 +250,8 @@ bool NetAudioServer::start(uint16_t port) {
   set_error({});
   listening_.store(true);
   running_.store(true);
-  LOG_INFO("net: listening on {} (any channel) and {}..{} (NET 1..{})", port_, port_ + 1,
-           port_ + kNetInputs, kNetInputs);
+  LOG_INFO("net: listening on {} (any channel) and {}..{} (NET 1..{})", port, port + 1,
+           port + kNetInputs, kNetInputs);
   accept_thread_ = std::thread([this] { accept_loop(); });
   return true;
 }

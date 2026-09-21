@@ -134,6 +134,9 @@ inline constexpr size_t kPingLogEntries = 64;
 // writes it into a per-channel timeline at exactly that index. Ordering and duplication sort
 // themselves out; loss is a hole; a packet that misses its slot is dropped and counted.
 inline constexpr uint16_t kNetPort = ST_DEFAULT_PORT;
+// The base port, clamped so that base + kNetInputs, the last per-channel port, still exists.
+inline constexpr int kNetPortMin = 1;
+inline constexpr int kNetPortMax = 65535 - static_cast<int>(kNetInputs);
 inline constexpr uint32_t kNetProtoVersion = ST_NET_PROTO_VERSION;
 
 // Every local capture frame is held back by this much before entering the ring, so that ring

@@ -93,18 +93,22 @@ struct NetChannelStatus {
 // preallocated timelines.
 class NetAudioServer {
  public:
-  // `port` is the configured port, remembered even while the server is stopped so that
-  // enabling it later binds where the operator asked rather than falling back to a default.
-  NetAudioServer(Control& ctl, double rate, uint16_t port);
+  // The configured base port is ctl.net.port, remembered even while the server is stopped so
+  // that enabling it later binds where the operator asked rather than falling back to a default.
+  NetAudioServer(Control& ctl, double rate);
   ~NetAudioServer();
 
   NetAudioServer(const NetAudioServer&) = delete;
   NetAudioServer& operator=(const NetAudioServer&) = delete;
 
   // Binds and starts accepting. A failure to bind is reported, not fatal — the same philosophy
-  // as a card that will not open: the web console has to stay up to explain why.
+  // as a card that will not open: the web console has to stay up to explain why. `port` becomes
+  // the configured port whether or not the bind succeeds.
   bool start(uint16_t port);
   void stop();
+  // Changes the configured port without binding it: what a stopped server starts on next, and
+  // what a save writes. A running server keeps listening where it is until restarted.
+  void set_port(uint16_t port) { ctl_.net.port.store(port); }
 
   // Audio thread. Fills the network channels of two blocks that sit on two different axes:
   //
@@ -143,7 +147,7 @@ class NetAudioServer {
   // has been and gone leaves audio in the ring, and a freeze taken after it disconnected has to
   // stay analysable. A channel nobody has ever used stays out of the way entirely.
   bool channel_in_use(unsigned c) const;
-  uint16_t port() const { return port_; }
+  uint16_t port() const { return ctl_.net.port.load(); }
   bool listening() const { return listening_.load(); }
   std::string last_error() const;
   unsigned connected_count() const;
@@ -212,7 +216,6 @@ class NetAudioServer {
   // be pinned by the one setting its .asoundrc already had. One socket each, all in one poll.
   std::vector<int> listen_fds_;
   std::vector<int> listen_channels_;  // parallel to listen_fds_; -1 = any
-  uint16_t port_ = 0;  // the configured base port, whether or not it is bound
   std::atomic<bool> running_{false};
   std::atomic<bool> listening_{false};
   std::thread accept_thread_;
