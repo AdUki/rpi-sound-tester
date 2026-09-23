@@ -1,0 +1,12 @@
+[Unit]
+Description=Route the VIM3L sound card to HDMI and its loopback (bring-up)
+After=sound.target
+Before=soundtesterd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/soundtester-hdmi-routing
+
+[Install]
+WantedBy=multi-user.target

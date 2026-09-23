@@ -1,8 +1,8 @@
-# RPi Sound Tester
+# Sound Tester
 #
 #   make            list the targets
 #   make run        run it on this machine against a simulated card
-#   make image      build the read-only Yocto image
+#   make image      build the read-only Yocto image (BOARD=rpi3 or vim3l)
 #   make flash      write it to an SD card
 
 SHELL := /bin/bash
@@ -20,14 +20,30 @@ PLUGIN_SO    := $(PLUGIN_BUILD)/libasound_module_pcm_soundtester.so
 # VORBIS=0 builds the plugin without the encoder, and without any libvorbis dependency.
 VORBIS  ?=
 
-# Plain poky + bitbake. No kas, no pip: the layers are three git clones and two conf files.
+# Plain poky + bitbake. No kas, no pip: the layers are git clones and the build dir's conf files
+# are generated. BOARD picks the hardware; yocto/boards/$(BOARD).mk says what that means for the
+# build (MACHINE, the daemon's board profile, the BSP layer), and yocto/conf/boards/$(BOARD).conf
+# holds the board's bitbake settings. Each board builds in its own dir; downloads and sstate are
+# shared through site.conf.
+BOARD   ?= rpi3
 YOCTO   := yocto
 LAYERS  := $(YOCTO)/layers
-YB      := $(YOCTO)/build
+BOARDS  := $(patsubst $(YOCTO)/boards/%.mk,%,$(wildcard $(YOCTO)/boards/*.mk))
+ifeq ($(filter $(BOARD),$(BOARDS)),)
+  $(error BOARD=$(BOARD) is not one of: $(BOARDS))
+endif
+include $(YOCTO)/boards/$(BOARD).mk
+BOARD_MK   := $(YOCTO)/boards/$(BOARD).mk
+BOARD_CONF := $(YOCTO)/conf/boards/$(BOARD).conf
+YB      := $(YOCTO)/build-$(BOARD)
 BRANCH  := scarthgap
-MACHINE := raspberrypi3
 DEPLOY  := $(YB)/tmp/deploy/images/$(MACHINE)
-BB       = set -e && . $(LAYERS)/poky/oe-init-build-env $(CURDIR)/$(YB) >/dev/null &&
+# MACHINE is exported as well as written into auto.conf: oe-init-build-env passes it through to
+# bitbake, and auto.conf's hard assignment is what holds once the build is running.
+BB       = set -e && export MACHINE=$(MACHINE) && \
+           . $(LAYERS)/poky/oe-init-build-env $(CURDIR)/$(YB) >/dev/null &&
+# The generated build config every bitbake invocation needs.
+BUILD_CONF = check-builddir $(YB)/conf/bblayers.conf $(YB)/conf/auto.conf build-localconf $(SITE_LINK)
 
 # DEV=1 selects the writable development image (alsa-utils, ssh, package manager) instead
 # of the read-only production one. Used by both `image` and `flash`.
@@ -152,9 +168,11 @@ endif
 TARGET    ?= root@soundtester.local
 WWW_DEST  := /usr/share/soundtester/www
 BIN_DEST  := /usr/bin/soundtesterd
-# The stripped ARM binary from `make bitbake ARGS="soundtesterd"`. The daemon reads its www
-# from disk per request, so a frontend swap needs no restart; a binary swap does.
-YOCTO_BIN := $(YB)/tmp/work/cortexa7t2hf-neon-vfpv4-poky-linux-gnueabi/soundtesterd/1.0/packages-split/soundtesterd/usr/bin/soundtesterd
+# The stripped binary from `make bitbake ARGS="soundtesterd"`, found in the recipe's PKGDEST;
+# the libraries it may need are looked up under the board's TUNE_PKGARCH. Both come from
+# bitbake, so the target works for any board's toolchain. The daemon reads its www from disk per
+# request, so a frontend swap needs no restart; a binary swap does.
+yocto_vars = $(BB) bitbake -e soundtesterd | sed -n 's/^\(PKGDEST\|TUNE_PKGARCH\)="\(.*\)"$$/\1=\2/p'
 
 .PHONY: deploy-www
 deploy-www: ## Copy app/www to a running board over ssh (no restart; TARGET=root@host)
@@ -165,32 +183,34 @@ deploy-www: ## Copy app/www to a running board over ssh (no restart; TARGET=root
 	@echo -e "Done. Hard-refresh the browser $(DIM)(Ctrl+Shift+R)$(OFF)."
 
 .PHONY: deploy-daemon
-deploy-daemon: ## Copy the cross-compiled daemon to a board, stop+restart it (TARGET=root@host)
-	@if [ ! -e $(YOCTO_BIN) ]; then \
-	  echo -e "$(BOLD)No cross-compiled daemon.$(OFF) $(YOCTO_BIN) is missing."; \
-	  echo -e "Build it first:  $(BOLD)make bitbake ARGS=\"soundtesterd\"$(OFF)"; exit 1; fi
-	@echo -e "$(BOLD)$(YOCTO_BIN) → $(TARGET):$(BIN_DEST)$(OFF)"
-	@ssh $(TARGET) 'systemctl stop soundtesterd'
-	@ssh $(TARGET) 'mount -o remount,rw /'
-	@scp $(YOCTO_BIN) $(TARGET):$(BIN_DEST)
-	@# A new DEPENDS reaches the board only through a reflash, so a binary that has grown a
-	@# library since the image was built would land here and then refuse to start. Carry over
-	@# anything it needs that the board has not got; a reflash installs them properly.
+deploy-daemon: $(BUILD_CONF) ## Copy the cross-compiled daemon to a board, stop+restart it (TARGET=root@host)
 	@set -e; \
-	  for lib in $$(readelf -d $(YOCTO_BIN) | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'); do \
-	    if ! ssh $(TARGET) "test -e /usr/lib/$$lib -o -e /lib/$$lib" 2>/dev/null; then \
-	      src=$$(find $(YB)/tmp/sysroots-components -name "$$lib" -path "*cortexa7*" | head -1); \
-	      if [ -n "$$src" ]; then \
-	        echo -e "  $(DIM)+ $$lib (missing on the board)$(OFF)"; \
-	        scp -q "$$(readlink -f $$src)" $(TARGET):/usr/lib/$$lib; \
-	      else \
-	        echo -e "  $(BOLD)! $$lib is missing on the board and not in the sysroot$(OFF)"; \
-	      fi; \
+	eval "$$($(yocto_vars))"; \
+	bin="$$PKGDEST/soundtesterd/usr/bin/soundtesterd"; \
+	if [ ! -e "$$bin" ]; then \
+	  echo -e "$(BOLD)No cross-compiled daemon.$(OFF) $$bin is missing."; \
+	  echo -e "Build it first:  $(BOLD)make bitbake ARGS=\"soundtesterd\" BOARD=$(BOARD)$(OFF)"; exit 1; fi; \
+	echo -e "$(BOLD)$$bin → $(TARGET):$(BIN_DEST)$(OFF)"; \
+	ssh $(TARGET) 'systemctl stop soundtesterd'; \
+	ssh $(TARGET) 'mount -o remount,rw /'; \
+	scp "$$bin" $(TARGET):$(BIN_DEST); \
+	: 'A new DEPENDS reaches the board only through a reflash, so a binary that has grown a'; \
+	: 'library since the image was built would land here and then refuse to start. Carry over'; \
+	: 'anything it needs that the board has not got; a reflash installs them properly.'; \
+	for lib in $$(readelf -d "$$bin" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'); do \
+	  if ! ssh $(TARGET) "test -e /usr/lib/$$lib -o -e /lib/$$lib" 2>/dev/null; then \
+	    src=$$(find $(YB)/tmp/sysroots-components -name "$$lib" -path "*/$$TUNE_PKGARCH/*" | head -1); \
+	    if [ -n "$$src" ]; then \
+	      echo -e "  $(DIM)+ $$lib (missing on the board)$(OFF)"; \
+	      scp -q "$$(readlink -f $$src)" $(TARGET):/usr/lib/$$lib; \
+	    else \
+	      echo -e "  $(BOLD)! $$lib is missing on the board and not in the sysroot$(OFF)"; \
 	    fi; \
-	  done
-	@ssh $(TARGET) 'sync && mount -o remount,ro /'
-	@ssh $(TARGET) 'systemctl start soundtesterd'
-	@echo "Done. Daemon restarted with the new binary."
+	  fi; \
+	done; \
+	ssh $(TARGET) 'sync && mount -o remount,ro /'; \
+	ssh $(TARGET) 'systemctl start soundtesterd'; \
+	echo "Done. Daemon restarted with the new binary."
 
 ## ─── configure ───────────────────────────────────────────────────────────────
 
@@ -261,26 +281,30 @@ configure: ## Set hostname, ssh password, Wi-Fi and the Yocto cache dirs (intera
 
 ## ─── image ───────────────────────────────────────────────────────────────────
 
+# The newest image of this board, whatever its BSP calls it: meta-raspberrypi's names carry
+# ".rootfs", meta-meson empties IMAGE_NAME_SUFFIX and so its names do not.
+newest_image = ls -t $(DEPLOY)/$(IMAGE)-$(MACHINE)*.wic.bz2 2>/dev/null | head -1
+
 .PHONY: image
-image: check-host check-submodules check-devconf $(YB)/conf/bblayers.conf $(SITE_LINK) ## Build the image (DEV=1 for the dev image)
+image: check-host check-submodules check-devconf $(BUILD_CONF) ## Build the image (BOARD=rpi3|vim3l, DEV=1 for the dev image)
 	@$(BB) bitbake $(IMAGE)
 	@echo ""
-	@IMG=$(DEPLOY)/$(IMAGE)-$(MACHINE).rootfs.wic.bz2; \
-	if [ -e "$$IMG" ]; then \
+	@IMG=$$($(newest_image)); \
+	if [ -n "$$IMG" ]; then \
 	  echo -e "$(BOLD)$$(du -h $$(readlink -f $$IMG) | cut -f1)$(OFF)  $$IMG"; \
-	  echo -e "  flash it:  $(BOLD)make flash$(if $(DEV), DEV=1) DISK=<device>$(OFF)"; \
+	  echo -e "  flash it:  $(BOLD)make flash BOARD=$(BOARD)$(if $(DEV), DEV=1) DISK=<device>$(OFF)"; \
 	fi
 
 .PHONY: bitbake
-bitbake: check-host check-devconf $(YB)/conf/bblayers.conf $(SITE_LINK) ## Run bitbake with the layers set up (ARGS=..., or no ARGS for a shell)
+bitbake: check-host check-devconf $(BUILD_CONF) ## Run bitbake with the layers set up (ARGS=..., or no ARGS for a shell)
 ifeq ($(ARGS),)
-	@echo "Layers configured. 'exit' to leave."
+	@echo "Layers configured for BOARD=$(BOARD) (MACHINE=$(MACHINE)). 'exit' to leave."
 	@$(BB) $$SHELL
 else
 	@$(BB) bitbake $(ARGS)
 endif
 
-# The layers and build config: three clones and two generated conf files.
+# The layers and build config: git clones, and conf files generated per board.
 $(LAYERS)/poky:
 	@echo "Cloning poky ($(BRANCH))..."
 	@git clone -q --depth 1 -b $(BRANCH) https://git.yoctoproject.org/poky $@
@@ -293,8 +317,16 @@ $(LAYERS)/meta-raspberrypi:
 	@echo "Cloning meta-raspberrypi ($(BRANCH))..."
 	@git clone -q --depth 1 -b $(BRANCH) https://git.yoctoproject.org/meta-raspberrypi $@
 
-$(YB)/conf/bblayers.conf: $(LAYERS)/poky $(LAYERS)/meta-openembedded $(LAYERS)/meta-raspberrypi \
-                          $(YOCTO)/conf/bblayers.conf.sample $(YOCTO)/conf/local.conf.sample
+# meta-meson develops on master; its scarthgap branch is frozen, so pin the commit it froze at.
+MESON_REV := 524ab0409b54ebed5d113d4251a9561d7798cb45
+
+$(LAYERS)/meta-meson:
+	@echo "Cloning meta-meson ($(BRANCH), $(shell echo $(MESON_REV) | cut -c1-8))..."
+	@git clone -q -b $(BRANCH) https://github.com/superna9999/meta-meson $@
+	@git -C $@ checkout -q $(MESON_REV)
+
+$(YB)/conf/bblayers.conf: $(LAYERS)/poky $(LAYERS)/meta-openembedded $(BSP_LAYERS) \
+                          $(YOCTO)/conf/bblayers.conf.sample $(BOARD_MK)
 	@mkdir -p $(YB)/conf
 	@printf '  %s \\\n' \
 	  $(CURDIR)/$(LAYERS)/poky/meta \
@@ -303,13 +335,51 @@ $(YB)/conf/bblayers.conf: $(LAYERS)/poky $(LAYERS)/meta-openembedded $(LAYERS)/m
 	  $(CURDIR)/$(LAYERS)/meta-openembedded/meta-python \
 	  $(CURDIR)/$(LAYERS)/meta-openembedded/meta-networking \
 	  $(CURDIR)/$(LAYERS)/meta-openembedded/meta-multimedia \
-	  $(CURDIR)/$(LAYERS)/meta-raspberrypi \
+	  $(addprefix $(CURDIR)/,$(BSP_LAYERS)) \
 	  $(CURDIR)/$(YOCTO)/meta-soundtester > $(YB)/conf/.layers
 	@sed -e '/@LAYERS@/{r $(YB)/conf/.layers' -e 'd}' \
 	     $(YOCTO)/conf/bblayers.conf.sample > $(YB)/conf/bblayers.conf
 	@rm -f $(YB)/conf/.layers
-	@[ -f $(YB)/conf/local.conf ] || cp $(YOCTO)/conf/local.conf.sample $(YB)/conf/local.conf
-	@echo "Build config written to $(YB)/conf/ (local.conf is yours to edit)."
+	@echo "Layers for BOARD=$(BOARD) written to $(YB)/conf/bblayers.conf."
+
+# What makes this build dir this board's. bitbake reads auto.conf before local.conf, and the
+# board conf is required by absolute path rather than copied, so an edit to it is picked up (and
+# tracked by bitbake) without regenerating anything here.
+$(YB)/conf/auto.conf: $(BOARD_MK) Makefile
+	@mkdir -p $(YB)/conf
+	@{ echo "# Written by the Makefile for BOARD=$(BOARD) from $(BOARD_MK). Do not edit:"; \
+	   echo "# it is regenerated. One-off settings go in local.conf."; \
+	   echo 'MACHINE = "$(MACHINE)"'; \
+	   echo 'SOUNDTESTER_BOARD = "$(PROFILE)"'; \
+	   echo 'require $(CURDIR)/$(BOARD_CONF)'; } > $@
+
+# local.conf is yours to edit, so it is only ever created, never rewritten — except that one
+# from before the board split (it carries the Pi's settings, which now live in the board conf and
+# would otherwise be applied twice) is moved aside for the current sample, which is marked.
+LOCALCONF_MARK := soundtester-local-conf: board-neutral
+
+.PHONY: build-localconf
+build-localconf: $(YB)/conf/bblayers.conf
+	@if [ -f $(YB)/conf/local.conf ] && ! grep -q '$(LOCALCONF_MARK)' $(YB)/conf/local.conf; then \
+	  mv $(YB)/conf/local.conf $(YB)/conf/local.conf.pre-split; \
+	  echo -e "$(BOLD)Note:$(OFF) $(YB)/conf/local.conf predates the per-board config and was moved to"; \
+	  echo    "      local.conf.pre-split. Carry any one-off change you made in it over by hand."; \
+	fi
+	@if [ ! -f $(YB)/conf/local.conf ]; then \
+	  cp $(YOCTO)/conf/local.conf.sample $(YB)/conf/local.conf; \
+	  echo "Build config written to $(YB)/conf/ (local.conf is yours to edit)."; \
+	fi
+
+# Before the split there was a single yocto/build. Moving it keeps its sstate-backed state, but
+# bitbake refuses a build dir whose tmp/ has moved (tmp/saved_tmpdir), so tmp goes: the next build
+# repopulates it from sstate-cache, which lives outside the build dir.
+.PHONY: check-builddir
+check-builddir:
+	@if [ -d $(YOCTO)/build/conf ]; then \
+	  echo -e "$(BOLD)yocto/build is from before the per-board build dirs.$(OFF) Move it once:"; \
+	  echo -e "\n  $(BOLD)mv yocto/build yocto/build-rpi3 && rm -rf yocto/build-rpi3/tmp$(OFF)\n"; \
+	  echo    "Downloads and sstate are outside it, so the next build restores tmp/ from sstate."; \
+	  exit 1; fi
 
 # Copied rather than symlinked so that a `make clean FULL=1` cannot take the original with it.
 $(YB)/conf/site.conf: $(SITECONF) $(YB)/conf/bblayers.conf
@@ -328,12 +398,12 @@ candidates = lsblk -dno NAME,SIZE,TRAN,MODEL --exclude 7 \
 rootdisk = lsblk -no PKNAME "$$(findmnt -no SOURCE /)" 2>/dev/null | head -1
 
 .PHONY: flash
-flash: ## Write the image to a disk (DISK=/dev/..., DEV=1 for the dev image)
-	@IMG=$$(ls -t $(DEPLOY)/$(IMAGE)-$(MACHINE).rootfs*.wic.bz2 2>/dev/null | head -1); \
-	if [ -z "$$IMG" ]; then echo "No image. Run 'make image$(if $(DEV), DEV=1)' first."; exit 1; fi; \
+flash: ## Write the image to a disk (DISK=/dev/..., BOARD=, DEV=1 for the dev image)
+	@IMG=$$($(newest_image)); \
+	if [ -z "$$IMG" ]; then echo "No image. Run 'make image BOARD=$(BOARD)$(if $(DEV), DEV=1)' first."; exit 1; fi; \
 	ROOTDISK="/dev/$$($(rootdisk))"; \
 	if [ -z "$(DISK)" ]; then \
-	  echo -e "Usage: $(BOLD)make flash DISK=<device>$(OFF)   e.g. /dev/sdb, /dev/mmcblk0, /dev/sda\n"; \
+	  echo -e "Usage: $(BOLD)make flash BOARD=$(BOARD)$(if $(DEV), DEV=1) DISK=<device>$(OFF)   e.g. /dev/sdb, /dev/mmcblk0, /dev/sda\n"; \
 	  echo "Disks on this machine (the system disk $$ROOTDISK is not listed):"; \
 	  $(candidates); exit 1; fi; \
 	if [ ! -b "$(DISK)" ]; then echo "$(DISK) is not a block device."; exit 1; fi; \
@@ -364,7 +434,7 @@ flash: ## Write the image to a disk (DISK=/dev/..., DEV=1 for the dev image)
 	  bunzip2 -c "$$IMG" | sudo dd of=$(DISK) bs=4M conv=fsync status=progress; \
 	fi; \
 	sync; \
-	echo -e "\n$(BOLD)Done.$(OFF) Boot the Pi and open http://soundtester.local"
+	echo -e "\n$(BOLD)Done.$(OFF) Boot the board and open http://soundtester.local"
 
 ## ─── setup ───────────────────────────────────────────────────────────────────
 
@@ -394,12 +464,15 @@ check-devconf:
 	  echo -e "\n  $(BOLD)make configure$(OFF)   set hostname, password and Wi-Fi (starts from the defaults)"; \
 	  echo    "  or copy $$(basename $(DEVCONF)).sample over it and edit by hand"; \
 	  exit 1; fi
+	@if grep -qE '^SOUNDTESTER_(RATE|PERIOD)' $(DEVCONF); then \
+	  echo -e "$(DIM)Note: SOUNDTESTER_RATE/PERIOD in $(DEVCONF) no longer take effect: the board"; \
+	  echo -e "conf ($(BOARD_CONF)) owns them. Override in $(YB)/conf/local.conf instead.$(OFF)"; fi
 
 .PHONY: help
 help:
-	@echo -e "$(BOLD)RPi Sound Tester$(OFF)\n"
+	@echo -e "$(BOLD)Sound Tester$(OFF)  $(DIM)boards: $(BOARDS) (BOARD=$(BOARD))$(OFF)\n"
 	@awk 'BEGIN {FS = ":.*## "} \
 	     /^## ─/ { gsub(/## /,""); printf "\n\033[2m%s\033[0m\n", $$0; next } \
 	     /^[a-zA-Z_-]+:.*?## / { printf "  \033[1m%-11s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
-	@echo -e "\n$(DIM)Flags:  DEV=1 (dev image)  FULL=1 (deeper clean)  ARGS=\"...\" (bitbake)$(OFF)"
+	@echo -e "\n$(DIM)Flags:  BOARD=rpi3|vim3l  DEV=1 (dev image)  FULL=1 (deeper clean)  ARGS=\"...\" (bitbake)$(OFF)"
 	@echo -e "$(DIM)Vars:   DISK=/dev/...  DEVICE=hw:...  PORT=$(PORT)  TARGET=root@host$(OFF)\n"

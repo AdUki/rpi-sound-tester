@@ -17,8 +17,13 @@ IMAGE_INSTALL:append = " \
     alsa-utils \
     alsa-tools \
     i2c-tools \
+    usbutils \
     strace \
     htop \
 "
+
+# The VIM3L's card plays nothing until its routing is set; for bring-up with alsa-utils, set it at
+# boot. The recipe exists only when meta-meson is in the build, hence the machine override.
+IMAGE_INSTALL:append:khadas-vim3l = " soundtester-hdmi-routing"
 
 export IMAGE_BASENAME = "soundtester-image-dev"

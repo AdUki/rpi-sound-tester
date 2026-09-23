@@ -9,6 +9,9 @@ app/www/api.html
 # Yocto: cloned layers and build output. Reproduced by `make image`.
 yocto/layers/
 yocto/build/
+# One build dir per board (yocto/build-rpi3, ...). They hold the rendered Wi-Fi config and the
+# image's /etc/shadow, so they must never be committed.
+yocto/build-*/
 yocto/downloads/
 yocto/sstate-cache/
 

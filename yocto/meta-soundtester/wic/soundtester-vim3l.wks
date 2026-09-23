@@ -1,0 +1,26 @@
+# Khadas VIM3L: boot (FAT) + read-only rootfs + a small writable partition for saved settings.
+#
+# There is no boot firmware in the FAT partition as on the Pi: the Amlogic BootROM reads the signed
+# FIP (BL2 ... U-Boot) from the raw sectors starting at byte 512, which meta-meson's
+# image_types_meson writes into the .wic after wic has laid it out. --align 4096 (KiB) keeps the
+# first partition clear of that area. U-Boot's distro boot then reads extlinux/extlinux.conf from
+# the FAT partition, which bootimg-partition writes with loader=u-boot: "kernel /fitImage" (the
+# dtb is inside the FIT) and "append root=PARTUUID=<disk id>-02 rootwait <--append below>".
+#
+# `ro` has to be in --append: read-only-rootfs adds it to APPEND, which bootimg-partition does not
+# read (on the Pi, rpi-cmdline gets it from CMDLINE_ROOTFS instead). PARTUUID, not /dev/mmcblkN,
+# because the same image boots from SD (mmc0) and from eMMC (mmc1). No --ondisk for the same reason.
+#
+# As on the Pi, the mountpoints name partitions for wic only: the image recipe passes
+# --no-fstab-update, base-files owns the one /data line (by label), and /boot is not mounted at
+# runtime.
+#
+# console=tty0 as well as the serial one: the kernel then also prints to the HDMI framebuffer, so
+# a monitor (or a TV behind the soundbar) is enough to see a failed boot without a USB-TTL adapter
+# on the debug UART. ttyAML0 comes last, so it stays /dev/console for systemd.
+
+part /boot --source bootimg-partition --sourceparams="loader=u-boot" --fstype=vfat --label boot --active --align 4096 --size 64 --use-uuid
+part /     --source rootfs --fstype=ext4 --label root --align 4096 --use-uuid
+part /data --fstype=ext4 --label data --align 4096 --size 64
+
+bootloader --ptable msdos --append="console=tty0 console=ttyAML0,115200 ro"

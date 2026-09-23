@@ -61,7 +61,11 @@ do_install:append() {
     chmod 0644 ${D}${systemd_system_unitdir}/soundtesterd.service
 
     # The engine opens the card with whatever rate/period config.json says, so patch the
-    # shipped config to match the image settings.
+    # shipped config to match the image settings (the board conf's). A config without the keys
+    # would ship the daemon's compiled-in 96 kHz whatever the board says, so refuse it.
+    grep -q '"rate": *[0-9]' ${D}${sysconfdir}/soundtester/config.json && \
+        grep -q '"period": *[0-9]' ${D}${sysconfdir}/soundtester/config.json || \
+        bbfatal "config.json has no \"rate\"/\"period\" to set to ${SOUNDTESTER_RATE}/${SOUNDTESTER_PERIOD}"
     sed -i -e 's|"rate": *[0-9]*|"rate": ${SOUNDTESTER_RATE}|' \
            -e 's|"period": *[0-9]*|"period": ${SOUNDTESTER_PERIOD}|' \
            ${D}${sysconfdir}/soundtester/config.json

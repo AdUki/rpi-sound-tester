@@ -20,9 +20,9 @@ SOUNDTESTER_HOSTNAME ?= "soundtester"
 # Root password, in the clear (bitbake hashes it into /etc/shadow at build time).
 # SSH is enabled by default so the device can be reached without a screen.
 #
-# WARNING: this appliance runs a pinned end-of-life 5.15 kernel (the Audio Injector
-# Octo does not work on any 6.x kernel — see docs/octo-known-issues.md). Keep it on a
-# trusted lab network and change this password from the default.
+# WARNING: the Raspberry Pi image runs a pinned end-of-life 5.15 kernel (the Audio Injector
+# Octo does not work on any 6.x kernel). Keep the device on a trusted lab network and change
+# this password from the default.
 SOUNDTESTER_ROOT_PASSWORD ?= "soundtester"
 SOUNDTESTER_ENABLE_SSH ?= "1"
 
@@ -45,7 +45,7 @@ SOUNDTESTER_HTTP_PORT ?= "80"
 SOUNDTESTER_NET_PORT ?= "4010"
 
 # --- Audio -------------------------------------------------------------------
-# 96 kHz is the Octo's maximum (the machine driver's rate list stops there; 192 kHz is
-# not reachable on this card). Raise the period to 2048 if the Pi reports xruns.
-SOUNDTESTER_RATE ?= "96000"
-SOUNDTESTER_PERIOD ?= "1024"
+# The sample rate and period are the board's, not the bench's: they are set in
+# yocto/conf/boards/<board>.conf. To override one for this bench, assign it in
+# yocto/build-<board>/conf/local.conf (read after the board conf) — a line here would be read
+# first and lose.

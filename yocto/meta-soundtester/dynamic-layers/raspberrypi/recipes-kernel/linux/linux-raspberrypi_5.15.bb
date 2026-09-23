@@ -12,7 +12,8 @@
 #
 # UNVERIFIED: building a 5.15 tree with scarthgap's newer toolchain is the riskiest step
 # in this whole image. Milestone 0 must prove it. If it fights the toolchain, build the
-# whole stack on the kirkstone branch set instead (see docs/octo-known-issues.md).
+# whole stack on the kirkstone branch set instead (the evidence was collected in
+# docs/octo-known-issues.md: `git show 13ea712^:docs/octo-known-issues.md`).
 
 LINUX_VERSION ?= "5.15.92"
 LINUX_RPI_BRANCH ?= "rpi-5.15.y"

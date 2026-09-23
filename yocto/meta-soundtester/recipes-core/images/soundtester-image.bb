@@ -67,7 +67,10 @@ soundtester_ssh_persistent_keys() {
 }
 IMAGE_PREPROCESS_COMMAND += "${@bb.utils.contains('SOUNDTESTER_ENABLE_SSH', '1', 'soundtester_ssh_persistent_keys;', '', d)}"
 
-WKS_FILE = "soundtester.wks"
+# Per board (SOUNDTESTER_WKS, from yocto/conf/boards/<board>.conf), and set here at recipe scope
+# on purpose: a BSP's machine conf is parsed after every conf file of ours, and meta-meson's
+# hard-sets WKS_FILE to its own layout, which has no data partition and no read-only root.
+WKS_FILE = "${SOUNDTESTER_WKS}"
 
 IMAGE_FSTYPES = "wic.bz2 wic.bmap"
 
@@ -81,11 +84,8 @@ IMAGE_FSTYPES = "wic.bz2 wic.bmap"
 # --no-fstab-update flag in the .wks does NOT prevent this: scarthgap's update_fstab() never
 # consults it (it only controls which partitions receive a copy of the updated fstab). Only
 # this imager-level switch turns the rewrite off. base-files owns the one and only /data
-# entry; /boot is deliberately not mounted at runtime — the GPU firmware reads it before
-# Linux starts, nothing else needs it.
+# entry; /boot is deliberately not mounted at runtime — only the boot firmware or bootloader
+# reads it, before Linux starts.
 WIC_CREATE_EXTRA_ARGS += "--no-fstab-update"
-
-# A bench instrument does not need a GPU stack.
-DISABLE_VC4GRAPHICS = "1"
 
 export IMAGE_BASENAME = "soundtester-image"

@@ -25,9 +25,9 @@ same instant on every channel.
 > ### Read this before buying/wiring anything
 > The Octo produces **only distorted noise on every 6.x kernel**. This image pins **5.15.92**,
 > which is the last version known to work. **The Pi 5 cannot work at all** — supported boards
-> are the Pi 2 / 3 / 4. The full evidence is in
-> [docs/octo-known-issues.md](docs/octo-known-issues.md), and milestone 0 is to confirm it on
-> your own card.
+> are the Pi 2 / 3 / 4. The evidence was collected in `docs/octo-known-issues.md`, since
+> dropped from the tree (`git show 13ea712^:docs/octo-known-issues.md`); milestone 0 is to
+> confirm it on your own card.
 
 ## Try it without hardware
 
@@ -49,10 +49,15 @@ IN 1→IN 3 exactly 274.
 
 ## Build the image
 
-Everything you would normally want to change lives in one file:
+`BOARD=` picks the hardware: `rpi3` (Raspberry Pi 2/3 with the Octo, the default) or `vim3l`
+(Khadas VIM3L). What the board means for the build is in `yocto/boards/<board>.mk` and
+`yocto/conf/boards/<board>.conf`; each board builds in its own `yocto/build-<board>/`, sharing
+downloads and sstate.
+
+Everything you would normally want to change for a bench lives in one file:
 **`yocto/meta-soundtester/conf/soundtester-device.conf`** — hostname, root password, SSH,
-Wi-Fi SSID/PSK, HTTP port, sample rate and period. The rootfs is read-only, so these are
-baked in at build time.
+Wi-Fi SSID/PSK and ports. The rootfs is read-only, so these are baked in at build time. (The
+sample rate and period are the board's, in its board conf.)
 
 That file is not in the repo — it carries a root password and a Wi-Fi PSK in the clear, and git
 history keeps whatever it is given. `make configure` creates it from the tracked `.sample` next
@@ -63,6 +68,7 @@ make configure        # hostname, root password, Wi-Fi, cache dirs
 make host-deps        # the Yocto host packages (Debian/Ubuntu), once
 make image            # clones the layers, then builds (hours, the first time)
 make image DEV=1      # writable image with alsa-utils + ssh, for bring-up
+make image BOARD=vim3l          # the same for another board
 make flash            # lists the disks it could write to
 make flash DISK=/dev/mmcblk0   # shows what it will erase, then asks before writing
 ```
@@ -71,9 +77,10 @@ make flash DISK=/dev/mmcblk0   # shows what it will erase, then asks before writ
 directory; it warns if the target is not flagged removable (normal for a card in a built-in
 reader, but also what an internal drive looks like). Add `DEV=1` to flash the dev image.
 
-Plain poky and bitbake — no kas, no pip. The first `make image` clones the three layers and
-generates the two conf files (from `yocto/conf/*.sample`) on its own; `make bitbake` with no
-ARGS drops you into the usual bitbake environment if you want to poke at it by hand.
+Plain poky and bitbake — no kas, no pip. The first `make image` clones poky,
+meta-openembedded and the board's BSP layer, and generates the build dir's conf files on its
+own; `make bitbake` with no ARGS drops you into the usual bitbake environment if you want to poke
+at it by hand.
 
 Two images:
 
@@ -130,19 +137,17 @@ app/            C++17 daemon + vanilla-JS web console (no build step)
   third_party/  submodules: cpp-httplib, pocketfft, nlohmann/json, spdlog, CLI11
                 (header-only, pinned at a tag — pocketfft at a commit, it has no tags)
 yocto/
-  meta-soundtester/   layer: images, app recipe, pinned kernel, wic layout
+  meta-soundtester/   layer: images, app recipe, wic layouts; BSP-specific parts (the pinned
+                      Pi kernel) under dynamic-layers/<bsp>/
     conf/soundtester-device.conf   <- hostname, password, ssh, Wi-Fi
-  conf/               local.conf / bblayers.conf templates
-  layers/             poky + meta-openembedded + meta-raspberrypi (cloned, gitignored)
-docs/           api.md · calibration.md · octo-known-issues.md · bench-tests.md
+  boards/             <board>.mk: MACHINE, BSP layer, daemon profile per BOARD=
+  conf/               local.conf / bblayers.conf templates; boards/<board>.conf
+  layers/             poky + meta-openembedded + BSP layers (cloned, gitignored)
+docs/           api.md
 ```
 
 ## Documentation
 
-- **[docs/calibration.md](docs/calibration.md)** — how to get a delay number you can trust,
-  and why `tick` is the only variant worth measuring with.
-- **[docs/octo-known-issues.md](docs/octo-known-issues.md)** — the 6.x kernel breakage, the
-  TDM slot-rotation bug, and what the software does about them.
-- **[docs/api.md](docs/api.md)** — the HTTP/WebSocket API.
-- **[docs/bench-tests.md](docs/bench-tests.md)** — the acceptance checklist for a finished
-  device.
+- **[docs/api.md](docs/api.md)** — the HTTP/WebSocket API, and the single reference since
+  13ea712. The companion docs it replaced (calibration, the Octo's known issues, the bench
+  checklist) are in git history: `git show 13ea712^:docs/<name>.md`.
