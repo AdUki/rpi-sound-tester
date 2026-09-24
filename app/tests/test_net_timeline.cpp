@@ -5,6 +5,7 @@
 
 #include "check.h"
 #include "constants.h"
+#include "rates.h"
 
 using namespace st;
 
@@ -140,10 +141,11 @@ void test_write_end_tracks_the_far_edge() {
 // The measurement is noisy for reasons that are not drift: network jitter, and a reader position
 // that only moves once per audio block. The filter has to take that out, or the trim spends its
 // whole authority chasing it.
-void test_the_filter_removes_measurement_noise() {
+void test_the_filter_removes_measurement_noise(double rate) {
   LeadFilter f;
   const double dt = 256.0 / 44100.0;  // one packet
-  const double truth = 96000.0;
+  const double truth = rate;          // a second's lead
+  const double half_block = kTestPeriod / 2.0;
 
   // A block's worth of quantisation, alternating — the worst case of what reader_n_ does.
   // Measured only once the filter has settled: it starts at the first sample it is given, so the
@@ -151,7 +153,7 @@ void test_the_filter_removes_measurement_noise() {
   const int settle = static_cast<int>(6 * 2.0 / dt);
   double worst = 0.0;
   for (int i = 0; i < settle * 2; ++i) {
-    const double noisy = truth + ((i % 2) ? 512.0 : -512.0);
+    const double noisy = truth + ((i % 2) ? half_block : -half_block);
     const double avg = f.update(noisy, dt, 2.0);
     if (i > settle) worst = std::max(worst, std::fabs(avg - truth));
   }
@@ -159,41 +161,41 @@ void test_the_filter_removes_measurement_noise() {
 }
 
 // It must still follow a real change, or it would filter out the very drift it exists to correct.
-void test_the_filter_still_follows_a_real_change() {
+void test_the_filter_still_follows_a_real_change(double rate) {
   LeadFilter f;
   const double dt = 256.0 / 44100.0;
-  for (int i = 0; i < 2000; ++i) f.update(96000.0, dt, 2.0);
-  CHECK_NEAR(f.avg, 96000.0, 1.0);
+  for (int i = 0; i < 2000; ++i) f.update(rate, dt, 2.0);
+  CHECK_NEAR(f.avg, rate, 1.0);
   // Step the truth and give it four time constants.
-  for (int i = 0; i < static_cast<int>(4 * 2.0 / dt); ++i) f.update(94000.0, dt, 2.0);
-  CHECK_NEAR(f.avg, 94000.0, 100.0);
+  for (int i = 0; i < static_cast<int>(4 * 2.0 / dt); ++i) f.update(rate - 2000.0, dt, 2.0);
+  CHECK_NEAR(f.avg, rate - 2000.0, 100.0);
 }
 
-void test_the_first_measurement_is_not_averaged_with_nothing() {
+void test_the_first_measurement_is_not_averaged_with_nothing(double rate) {
   LeadFilter f;
-  // Starting from zero would spend the first seconds insisting the stream was 96000 frames out.
-  CHECK_EQ(f.update(96000.0, 0.006, 2.0), 96000.0);
+  // Starting from zero would spend the first seconds insisting the stream was a second out.
+  CHECK_EQ(f.update(rate, 0.006, 2.0), rate);
   f.reset();
   CHECK(!f.primed);
 }
 
-void test_the_trim_pushes_the_right_way_and_is_bounded() {
-  const double rate = 96000.0, tau = 5.0, lim = 0.002;
+void test_the_trim_pushes_the_right_way_and_is_bounded(double rate) {
+  const double target = rate, tau = 5.0, lim = 0.002;  // a second's lead
   // Running behind (lead short of target) means produce more output: ratio up.
-  CHECK(asrc_trim(95000.0, 96000.0, rate, tau, lim) > 1.0);
+  CHECK(asrc_trim(target - 1000.0, target, rate, tau, lim) > 1.0);
   // Running ahead means produce less.
-  CHECK(asrc_trim(97000.0, 96000.0, rate, tau, lim) < 1.0);
+  CHECK(asrc_trim(target + 1000.0, target, rate, tau, lim) < 1.0);
   // On target, nothing.
-  CHECK_EQ(asrc_trim(96000.0, 96000.0, rate, tau, lim), 1.0);
+  CHECK_EQ(asrc_trim(target, target, rate, tau, lim), 1.0);
   // However far out, the correction stays within its authority — no step, ever.
-  CHECK_EQ(asrc_trim(0.0, 96000.0, rate, tau, lim), 1.0 + lim);
-  CHECK_EQ(asrc_trim(1e9, 96000.0, rate, tau, lim), 1.0 - lim);
+  CHECK_EQ(asrc_trim(0.0, target, rate, tau, lim), 1.0 + lim);
+  CHECK_EQ(asrc_trim(1e9, target, rate, tau, lim), 1.0 - lim);
 }
 
 // The pair together: a sender whose crystal is 200 ppm fast must be held, not merely slowed.
-void test_the_loop_holds_a_drifting_sender() {
+void test_the_loop_holds_a_drifting_sender(double rate) {
   LeadFilter f;
-  const double rate = 96000.0, target = 96000.0, dt = 256.0 / 44100.0;
+  const double target = rate, dt = 256.0 / 44100.0;
   double lead = target;
   const double skew = 200e-6;  // the sender runs this much fast
 
@@ -219,10 +221,14 @@ int main() {
   test_live_read_does_not_consume_what_the_trailing_read_needs();
   test_write_and_read_wrap_the_ring();
   test_write_end_tracks_the_far_edge();
-  test_the_filter_removes_measurement_noise();
-  test_the_filter_still_follows_a_real_change();
-  test_the_first_measurement_is_not_averaged_with_nothing();
-  test_the_trim_pushes_the_right_way_and_is_bounded();
-  test_the_loop_holds_a_drifting_sender();
+  for (const unsigned r : kTestRates) {
+    std::printf("  at %u Hz\n", r);
+    const double rate = r;
+    test_the_filter_removes_measurement_noise(rate);
+    test_the_filter_still_follows_a_real_change(rate);
+    test_the_first_measurement_is_not_averaged_with_nothing(rate);
+    test_the_trim_pushes_the_right_way_and_is_bounded(rate);
+    test_the_loop_holds_a_drifting_sender(rate);
+  }
   return report("net_timeline");
 }

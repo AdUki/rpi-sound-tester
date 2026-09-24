@@ -1,0 +1,302 @@
+{
+  "capture_channels": 8,
+  "device": "hw:audioinjectoroc,0",
+  "generators": {
+    "music": {
+      "level_db": -20.0
+    },
+    "noise": {
+      "level_db": -20.0,
+      "mode": "white"
+    },
+    "ping": {
+      "interval_s": 2.0,
+      "level_db": -20.0,
+      "variant": "tick"
+    },
+    "sine": {
+      "freq_hz": 440.0,
+      "level_db": -20.0
+    }
+  },
+  "hdmi": {
+    "device": "hw:b1,0",
+    "enabled": true,
+    "layout": "5.1",
+    "names": [
+      "soundbar L",
+      "",
+      "",
+      "subwoofer",
+      "",
+      "",
+      "",
+      ""
+    ],
+    "outputs": [
+      {
+        "gain_db": 0.0,
+        "mute": false,
+        "source": {
+          "index": "music",
+          "type": "gen"
+        }
+      },
+      {
+        "gain_db": 0.0,
+        "mute": false,
+        "source": {
+          "index": "music",
+          "type": "gen"
+        }
+      },
+      {
+        "gain_db": 0.0,
+        "mute": false,
+        "source": {
+          "index": "3",
+          "type": "input"
+        }
+      },
+      {
+        "gain_db": -20.0,
+        "mute": false,
+        "source": {
+          "index": "7",
+          "type": "input"
+        }
+      },
+      {
+        "gain_db": 0.0,
+        "mute": false,
+        "source": {
+          "index": "",
+          "type": "silence"
+        }
+      },
+      {
+        "gain_db": 0.0,
+        "mute": false,
+        "source": {
+          "index": "",
+          "type": "silence"
+        }
+      },
+      {
+        "gain_db": 0.0,
+        "mute": false,
+        "source": {
+          "index": "",
+          "type": "silence"
+        }
+      },
+      {
+        "gain_db": 0.0,
+        "mute": false,
+        "source": {
+          "index": "",
+          "type": "silence"
+        }
+      }
+    ],
+    "sample_rate": 48000
+  },
+  "input_map": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "input_names": [
+    "bench mic",
+    "",
+    "",
+    "DUT left",
+    "",
+    "",
+    "",
+    "laptop",
+    "",
+    "",
+    "",
+    ""
+  ],
+  "inputs": [
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false
+    }
+  ],
+  "lineout": {
+    "device": "hw:Headphones,0",
+    "enabled": false,
+    "names": [
+      "",
+      "desk right"
+    ],
+    "outputs": [
+      {
+        "gain_db": 0.0,
+        "mute": false,
+        "source": {
+          "index": "3",
+          "type": "input"
+        }
+      },
+      {
+        "gain_db": 0.0,
+        "mute": false,
+        "source": {
+          "index": "",
+          "type": "silence"
+        }
+      }
+    ],
+    "sample_rate": 48000
+  },
+  "listen": {
+    "bitrate_kbps": 96,
+    "codec": "opus"
+  },
+  "loopback_offset_samples": 0,
+  "net": {
+    "delay_ms": 1000,
+    "enabled": false,
+    "port": 4010
+  },
+  "output_map": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "output_names": [
+    "to DUT",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "sub"
+  ],
+  "outputs": [
+    {
+      "gain_db": -6.0,
+      "mute": false,
+      "source": {
+        "index": "3",
+        "type": "input"
+      }
+    },
+    {
+      "gain_db": 0.0,
+      "mute": true,
+      "source": {
+        "index": "7",
+        "type": "input"
+      }
+    },
+    {
+      "gain_db": -12.0,
+      "mute": false,
+      "source": {
+        "index": "music",
+        "type": "gen"
+      }
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false,
+      "source": {
+        "index": "",
+        "type": "silence"
+      }
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false,
+      "source": {
+        "index": "",
+        "type": "silence"
+      }
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false,
+      "source": {
+        "index": "",
+        "type": "silence"
+      }
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false,
+      "source": {
+        "index": "",
+        "type": "silence"
+      }
+    },
+    {
+      "gain_db": 0.0,
+      "mute": false,
+      "source": {
+        "index": "",
+        "type": "silence"
+      }
+    }
+  ],
+  "period": 1024,
+  "periods": 4,
+  "rate": 96000
+}

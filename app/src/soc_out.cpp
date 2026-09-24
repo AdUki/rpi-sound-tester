@@ -16,8 +16,6 @@ namespace st {
 
 namespace {
 
-constexpr unsigned kReopenDelayS = 5;
-
 // How long the reader waits for the engine's next block before calling it a stall. Well inside
 // what the PCM's buffer holds, so a block that is merely late costs nothing audible.
 constexpr unsigned kStarveWaitMs = 40;
@@ -55,6 +53,7 @@ SocOutput::SocOutput(const SocSink& sink, SocControl& sctl, Control& ctl,
       sctl_(sctl),
       ctl_(ctl),
       engine_(engine),
+      clock_(engine.clock()),
       ring_(kSocRingFrames, sink.width, kSocRingFrames / 8),
       device_(std::move(device)),
       sample_rate_(soc_rate_ok(sample_rate) ? sample_rate : kSocRateDefault) {}
@@ -317,7 +316,7 @@ bool SocOutput::wait_for_engine() {
     if (!running_.load()) return false;
     const uint64_t h0 = ring_.counter();
     sleep_ms(50);
-    if (ring_.counter() > h0 && ctl_.anchor.estimate(mono_ns(), rate_) != 0) return true;
+    if (ring_.counter() > h0 && ctl_.anchor.estimate(clock_.now_ns(), rate_) != 0) return true;
   }
 }
 
@@ -355,7 +354,7 @@ bool SocOutput::anchor() {
 
   // Place the reader so the first measurement already reads the target: after the first pass it
   // will have taken one chunk, and the driver will hold about a full buffer.
-  const uint64_t est = ctl_.anchor.estimate(mono_ns(), rate_);
+  const uint64_t est = ctl_.anchor.estimate(clock_.now_ns(), rate_);
   const uint64_t now = std::min(est, ring_.counter());
   const uint64_t back = static_cast<uint64_t>(ring_lag) + chunk_in_;
   r_n_ = now > back ? now - back : 0;
@@ -372,7 +371,7 @@ bool SocOutput::stream() {
     if (need_anchor) {
       if (!anchor()) return !running_.load();
       need_anchor = false;
-      last_ns = mono_ns();
+      last_ns = clock_.now_ns();
       settled_ns = last_ns + static_cast<uint64_t>(kSocSettleS * 1e9);
     }
 
@@ -431,7 +430,7 @@ bool SocOutput::stream() {
     // driver term moves opposite to it as a write goes in: the sum does not see either sawtooth.
     snd_pcm_sframes_t delay = 0;
     if (snd_pcm_delay(pcm_, &delay) < 0) delay = 0;
-    const uint64_t now_ns = mono_ns();
+    const uint64_t now_ns = clock_.now_ns();
     const uint64_t est = ctl_.anchor.estimate(now_ns, rate_);
     const double ring_part =
         static_cast<double>(static_cast<int64_t>(est) - static_cast<int64_t>(r_n_));

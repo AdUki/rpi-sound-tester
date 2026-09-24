@@ -64,9 +64,10 @@ inline constexpr float kSineFreqMaxHz = 40000.0f;
 inline constexpr float kPingIntervalMinS = 0.5f;
 inline constexpr float kPingIntervalMaxS = 60.0f;
 
-inline constexpr unsigned kDefaultRate = 96000;
-inline constexpr unsigned kDefaultPeriod = 1024;
-inline constexpr unsigned kDefaultPeriods = 4;
+// How long a device that would not open, or stopped, is left before it is opened again: the card
+// by the audio thread, each SoC sink by its own. One open of the card also waits this long for its
+// device node to appear, since the codec probes a few seconds into boot.
+inline constexpr unsigned kReopenDelayS = 5;
 
 // 2^23 frames = 87.4 s at 96 kHz, 192 MB of float32 x 6ch. Power of two: index by mask.
 // This is the *ceiling*; how much of it a freeze actually copies is set at runtime by
@@ -89,9 +90,16 @@ inline constexpr size_t kCaptureMinFrames = 4096;
 // changes it. Well under the ceiling so a fresh freeze is quick; raise it per-session as needed.
 inline constexpr double kCaptureDefaultSeconds = 20.0;
 
-// One envelope column per 480 frames = 200 columns/s at 96 kHz; 60 s of history.
-inline constexpr unsigned kEnvColumnFrames = 480;
+// The scope's envelope: 200 min/max columns per second of capture, 480 frames each at 96 kHz, and
+// 60 s of history. Counted in seconds rather than frames so that every rate gets the same history.
+inline constexpr unsigned kEnvColumnsPerS = 200;
 inline constexpr size_t kEnvColumns = 12000;
+
+// How many frames one envelope column covers at `rate`. Never zero, whatever a config file says the
+// rate is: the analysis thread divides by it.
+inline constexpr unsigned env_column_frames(unsigned rate) {
+  return rate >= kEnvColumnsPerS ? rate / kEnvColumnsPerS : 1;
+}
 
 inline constexpr unsigned kSpectrumFft = 8192;
 inline constexpr unsigned kSpectrumBins = 240;
@@ -156,7 +164,7 @@ inline constexpr unsigned kNetTimelineMs = 6000;
 // quarter-second offset would take two minutes to walk off; past that, one discontinuity now is
 // better than being wrong for the next two minutes.
 inline constexpr double kNetLeadFilterTauS = 2.0;
-inline constexpr double kNetResyncFrames = 0.25 * kDefaultRate;
+inline constexpr double kNetResyncS = 0.25;
 
 // How quickly a converter's ratio trim closes a residual offset, and how far it may stray from
 // nominal. 0.2% is far more than two crystals can differ by, and small enough that the audio does
@@ -169,8 +177,6 @@ inline constexpr double kAsrcTrimMax = 0.002;
 // 100 Mbit link waits under ~80 us, i.e. under ten samples of timing error at 96 kHz.
 inline constexpr unsigned kNetPacketFrames = ST_PACKET_FRAMES;
 inline constexpr unsigned kNetMaxPacketFrames = 4096;
-
-static_assert(kDefaultRate == ST_DEFAULT_RATE, "the plugin's default rate must match the card's");
 
 // ---- The SoC's own outputs: HDMI and the line out -------------------------------------------
 //

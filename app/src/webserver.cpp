@@ -319,12 +319,13 @@ class WsReadPump {
 // The channel count is on the wire, and the type byte moved from 1 to 2, because the frame used
 // to be a fixed six channels wide. A cached copy of app.js parsing the old layout would not fail
 // — it would silently read every column at the wrong offset and draw plausible nonsense.
-std::string envelope_frame(uint64_t first_col, const std::vector<EnvColumn>& cols) {
+std::string envelope_frame(uint64_t first_col, unsigned col_frames,
+                           const std::vector<EnvColumn>& cols) {
   std::string out;
   out.resize(12 + cols.size() * kTotalInputs * 4);
   char* p = out.data();
   *p++ = 2;
-  const uint64_t sample = first_col * kEnvColumnFrames;
+  const uint64_t sample = first_col * col_frames;
   std::memcpy(p, &sample, 8);
   p += 8;
   const uint16_t n = static_cast<uint16_t>(cols.size());
@@ -474,7 +475,7 @@ void WebServer::install_routes() {
           {"last_error", es.last_error}}},
         {"system", sys_json},
         {"limits",
-         {{"env_column_frames", kEnvColumnFrames},
+         {{"env_column_frames", d_.analysis.env_column_frames()},
           {"capture_max_frames", d_.capture.max_frames()},
           {"capture_config", true},
           {"input_gain_min_db", kInputGainMinDb},
@@ -1361,7 +1362,7 @@ void WebServer::run_publisher() {
   Task system{t0, milliseconds(1000)};   //  1 Hz
 
   // Envelope frames go out in lockstep with the thing that produces them. The analysis thread
-  // appends envelope columns once per tick (kTickHz = 10 Hz, ~20 columns of 480 frames each), so
+  // appends envelope columns once per tick (kTickHz = 10 Hz, ~20 columns of env_column_frames), so
   // a publisher polling faster finds an empty ring on some ticks and emits nothing. Raising the
   // producer instead would mean running the 6-channel 8192-point FFT half again as often on a
   // Pi 3 to gain nothing — the scope's fidelity is set by the column rate (a constant
@@ -1460,7 +1461,8 @@ void WebServer::run_publisher() {
       const auto cols = d_.analysis.envelope().since(env_cursor, &first);
       if (!cols.empty()) {
         env_cursor = first + cols.size();
-        hub_.publish(std::make_shared<WsMessage>(WsMessage{envelope_frame(first, cols), true}));
+        hub_.publish(std::make_shared<WsMessage>(
+            WsMessage{envelope_frame(first, d_.analysis.env_column_frames(), cols), true}));
       }
     }
   }

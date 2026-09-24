@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 
+#include "board_profile.h"
 #include "check.h"
 #include "constants.h"
 #include "net_proto.h"
@@ -130,7 +131,8 @@ void test_shared_constants_agree() {
   CHECK_EQ(static_cast<unsigned>(kNetPort), static_cast<unsigned>(ST_DEFAULT_PORT));
   CHECK_EQ(kNetProtoVersion, ST_NET_PROTO_VERSION);
   CHECK_EQ(kNetPacketFrames, ST_PACKET_FRAMES);
-  CHECK_EQ(kDefaultRate, ST_DEFAULT_RATE);
+  // The plugin assumes the rate of the board it was written for when nothing tells it otherwise.
+  CHECK_EQ(rpi3_octo_profile().clock.rate, ST_DEFAULT_RATE);
   // A full-size packet must fit the receiver's cap, or every large packet is refused.
   CHECK(ST_AUDIO_FIXED + 4u * kNetMaxPacketFrames <= ST_NET_MAX_PAYLOAD);
   // Two readers plus the sender's lead have to fit in the timeline.

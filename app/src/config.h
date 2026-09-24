@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "board_profile.h"
 #include "constants.h"
 #include "control.h"
 
@@ -41,11 +42,12 @@ struct SocConfig {
 };
 
 struct Config {
-  unsigned rate = kDefaultRate;
-  unsigned period = kDefaultPeriod;
-  unsigned periods = kDefaultPeriods;
-  std::string device = "hw:audioinjectoroc,0";
-  unsigned capture_channels = kTdmSlots;
+  // The compiled-in board's clock, until a file says otherwise.
+  unsigned rate = rpi3_octo_profile().clock.rate;
+  unsigned period = rpi3_octo_profile().clock.period;
+  unsigned periods = rpi3_octo_profile().clock.periods;
+  std::string device = rpi3_octo_profile().clock.capture_device;
+  unsigned capture_channels = rpi3_octo_profile().clock.capture_slots.front();
 
   std::array<InputConfig, kTotalInputs> inputs{};
   std::array<OutputConfig, kOutputs> outputs{};
@@ -79,12 +81,10 @@ struct Config {
   int net_port = kNetPort;
   int net_delay_ms = static_cast<int>(kNetDelayDefaultMs);
 
-  // The firmware driver calls the first HDMI port's card "b1" and the 3.5 mm jack's "Headphones"
-  // once snd_bcm2835.enable_compat_alsa=0 is on the kernel command line; without it both are
-  // devices of one card called "ALSA", HDMI 1 and the jack 0. Only HDMI has a layout: the line out
-  // is always stereo, and neither reads nor writes one.
-  SocConfig hdmi{"hw:b1,0", kHdmiMaxChannels};
-  SocConfig lineout{"hw:Headphones,0", kLineoutChannels};
+  // On the devices the compiled-in board names for them. Only HDMI has a layout: the line out is
+  // always stereo, and neither reads nor writes one.
+  SocConfig hdmi{rpi3_octo_profile().sink("hdmi")->device, kHdmiMaxChannels};
+  SocConfig lineout{rpi3_octo_profile().sink("lineout")->device, kLineoutChannels};
 
   std::string to_json() const;
   static bool from_json(const std::string& text, Config* out, std::string* err);

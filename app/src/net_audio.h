@@ -13,6 +13,7 @@
 #include "constants.h"
 #include "control.h"
 #include "util/asrc.h"
+#include "util/clock.h"
 #include "vorbis_decode.h"
 
 namespace st {
@@ -95,7 +96,10 @@ class NetAudioServer {
  public:
   // The configured base port is ctl.net.port, remembered even while the server is stopped so
   // that enabling it later binds where the operator asked rather than falling back to a default.
-  NetAudioServer(Control& ctl, double rate);
+  // `rate` is the engine's, the sample rate every sender is converted to. `period` is the block
+  // the write guard is counted in (see guard_frames()). `clock` is the engine's, the one its
+  // anchors are stamped with: a session reads the time from it to place the reader between them.
+  NetAudioServer(Control& ctl, double rate, unsigned period, Clock& clock = monotonic_clock());
   ~NetAudioServer();
 
   NetAudioServer(const NetAudioServer&) = delete;
@@ -152,7 +156,16 @@ class NetAudioServer {
   std::string last_error() const;
   unsigned connected_count() const;
 
+  // How far ahead of the audio thread a packet must land: two blocks of the period the server was
+  // built with. One would be the bare minimum; two keeps the writer clear of the reader even if the
+  // audio thread advances while the check is in flight.
+  uint64_t guard_frames() const { return guard_frames_; }
+  // How far a stream's filtered lead may stray from the delay before it is re-anchored instead of
+  // walked back by the converter's trim: kNetResyncS, in frames.
+  double resync_frames() const { return kNetResyncS * rate_; }
+
  private:
+  friend struct NetTestAccess;
   struct Channel;
 
   void accept_loop();
@@ -208,6 +221,8 @@ class NetAudioServer {
 
   Control& ctl_;
   const double rate_;
+  const uint64_t guard_frames_;
+  Clock& clock_;
 
   std::vector<std::unique_ptr<Channel>> chans_;
   std::atomic<uint64_t> reader_n_{0};

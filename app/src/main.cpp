@@ -3,10 +3,12 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <string>
 #include <thread>
 
 #include "analysis.h"
 #include "audio_engine.h"
+#include "board_profile.h"
 #include "capture.h"
 #include "config.h"
 #include "constants.h"
@@ -44,7 +46,9 @@ void start_shutdown_watchdog() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  CLI::App app{"soundtesterd — multichannel audio test appliance (Audio Injector Octo)"};
+  // The defaults --help quotes are the ones Config and the engine start from.
+  const st::BoardProfile& board = st::rpi3_octo_profile();
+  CLI::App app{"soundtesterd — multichannel audio test appliance (" + board.label + ")"};
 
   bool sim = false;
   bool verbose = false;
@@ -63,17 +67,19 @@ int main(int argc, char** argv) {
   app.add_flag("--sim", sim, "Run without hardware: a simulated card loops each output back to its input");
   app.add_option("--sim-stagger", sim_stagger,
                  "Simulator: extra delay per input channel, in frames (channel c is delayed c x N)");
-  app.add_option("--device", device, "ALSA device (default hw:audioinjectoroc,0)");
-  app.add_option("--rate", rate, "Sample rate (default 96000)");
-  app.add_option("--period", period, "Period size in frames (default 1024)");
+  app.add_option("--device", device, "ALSA device (default " + board.clock.capture_device + ")");
+  app.add_option("--rate", rate, "Sample rate (default " + std::to_string(board.clock.rate) + ")");
+  app.add_option("--period", period,
+                 "Period size in frames (default " + std::to_string(board.clock.period) + ")");
   app.add_option("--port", port, "HTTP port (default 80)");
   app.add_option("--net-port", net_port, "TCP port for network audio input (default 4010)");
   app.add_option("--hdmi-device", hdmi_device,
-                 "ALSA device for the HDMI output, and turn it on (e.g. hw:b1,0, or default to "
-                 "hear it through a desktop's speakers)");
+                 "ALSA device for the HDMI output, and turn it on (e.g. " +
+                     board.sink("hdmi")->device +
+                     ", or default to hear it through a desktop's speakers)");
   app.add_option("--lineout-device", lineout_device,
-                 "ALSA device for the line out (the 3.5 mm jack), and turn it on (e.g. "
-                 "hw:Headphones,0)");
+                 "ALSA device for the line out (the 3.5 mm jack), and turn it on (e.g. " +
+                     board.sink("lineout")->device + ")");
   app.add_option("--www", www, "Directory of static web files");
   app.add_option("--config", config_path, "Path to the default config");
   app.add_option("--data-dir", data_dir, "Where saved settings live (the writable partition)");
@@ -130,7 +136,12 @@ int main(int argc, char** argv) {
   // Wired in before start(), so the audio thread never sees a half-constructed server. A bind
   // failure is reported through /api/net, not fatal — same reasoning as a card that will not
   // open: taking the console down removes the only way to find out what went wrong.
-  st::NetAudioServer net(ctl, engine.rate());
+  //
+  // The write guard is counted in the board's own period, not the configured one, so it stays the
+  // 2048 frames it has always been on the Pi, SOUNDTESTER_PERIOD=2048 included. Two of those
+  // longer blocks would be 4096 frames, and a net.delay_ms that works today, 21 to 43 ms, would
+  // then have every packet dropped as late.
+  st::NetAudioServer net(ctl, engine.rate(), board.clock.period, engine.clock());
   engine.set_net(&net);
   if (cfg.net_enabled) net.start(ctl.net.port.load());
 

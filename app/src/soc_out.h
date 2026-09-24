@@ -7,10 +7,12 @@
 #include <thread>
 #include <vector>
 
+#include "board_profile.h"
 #include "constants.h"
 #include "control.h"
 #include "ring_buffer.h"
 #include "util/asrc.h"
+#include "util/clock.h"
 
 typedef struct _snd_pcm snd_pcm_t;
 
@@ -81,14 +83,15 @@ struct SocSink {
   const char* where;  // why a device might not exist, appended to an open error that says so
 };
 
-inline constexpr SocSink kHdmiSink{
-    "hdmi", kHdmiMaxChannels,
-    "the Pi's HDMI audio needs dtparam=audio=on in config.txt; it is hw:b1,0 with "
-    "snd_bcm2835.enable_compat_alsa=0 on the kernel command line, hw:ALSA,1 without"};
-inline constexpr SocSink kLineoutSink{
-    "lineout", kLineoutChannels,
-    "the Pi's 3.5 mm jack needs dtparam=audio=on in config.txt; it is hw:Headphones,0 with "
-    "snd_bcm2835.enable_compat_alsa=0 on the kernel command line, hw:ALSA,0 without"};
+// The part of a sink's profile its thread needs. The strings stay the profile's own, and a board
+// profile lasts as long as the process.
+inline SocSink soc_sink(const SinkProfile& p) {
+  return {p.id.c_str(), p.width, p.where_hint.c_str()};
+}
+
+// The Pi's two, as the compiled-in board describes them.
+inline const SocSink kHdmiSink = soc_sink(*rpi3_octo_profile().sink("hdmi"));
+inline const SocSink kLineoutSink = soc_sink(*rpi3_octo_profile().sink("lineout"));
 
 struct SocStatus {
   bool enabled = false;   // what the operator asked for
@@ -171,6 +174,9 @@ class SocOutput {
   SocControl& sctl_;
   Control& ctl_;
   const AudioEngine& engine_;
+  // The engine's: the clock its anchors are stamped with, and so the only one an estimate from
+  // them comes out right on.
+  Clock& clock_;
   RingBuffer ring_;
 
   mutable std::mutex m_;  // guards device_, sample_rate_, error_

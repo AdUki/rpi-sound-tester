@@ -3,32 +3,19 @@
 #include <pthread.h>
 
 #include <atomic>
-#include <mutex>
+#include <memory>
 #include <string>
-#include <vector>
 
+#include "audio_backend.h"
 #include "constants.h"
 #include "control.h"
-#include "generators.h"
+#include "engine_core.h"
 #include "ring_buffer.h"
-
-typedef struct _snd_pcm snd_pcm_t;
+#include "util/clock.h"
 
 namespace st {
 
 class NetAudioServer;
-
-struct EngineOptions {
-  bool sim = false;
-  std::string device = "hw:audioinjectoroc,0";
-  unsigned rate = kDefaultRate;
-  unsigned period = kDefaultPeriod;
-  unsigned periods = kDefaultPeriods;
-  unsigned capture_channels = kTdmSlots;  // falls back to kInputs if 8 ch cannot be opened
-  // Simulator only: output channel c loops back into input channel c, delayed by
-  // period + c*sim_stagger frames.
-  unsigned sim_stagger = 0;
-};
 
 struct EngineStats {
   bool running = false;
@@ -45,9 +32,19 @@ struct EngineStats {
   std::string last_error;
 };
 
+// The audio thread: opens a backend, keeps it open, and hands each block it captures to the
+// EngineCore, which does everything else with it.
 class AudioEngine {
  public:
-  AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt);
+  // Opens the card `opt` names, or the simulator when opt.sim is set. `clock` stamps the anchor
+  // each block publishes and paces the simulator and the retries; it is the host's CLOCK_MONOTONIC
+  // unless a test runs the engine on time of its own.
+  AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt,
+              Clock& clock = monotonic_clock());
+  // Drives `backend` instead of what `opt` would open: a test's stand-in for the card. The engine
+  // does not own it, and opt.sim still picks which of the two run loops drives it.
+  AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt, AudioBackend& backend,
+              Clock& clock = monotonic_clock());
   ~AudioEngine();
 
   bool start();
@@ -56,56 +53,52 @@ class AudioEngine {
   EngineStats stats() const;
 
   // Wired in by main() before start(): the engine reads its network channels each block.
-  void set_net(NetAudioServer* net) { net_.store(net, std::memory_order_relaxed); }
+  void set_net(NetAudioServer* net) { core_.set_net(net); }
   // Also before start(): the rings the HDMI speakers and the line out's pair are handed over
   // through. Each is written every block, its sink on or off, so its counter stays equal to the
-  // capture ring's and an index in it means the same sample as everywhere else.
-  void set_hdmi_ring(RingBuffer* ring) { hdmi_ring_.store(ring, std::memory_order_relaxed); }
-  void set_lineout_ring(RingBuffer* ring) { lineout_ring_.store(ring, std::memory_order_relaxed); }
+  // capture ring's and an index in it means the same sample as everywhere else. False, and the
+  // sink left without audio, for a ring the engine cannot write: see EngineCore.
+  bool set_hdmi_ring(RingBuffer* ring) { return core_.set_hdmi_ring(ring); }
+  bool set_lineout_ring(RingBuffer* ring) { return core_.set_lineout_ring(ring); }
   double rate() const { return static_cast<double>(opt_.rate); }
   unsigned period() const { return period_.load(std::memory_order_relaxed); }
-  uint64_t identify_frames() const { return identify_frames_; }
+  uint64_t identify_frames() const { return core_.identify_frames(); }
+  // The clock each block's anchor is stamped with. Whatever extrapolates the anchor has to read
+  // the time from this one, or its estimate is off by however far apart the two clocks are.
+  Clock& clock() const { return clock_; }
 
  private:
+  friend struct EngineTestAccess;
   static void* thread_entry(void* self);
 
-  // last_error_ is written by the audio thread and read by web handlers; a bare std::string
-  // there would be a racing read against a reallocating write.
-  void set_error(std::string msg);
-  std::string error() const;
+  // The backend keeps the one error slot, so that what it reports while it opens the card and
+  // what the engine reports around it are the same field.
+  void set_error(std::string msg) { backend_->set_error(std::move(msg)); }
+  std::string error() const { return backend_->error(); }
 
   void wait_before_retry();
-  void size_buffers();
-  // Picks up a change to ctl_.net.delay_frames and returns the delay now in force.
-  unsigned sync_capture_delay();
-  // Writes the local channels of `ring_out` from `live` delayed by cap_delay_frames_, so that
-  // ring index n means the same real-world instant on an ADC channel as on a network channel.
-  void apply_capture_delay(size_t frames, const float* live, float* ring_out);
-  bool open_alsa();
-  void close_alsa();
-  bool configure(snd_pcm_t* pcm, unsigned channels, const char* what);
-  bool prefill_and_start();
-  bool recover(int err);
-  void init_mixer();
-
-  void run_alsa();
+  // What start() sets up before the audio thread exists.
+  void prepare();
+  // The card: opened by the audio thread, and opened again after anything that ends the stream,
+  // forever.
+  void run_card();
+  // The simulator: opened once, and it cannot fail.
   void run_sim();
+  // Streams until the engine stops or the stream fails past recovering.
+  void run_stream();
+  // One block, captured, processed and played. False when the stream has ended.
+  bool run_block();
+  // An xrun is a discontinuity on the sample axis: counted, then left to the backend to recover
+  // from. False ends the stream.
+  bool recover(int err);
+  // Takes on the shape the backend just opened with, for stats() and period().
+  void publish_shape();
 
-  // Shared by both backends: publishes one captured block to the ring and produces the
-  // output block that sits on the same sample axis.
-  // `in_all` is kTotalInputs wide: the backend fills channels [0, kInputs) with card audio and
-  // process_block fills [kInputs, kTotalInputs) from the network timelines. It is modified in
-  // place — input gain is applied to it before anything else reads it.
-  void process_block(uint64_t n, size_t frames, float* in_all, float* out8);
-
-  Control& ctl_;
   RingBuffer& ring_;
   EngineOptions opt_;
-  Generators gen_;
-
-  snd_pcm_t* capture_ = nullptr;
-  snd_pcm_t* playback_ = nullptr;
-  uint64_t identify_frames_ = 0;
+  Clock& clock_;
+  std::unique_ptr<AudioBackend> own_backend_;  // null when a test handed one in
+  AudioBackend* const backend_;
 
   pthread_t thread_{};
   bool thread_valid_ = false;
@@ -117,36 +110,7 @@ class AudioEngine {
   std::atomic<unsigned> cap_ch_{0};
   std::atomic<unsigned> period_{0};
 
-  mutable std::mutex err_m_;
-  std::string last_error_;
-
-  std::vector<int32_t> raw_in_;
-  std::vector<int32_t> raw_out_;
-  // Set once before start(). The engine does not own it; a null pointer just means the network
-  // channels stay silent.
-  std::atomic<NetAudioServer*> net_{nullptr};
-  std::atomic<RingBuffer*> hdmi_ring_{nullptr};
-  std::atomic<RingBuffer*> lineout_ring_{nullptr};
-
-  // Two views of the same block, on the two axes this device has. `in_` is LIVE — what the card
-  // just captured and what the network sender wants heard now — and is what outputs are routed
-  // from, so a passthrough keeps its near-zero latency. `ring_block_` is the same audio on the
-  // CAPTURE axis, every channel delayed alike, and is the only thing the ring ever sees.
-  // With no delay configured the two are the same buffer and none of this costs anything.
-  std::vector<float> in_;
-  std::vector<float> ring_block_;
-  std::vector<float> cap_delay_;   // kInputs wide, power-of-two frames, mask-indexed
-  size_t cap_delay_len_ = 0;
-  size_t cap_delay_mask_ = 0;
-  size_t cap_delay_pos_ = 0;
-  unsigned cap_delay_frames_ = 0;  // currently in force; a change resets the line
-  std::vector<float> out8_;
-  std::vector<float> hdmi_block_;     // kHdmiMaxChannels wide
-  std::vector<float> lineout_block_;  // kLineoutChannels wide
-  std::vector<float> gen_sine_, gen_noise_, gen_ping_, gen_music_;
-
-  std::vector<float> sim_delay_;
-  size_t sim_delay_len_ = 0;
+  EngineCore core_;
 };
 
 }  // namespace st

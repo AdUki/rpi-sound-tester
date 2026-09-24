@@ -1,7 +1,5 @@
 #pragma once
 
-#include <time.h>
-
 #include <atomic>
 #include <array>
 #include <cstdint>
@@ -10,6 +8,7 @@
 
 #include "constants.h"
 #include "hdmi_layout.h"
+#include "util/clock.h"
 
 namespace st {
 
@@ -169,13 +168,6 @@ class TimeAnchor {
   std::atomic<uint64_t> n_{0};
   std::atomic<uint64_t> t_ns_{0};
 };
-
-// CLOCK_MONOTONIC in nanoseconds — the clock both ends of the network link agree to talk in.
-inline uint64_t mono_ns() {
-  timespec ts{};
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
-}
 
 // Network audio input. `delay_frames` is the one the audio thread reads: local capture is held
 // back by exactly this much before entering the ring, so that ring index n means the same real

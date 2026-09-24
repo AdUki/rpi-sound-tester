@@ -24,10 +24,6 @@ namespace st {
 
 namespace {
 
-// How far ahead of the reader a packet must land. One block would be the bare minimum; two keeps
-// the writer clear of the reader even if the audio thread advances while the check is in flight.
-constexpr uint64_t kGuardFrames = 2 * kDefaultPeriod;
-
 // Reads exactly n bytes unless the connection dies or the server is stopping. The poll timeout is
 // what lets a parked connection notice a shutdown instead of holding teardown open.
 bool read_exact(int fd, void* buf, size_t n, const std::atomic<bool>& running) {
@@ -199,7 +195,8 @@ size_t timeline_frames(double rate) {
 }
 }  // namespace
 
-NetAudioServer::NetAudioServer(Control& ctl, double rate) : ctl_(ctl), rate_(rate) {
+NetAudioServer::NetAudioServer(Control& ctl, double rate, unsigned period, Clock& clock)
+    : ctl_(ctl), rate_(rate), guard_frames_(2ull * period), clock_(clock) {
   const size_t frames = timeline_frames(rate);
   chans_.reserve(kNetInputs);
   for (unsigned c = 0; c < kNetInputs; ++c) chans_.push_back(std::make_unique<Channel>(frames));
@@ -635,7 +632,7 @@ bool NetAudioServer::Session::audio(const uint8_t* p, uint32_t len) {
       // An INTERPOLATED reader position, not the raw one. srv.reader_n_ only moves when the audio
       // thread finishes a block, so measuring against it quantises the error by up to a whole
       // period — noise worth half the trim's authority, and none of it drift.
-      const uint64_t reader_now = srv.ctl_.anchor.estimate(mono_ns(), srv.rate_);
+      const uint64_t reader_now = srv.ctl_.anchor.estimate(srv.clock_.now_ns(), srv.rate_);
       const uint64_t reader_pos = reader_now ? reader_now : reader;
 
       const bool sender_jumped = expect_pos != 0 && pos != expect_pos;
@@ -643,7 +640,7 @@ bool NetAudioServer::Session::audio(const uint8_t* p, uint32_t len) {
       // minutes, and being wrong for two minutes is worse than one discontinuity now. Judged on
       // the filtered value, so a moment's jitter cannot trigger it.
       const bool adrift = out_next != 0 && lead.primed &&
-                          std::fabs(lead.avg - static_cast<double>(delay)) > kNetResyncFrames;
+                          std::fabs(lead.avg - static_cast<double>(delay)) > srv.resync_frames();
 
       if (out_next == 0 || sender_jumped || adrift) {
         if (sender_jumped) {
@@ -690,7 +687,7 @@ bool NetAudioServer::Session::audio(const uint8_t* p, uint32_t len) {
       // Report on a fixed cadence. Audio packets arrive every few milliseconds, so hanging the
       // timer off them is both simple and reliable — no extra thread, and it stops on its own the
       // moment a sender goes quiet, which is when there is nothing to report anyway.
-      const uint64_t now = mono_ns();
+      const uint64_t now = srv.clock_.now_ns();
       if (now - last_status_ns >= ST_STATUS_INTERVAL_MS * 1000000ull) {
         last_status_ns = now;
         if (!status()) return false;
@@ -713,7 +710,7 @@ void NetAudioServer::Session::distribute(const float* src, size_t frames, uint64
       peak = std::max(peak, std::fabs(v));
     }
 
-    switch (ch.timeline.write(at, chan.data(), frames, reader, kGuardFrames,
+    switch (ch.timeline.write(at, chan.data(), frames, reader, srv.guard_frames_,
                               max_lead)) {
       case NetTimeline::Write::Ok: {
         ch.frames_received.fetch_add(frames, std::memory_order_relaxed);

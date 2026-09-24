@@ -30,8 +30,8 @@ struct EnvColumn {
   int16_t max[kTotalInputs];
 };
 
-// One min/max column per kEnvColumnFrames of capture, indexed by column number
-// (= sample / kEnvColumnFrames) so every consumer agrees on the time axis.
+// One min/max column per env_column_frames(rate) of capture, indexed by column number
+// (= sample / env_column_frames(rate)) so every consumer agrees on the time axis.
 class EnvelopeRing {
  public:
   EnvelopeRing() : cols_(kEnvColumns) {}
@@ -83,6 +83,9 @@ class Analysis {
 
   AnalysisSnapshot snapshot() const;
   EnvelopeRing& envelope() { return env_; }
+  // Frames per envelope column at the engine's rate: what a column index is multiplied by to name
+  // its first sample.
+  unsigned env_column_frames() const { return env_col_frames_; }
 
   // Center frequency (Hz, geometric mid-band) of each of the kSpectrumBins log-spaced spectrum
   // bins. Fixed at construction — it depends only on the rate — and AnalysisSnapshot::spectrum is
@@ -98,6 +101,7 @@ class Analysis {
 
   const RingBuffer& ring_;
   const double rate_;
+  const unsigned env_col_frames_;
 
   std::thread thread_;
   std::atomic<bool> running_{false};

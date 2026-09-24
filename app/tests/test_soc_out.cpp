@@ -6,11 +6,13 @@
 #include <string>
 #include <vector>
 
+#include "board_profile.h"
 #include "check.h"
 #include "constants.h"
 #include "control.h"
 #include "generators.h"
 #include "output_route.h"
+#include "rates.h"
 #include "ring_buffer.h"
 #include "util/dsp.h"
 
@@ -91,13 +93,16 @@ void test_pull_lapped_is_reported() {
 // hands it to a driver that drains at its own, slightly wrong, rate. The card runs slightly wrong
 // too. The servo has to hold the latency anyway, and do it by slewing the ratio, never stepping.
 struct LoopModel {
-  double rate = 96000.0;      // engine nominal
+  explicit LoopModel(double engine_rate)
+      : rate(engine_rate), chunk_in(engine_rate * kSocPeriodMs / 1000) {}
+
+  double rate;                // engine nominal
   double dev_rate = 48000.0;  // device nominal
   double engine_ppm = 0.0;
   double device_ppm = 0.0;
-  double chunk_in = 1920.0;   // 20 ms of engine frames
+  double chunk_in;            // one device period, in engine frames
   double buffer = 3840.0;     // PCM buffer, device frames
-  double ring_lag = 3072.0;
+  double ring_lag = static_cast<double>(kSocRingLagPeriods) * kTestPeriod;
 
   double target() const { return ring_lag + buffer * rate / dev_rate; }
 };
@@ -140,9 +145,18 @@ LoopResult run_loop(const LoopModel& m, double initial_error, double seconds) {
   return r;
 }
 
-void test_servo_holds_latency_against_drift() {
+// The model with the engine at either rate against a 48 kHz device, so that the servo's frame
+// counts and gain are the Pi's at 96 kHz and the VIM3L's at 48 kHz. Only the ratio is modelled: no
+// converter runs here, and neither does SocOutput itself, whose anchor() and stream() need a PCM.
+void test_servo_holds_latency_against_drift(double rate) {
+  // Slews, never steps: from one pass to the next the filtered latency moves by a few frames of
+  // the measurement's jitter, and the trim follows it at 1 / (rate x tau) per frame. The jitter is
+  // a quarter of a 1024-frame block at either rate, so the bound is in frames too: 4.8 of them is
+  // the 1e-5 of trim this was first held to at 96 kHz. At 48 kHz the same frames are twice as
+  // long, and the trim moves twice as far for them.
+  const double max_step = 4.8 / (rate * kAsrcTauS);
   for (double ppm : {-100.0, 0.0, 100.0}) {
-    LoopModel m;
+    LoopModel m(rate);
     m.device_ppm = ppm;
     m.engine_ppm = -ppm / 2;
     const LoopResult r = run_loop(m, 0.0, 120.0);
@@ -151,14 +165,14 @@ void test_servo_holds_latency_against_drift() {
     const double expected = std::fabs(ppm * 1.5e-6) * m.rate * kAsrcTauS;
     CHECK(std::fabs(r.final_error) <= expected + 0.001 * m.rate);
     CHECK(r.worst_trim_dev <= kAsrcTrimMax + 1e-12);
-    CHECK(r.worst_trim_step < 1e-5);  // slews, never steps
+    CHECK(r.worst_trim_step < max_step);
     CHECK(!r.ever_adrift);
   }
 }
 
 // Starting 30 ms off — what a re-anchor can leave behind — it walks back without a resync.
-void test_servo_walks_back_an_offset() {
-  LoopModel m;
+void test_servo_walks_back_an_offset(double rate) {
+  LoopModel m(rate);
   m.device_ppm = 50.0;
   const LoopResult r = run_loop(m, 0.030 * m.rate, 90.0);
   CHECK(std::fabs(r.final_error) <= 0.001 * m.rate);
@@ -396,14 +410,28 @@ void test_select_at_the_line_outs_width() {
 }
 
 // Each sink says which one it is, so two of them never log or fail under the other's name, and
-// its ring is as wide as the most slots it can have.
+// its ring is as wide as the most slots it can have. All of it is what the board's profile says,
+// and the hint for a missing device names the device the profile opens.
 void test_sinks_are_told_apart() {
+  const BoardProfile& board = rpi3_octo_profile();
+  const SinkProfile* hdmi = board.sink("hdmi");
+  const SinkProfile* lineout = board.sink("lineout");
+  CHECK(hdmi && lineout);
+  if (!hdmi || !lineout) return;
+
+  CHECK_EQ(std::string(kHdmiSink.name), hdmi->id);
+  CHECK_EQ(std::string(kLineoutSink.name), lineout->id);
   CHECK_EQ(std::string(kHdmiSink.name), std::string("hdmi"));
   CHECK_EQ(std::string(kLineoutSink.name), std::string("lineout"));
+  CHECK_EQ(kHdmiSink.width, hdmi->width);
+  CHECK_EQ(kLineoutSink.width, lineout->width);
+  // The engine renders each sink at a width fixed when it is compiled.
   CHECK_EQ(kHdmiSink.width, kHdmiMaxChannels);
   CHECK_EQ(kLineoutSink.width, kLineoutChannels);
-  CHECK(std::string(kLineoutSink.where).find("Headphones") != std::string::npos);
-  CHECK(std::string(kHdmiSink.where).find("b1") != std::string::npos);
+  CHECK_EQ(std::string(kHdmiSink.where), hdmi->where_hint);
+  CHECK_EQ(std::string(kLineoutSink.where), lineout->where_hint);
+  CHECK(hdmi->where_hint.find(hdmi->device) != std::string::npos);
+  CHECK(lineout->where_hint.find(lineout->device) != std::string::npos);
 }
 
 }  // namespace
@@ -412,8 +440,11 @@ int main() {
   test_pull_tracks_absolute_index();
   test_pull_starved_leaves_the_reader_alone();
   test_pull_lapped_is_reported();
-  test_servo_holds_latency_against_drift();
-  test_servo_walks_back_an_offset();
+  for (const unsigned r : kTestRates) {
+    std::printf("  at %u Hz\n", r);
+    test_servo_holds_latency_against_drift(r);
+    test_servo_walks_back_an_offset(r);
+  }
   test_servo_adrift();
   test_route_identical_across_strides();
   test_select_keeps_the_channels_in_play();

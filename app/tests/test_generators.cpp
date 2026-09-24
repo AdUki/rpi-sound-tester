@@ -7,13 +7,12 @@
 
 #include "check.h"
 #include "control.h"
+#include "rates.h"
 #include "util/dsp.h"
 
 using namespace st;
 
 namespace {
-
-constexpr double kRate = 96000.0;
 
 // Runs the generator in blocks, exactly as the audio thread does.
 void render_blocks(Generators& g, Control& ctl, PingLog& log, size_t blocks, size_t period,
@@ -27,12 +26,12 @@ void render_blocks(Generators& g, Control& ctl, PingLog& log, size_t blocks, siz
   }
 }
 
-void test_ping_spacing_is_exact() {
+void test_ping_spacing_is_exact(double rate) {
   // The period (1024) does not divide the ping interval, which is exactly the case a
   // naive "n % interval == 0" block-start test would never fire on.
   Control ctl;
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   PingLog log;
 
   ctl.ping.interval_s.store(0.5f);
@@ -41,22 +40,22 @@ void test_ping_spacing_is_exact() {
   ctl.ping.epoch.fetch_add(1);
 
   const size_t period = 1024;
-  render_blocks(g, ctl, log, 600, period, nullptr, nullptr, nullptr);  // ~6.4 s
+  render_blocks(g, ctl, log, 600, period, nullptr, nullptr, nullptr);  // 6.4 s at 96 kHz
 
   const auto pings = log.recent();
   CHECK(pings.size() >= 10);
 
-  const uint64_t expected = static_cast<uint64_t>(std::llround(0.5 * kRate));
+  const uint64_t expected = static_cast<uint64_t>(std::llround(0.5 * rate));
   for (size_t i = 1; i < pings.size(); ++i) {
     CHECK_EQ(pings[i].sample - pings[i - 1].sample, expected);
   }
   for (const auto& p : pings) CHECK_EQ(static_cast<int>(p.variant), 0);
 }
 
-void test_ping_energy_lands_at_logged_sample() {
+void test_ping_energy_lands_at_logged_sample(double rate) {
   Control ctl;
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   PingLog log;
 
   ctl.ping.interval_s.store(0.5f);
@@ -84,10 +83,10 @@ void test_ping_energy_lands_at_logged_sample() {
   CHECK(after > 0.3f);
 }
 
-void test_ping_interval_change_reschedules() {
+void test_ping_interval_change_reschedules(double rate) {
   Control ctl;
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   PingLog log;
 
   ctl.ping.interval_s.store(0.5f);
@@ -107,7 +106,7 @@ void test_ping_interval_change_reschedules() {
 
   const auto pings = log.recent();
   CHECK(pings.size() >= before + 3);
-  const uint64_t expected = static_cast<uint64_t>(std::llround(1.0 * kRate));
+  const uint64_t expected = static_cast<uint64_t>(std::llround(1.0 * rate));
   // The gap straddling the change mixes both schedules; every gap after it is the new one.
   for (size_t i = before + 1; i < pings.size(); ++i) {
     CHECK_EQ(pings[i].sample - pings[i - 1].sample, expected);
@@ -118,20 +117,20 @@ void test_ping_interval_change_reschedules() {
 // SEEN in the ring rather than where it was emitted. Get this wrong and the scope's ping markers
 // and genie/sync both aim a whole delay away from the arrival they are looking for — and they
 // fail silently, finding noise instead of a peak.
-void test_ping_log_carries_the_capture_delay() {
+void test_ping_log_carries_the_capture_delay(double rate) {
   Control ctl;
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   ctl.ping.interval_s.store(0.5f);
   ctl.ping.level_db.store(-6.0f);
 
-  const uint64_t offset = 96000;  // one second at 96 kHz
+  const uint64_t offset = static_cast<uint64_t>(rate);  // one second
   const size_t period = 1024;
   std::vector<float> bs(period), bn(period), bp(period);
 
   PingLog plain, shifted;
   Generators g2;
-  g2.init(kRate);
+  g2.init(rate);
   for (size_t b = 0; b < 200; ++b) {
     g.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), nullptr, plain, 0);
     g2.render(b * period, period, ctl, bs.data(), bn.data(), bp.data(), nullptr, shifted, offset);
@@ -165,10 +164,10 @@ void test_ping_log_wraps_keeping_the_newest_entries() {
   }
 }
 
-void test_sine_frequency_and_level() {
+void test_sine_frequency_and_level(double rate) {
   Control ctl;
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   PingLog log;
 
   ctl.sine.freq_hz.store(1000.0f);
@@ -188,14 +187,14 @@ void test_sine_frequency_and_level() {
   for (size_t i = 1; i < sine.size(); ++i) {
     if ((sine[i - 1] < 0.0f) != (sine[i] < 0.0f)) ++crossings;
   }
-  const double seconds = static_cast<double>(sine.size()) / kRate;
+  const double seconds = static_cast<double>(sine.size()) / rate;
   CHECK_NEAR(crossings / (2.0 * seconds), 1000.0, 2.0);
 }
 
-void test_sine_phase_is_continuous_across_blocks() {
+void test_sine_phase_is_continuous_across_blocks(double rate) {
   Control ctl;
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   PingLog log;
   ctl.sine.freq_hz.store(997.0f);
   ctl.sine.level_db.store(0.0f);
@@ -205,16 +204,16 @@ void test_sine_phase_is_continuous_across_blocks() {
 
   // A discontinuity at a block seam would show up as a sample-to-sample jump far larger
   // than the per-sample step of a 997 Hz sine.
-  const float max_step = static_cast<float>(2.0 * kPi * 997.0 / kRate) * 1.5f;
+  const float max_step = static_cast<float>(2.0 * kPi * 997.0 / rate) * 1.5f;
   for (size_t i = 1; i < sine.size(); ++i) {
     CHECK(std::fabs(sine[i] - sine[i - 1]) < max_step);
   }
 }
 
-void test_noise_is_bounded_and_nonzero() {
+void test_noise_is_bounded_and_nonzero(double rate) {
   Control ctl;
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   PingLog log;
   ctl.noise.level_db.store(-6.0f);
 
@@ -250,13 +249,13 @@ std::vector<float> render_music(Generators& g, uint64_t start, size_t total, siz
 // The melody is a pure function of the absolute index. Block size must not matter, and neither
 // may when rendering began — a sink that starts listening mid-tune, or an engine that skipped the
 // blocks nobody was routed to, hears exactly what it would have heard anyway.
-void test_music_is_pure_in_n() {
+void test_music_is_pure_in_n(double rate) {
   Generators a, b, c;
-  a.init(kRate);
-  b.init(kRate);
-  c.init(kRate);
-  const size_t total = 3 * 96000;
-  const uint64_t start = 5 * 96000 + 123;  // mid-loop, mid-note
+  a.init(rate);
+  b.init(rate);
+  c.init(rate);
+  const size_t total = static_cast<size_t>(3 * rate);
+  const uint64_t start = static_cast<uint64_t>(5 * rate) + 123;  // mid-loop, mid-note
   const auto x = render_music(a, start, total, 1024, 0.5f);
   const auto y = render_music(b, start, total, 777, 0.5f);
   CHECK(x == y);
@@ -274,17 +273,17 @@ void test_music_is_pure_in_n() {
   PingLog log;
   std::vector<float> bs(1024), bn(1024), bp(1024), bm(1024), direct(1024);
   Generators d;
-  d.init(kRate);
+  d.init(rate);
   d.render(start, 1024, ctl, bs.data(), bn.data(), bp.data(), bm.data(), log);
   d.render_music(start, 1024, db_to_lin(-6.0f), direct.data());
   CHECK(bm == direct);
 }
 
-void test_music_loops_seamlessly() {
+void test_music_loops_seamlessly(double rate) {
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   const uint64_t L = g.music_loop_frames();
-  CHECK_EQ(L, static_cast<uint64_t>(12.8 * kRate));
+  CHECK_EQ(L, static_cast<uint64_t>(12.8 * rate));
 
   // Exactly periodic: loop k and loop k+1 are the same samples.
   const auto x = render_music(g, 0, 2 * L, 1024, 1.0f);
@@ -301,16 +300,17 @@ void test_music_loops_seamlessly() {
 // No clicks anywhere, including the loop seam and every note boundary: the largest step between
 // adjacent samples stays within what the fastest partial at full envelope can produce. A note cut
 // off mid-waveform would jump by a sizeable fraction of full scale.
-void test_music_has_no_clicks() {
+void test_music_has_no_clicks(double rate) {
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   const uint64_t L = g.music_loop_frames();
   const float amp = 1.0f;
-  const auto x = render_music(g, L - 96000, 2 * 96000 + L, 1000, amp);  // spans a seam and a loop
+  const uint64_t second = static_cast<uint64_t>(rate);
+  const auto x = render_music(g, L - second, 2 * second + L, 1000, amp);  // spans a seam and a loop
 
   const double f_max = 440.0 * std::pow(2.0, (79 - 69) / 12.0);  // G5, the highest note
   // Carrier slope w(1 + 2 * 0.25) plus the 5 ms attack's own slope, with a margin.
-  const double bound = 1.2 * amp * (2.0 * kPi * f_max * 1.5 + 1.0 / 0.005) / kRate;
+  const double bound = 1.2 * amp * (2.0 * kPi * f_max * 1.5 + 1.0 / 0.005) / rate;
   double worst = 0.0;
   for (size_t i = 1; i < x.size(); ++i)
     worst = std::max(worst, static_cast<double>(std::fabs(x[i] - x[i - 1])));
@@ -318,9 +318,9 @@ void test_music_has_no_clicks() {
   CHECK(worst > 0.1 * bound);  // it does move
 }
 
-void test_music_level() {
+void test_music_level(double rate) {
   Generators g;
-  g.init(kRate);
+  g.init(rate);
   const uint64_t L = g.music_loop_frames();
   for (float db : {0.0f, -20.0f}) {
     const float amp = db_to_lin(db);
@@ -347,18 +347,22 @@ void test_music_is_rate_independent() {
 }  // namespace
 
 int main() {
-  test_ping_spacing_is_exact();
-  test_ping_energy_lands_at_logged_sample();
-  test_ping_interval_change_reschedules();
+  for (const unsigned r : kTestRates) {
+    std::cout << "at " << r << " Hz\n";
+    const double rate = r;
+    test_ping_spacing_is_exact(rate);
+    test_ping_energy_lands_at_logged_sample(rate);
+    test_ping_interval_change_reschedules(rate);
+    test_ping_log_carries_the_capture_delay(rate);
+    test_sine_frequency_and_level(rate);
+    test_sine_phase_is_continuous_across_blocks(rate);
+    test_noise_is_bounded_and_nonzero(rate);
+    test_music_is_pure_in_n(rate);
+    test_music_loops_seamlessly(rate);
+    test_music_has_no_clicks(rate);
+    test_music_level(rate);
+  }
   test_ping_log_wraps_keeping_the_newest_entries();
-  test_ping_log_carries_the_capture_delay();
-  test_sine_frequency_and_level();
-  test_sine_phase_is_continuous_across_blocks();
-  test_noise_is_bounded_and_nonzero();
-  test_music_is_pure_in_n();
-  test_music_loops_seamlessly();
-  test_music_has_no_clicks();
-  test_music_level();
   test_music_is_rate_independent();
   return report("generators");
 }

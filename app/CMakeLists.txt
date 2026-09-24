@@ -123,9 +123,12 @@ target_compile_definitions(third_party INTERFACE SPDLOG_HEADER_ONLY)
 
 add_library(soundtester_core STATIC
   src/analysis.cpp
+  src/audio_backend.cpp
   src/audio_engine.cpp
+  src/board_profile.cpp
   src/capture.cpp
   src/config.cpp
+  src/engine_core.cpp
   src/generators.cpp
   src/soc_out.cpp
   src/kmsg_watch.cpp

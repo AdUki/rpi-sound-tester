@@ -1,16 +1,7 @@
 #include "audio_engine.h"
 
-#include "net_audio.h"
-
-#include <alsa/asoundlib.h>
 #include <pthread.h>
-#include <time.h>
 
-#include <algorithm>
-#include <cmath>
-
-#include "output_route.h"
-#include "util/dsp.h"
 #include "util/log.h"
 #include "util/rt.h"
 
@@ -21,12 +12,6 @@ namespace {
 constexpr int kRtPriority = 80;
 constexpr size_t kAudioStackBytes = 1024 * 1024;
 constexpr size_t kPrefaultBytes = 256 * 1024;
-constexpr unsigned kReopenDelayS = 5;
-
-void sleep_ms(unsigned ms) {
-  timespec ts{static_cast<time_t>(ms / 1000), static_cast<long>((ms % 1000) * 1000000L)};
-  nanosleep(&ts, nullptr);
-}
 
 // Touch the stack once up front so no page fault can land inside the audio loop. The
 // asm barrier stops the optimizer from deleting a write-only local array.
@@ -36,54 +21,31 @@ void prefault_stack() {
   asm volatile("" : : "r"(scratch) : "memory");
 }
 
-// One of the SoC's own outputs, as the audio thread sees it for one block.
-struct SocFeed {
-  RingBuffer* ring;           // null until main() wires it in
-  const HdmiLayoutInfo* lay;  // puts each speaker in its PCM slot
-  unsigned speakers;          // how many are rendered: none while the sink is off
-};
-
-SocFeed soc_feed(const std::atomic<RingBuffer*>& ring, const SocControl& sc, unsigned width) {
-  RingBuffer* const r = ring.load(std::memory_order_relaxed);
-  const HdmiLayoutInfo& lay = hdmi_layout_info(soc_layout(sc, width));
-  const bool on = r && sc.enabled.load(std::memory_order_relaxed);
-  return {r, &lay, on ? lay.speakers : 0u};
-}
-
-// A sink's speakers, rendered at the same n by the same code as the DACs, each into its layout's
-// PCM slot of a `Width`-wide block, then handed to the sink's thread. Written whether or not
-// anything is playing them, so the handoff ring's counter never falls out of step with the capture
-// ring's; that write is a memcpy and an atomic store. Slots no speaker of the layout uses stay
-// silent.
-template <size_t Width>
-void feed_soc(const SocFeed& f, const OutputControl* outs, uint64_t n, size_t frames,
-              const float* in_all, const float* const* gens, const Generators& gen,
-              uint64_t identify_frames, float* block) {
-  if (!f.ring) return;
-  if (f.speakers < Width) std::fill(block, block + frames * Width, 0.0f);
-  for (unsigned s = 0; s < f.speakers; ++s) {
-    route_output<Width>(outs[s], n, frames, in_all, gens, gen, identify_frames,
-                        block + f.lay->slot[s]);
-  }
-  f.ring->write(block, frames);
+std::unique_ptr<AudioBackend> make_backend(const Control& ctl, const EngineOptions& opt,
+                                           Clock& clock) {
+  if (opt.sim) return std::make_unique<TimerBackend>(opt, clock);
+  return std::make_unique<AlsaLinkedBackend>(ctl, opt, clock);
 }
 
 }  // namespace
 
-AudioEngine::AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt)
-    : ctl_(ctl), ring_(ring), opt_(opt) {}
+AudioEngine::AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt, Clock& clock)
+    : ring_(ring),
+      opt_(opt),
+      clock_(clock),
+      own_backend_(make_backend(ctl, opt_, clock)),
+      backend_(own_backend_.get()),
+      core_(ctl, ring, clock, opt_.rate, generation_) {}
+
+AudioEngine::AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt, AudioBackend& backend,
+                         Clock& clock)
+    : ring_(ring),
+      opt_(opt),
+      clock_(clock),
+      backend_(&backend),
+      core_(ctl, ring, clock, opt_.rate, generation_) {}
 
 AudioEngine::~AudioEngine() { stop(); }
-
-void AudioEngine::set_error(std::string msg) {
-  std::lock_guard<std::mutex> lock(err_m_);
-  last_error_ = std::move(msg);
-}
-
-std::string AudioEngine::error() const {
-  std::lock_guard<std::mutex> lock(err_m_);
-  return last_error_;
-}
 
 EngineStats AudioEngine::stats() const {
   EngineStats s;
@@ -102,500 +64,86 @@ EngineStats AudioEngine::stats() const {
   return s;
 }
 
-bool AudioEngine::configure(snd_pcm_t* pcm, unsigned channels, const char* what) {
-  snd_pcm_hw_params_t* hw;
-  snd_pcm_hw_params_alloca(&hw);
-
-  int err = snd_pcm_hw_params_any(pcm, hw);
-  if (err < 0) {
-    set_error(std::string(what) + ": hw_params_any: " + snd_strerror(err));
-    return false;
-  }
-
-  err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
-  if (err < 0) {
-    set_error(std::string(what) + ": set_access: " + snd_strerror(err));
-    return false;
-  }
-
-  err = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S32_LE);
-  if (err < 0) {
-    set_error(std::string(what) + ": S32_LE not available: " + snd_strerror(err));
-    return false;
-  }
-
-  err = snd_pcm_hw_params_set_channels(pcm, hw, channels);
-  if (err < 0) {
-    set_error(std::string(what) + ": " + std::to_string(channels) +
-                  " channels not available: " + snd_strerror(err));
-    return false;
-  }
-
-  err = snd_pcm_hw_params_set_rate(pcm, hw, opt_.rate, 0);
-  if (err < 0) {
-    set_error(std::string(what) + ": rate " + std::to_string(opt_.rate) +
-                  " not available: " + snd_strerror(err));
-    return false;
-  }
-
-  snd_pcm_uframes_t period = opt_.period;
-  err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, nullptr);
-  if (err < 0) {
-    set_error(std::string(what) + ": set_period_size: " + snd_strerror(err));
-    return false;
-  }
-
-  snd_pcm_uframes_t buffer = static_cast<snd_pcm_uframes_t>(opt_.period) * opt_.periods;
-  err = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
-  if (err < 0) {
-    set_error(std::string(what) + ": set_buffer_size: " + snd_strerror(err));
-    return false;
-  }
-
-  err = snd_pcm_hw_params(pcm, hw);
-  if (err < 0) {
-    set_error(std::string(what) + ": hw_params: " + snd_strerror(err));
-    return false;
-  }
-
-  if (period != opt_.period) {
-    LOG_WARN("{}: driver chose period {} (asked {})", what, static_cast<unsigned>(period),
-             opt_.period);
-    opt_.period = static_cast<unsigned>(period);
-    period_.store(opt_.period, std::memory_order_relaxed);
-  }
-  LOG_INFO("{}: {} ch, {} Hz, S32_LE, period {}, buffer {}", what, channels, opt_.rate,
-           static_cast<unsigned>(period), static_cast<unsigned>(buffer));
-
-  snd_pcm_sw_params_t* sw;
-  snd_pcm_sw_params_alloca(&sw);
-  err = snd_pcm_sw_params_current(pcm, sw);
-  if (err < 0) {
-    set_error(std::string(what) + ": sw_params_current: " + snd_strerror(err));
-    return false;
-  }
-  // Nothing may auto-start: the linked group is started once, explicitly, so capture and
-  // playback share sample zero.
-  snd_pcm_sw_params_set_start_threshold(pcm, sw, 0x7fffffff);
-  snd_pcm_sw_params_set_avail_min(pcm, sw, opt_.period);
-  err = snd_pcm_sw_params(pcm, sw);
-  if (err < 0) {
-    set_error(std::string(what) + ": sw_params: " + snd_strerror(err));
-    return false;
-  }
-  return true;
-}
-
-bool AudioEngine::open_alsa() {
-  // Give the device node this long to appear per attempt; thread_entry() retries the whole
-  // open forever on the same cadence.
-  const unsigned deadline_ms = kReopenDelayS * 1000;
-  unsigned waited = 0;
-  int err = 0;
-
-  // The codec probes asynchronously after the overlay loads, so at boot the device may not
-  // exist yet for the first seconds.
-  for (;;) {
-    err = snd_pcm_open(&capture_, opt_.device.c_str(), SND_PCM_STREAM_CAPTURE, 0);
-    if (err >= 0) break;
-    if (waited >= deadline_ms) {
-      set_error("cannot open capture device " + opt_.device + ": " + snd_strerror(err));
-      LOG_ERROR("{}", error());
-      return false;
-    }
-    if (waited == 0) LOG_WARN("waiting for {} to appear ({})", opt_.device, snd_strerror(err));
-    sleep_ms(500);
-    waited += 500;
-  }
-
-  err = snd_pcm_open(&playback_, opt_.device.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
-  if (err < 0) {
-    set_error("cannot open playback device " + opt_.device + ": " + snd_strerror(err));
-    LOG_ERROR("{}", error());
-    close_alsa();
-    return false;
-  }
-
-  cap_ch_ = opt_.capture_channels;
-  if (!configure(capture_, cap_ch_, "capture")) {
-    if (cap_ch_ == kInputs) {
-      close_alsa();
-      return false;
-    }
-    // The driver only widens capture to 8 TDM slots while a stream is open; if it refuses,
-    // the plain 6 ADC channels always work.
-    LOG_WARN("{} — retrying capture with {} channels", error(), kInputs);
-    snd_pcm_close(capture_);
-    capture_ = nullptr;
-    err = snd_pcm_open(&capture_, opt_.device.c_str(), SND_PCM_STREAM_CAPTURE, 0);
-    if (err < 0) {
-      set_error(std::string("reopen capture: ") + snd_strerror(err));
-      close_alsa();
-      return false;
-    }
-    cap_ch_ = kInputs;
-    if (!configure(capture_, cap_ch_, "capture")) {
-      close_alsa();
-      return false;
-    }
-  }
-
-  if (!configure(playback_, kOutputs, "playback")) {
-    close_alsa();
-    return false;
-  }
-
-  err = snd_pcm_link(capture_, playback_);
-  if (err < 0) {
-    // Without a linked start the two streams have an unknown offset between them.
-    set_error(std::string("snd_pcm_link failed: ") + snd_strerror(err));
-    LOG_ERROR("{}", error());
-    close_alsa();
-    return false;
-  }
-  LOG_INFO("capture and playback linked: one clock, one start");
-  return true;
-}
-
-void AudioEngine::close_alsa() {
-  if (capture_) {
-    snd_pcm_close(capture_);
-    capture_ = nullptr;
-  }
-  if (playback_) {
-    snd_pcm_close(playback_);
-    playback_ = nullptr;
-  }
-}
-
-bool AudioEngine::prefill_and_start() {
-  int err = snd_pcm_prepare(capture_);
-  if (err < 0) {
-    set_error(std::string("prepare: ") + snd_strerror(err));
-    return false;
-  }
-
-  // Three periods of silence: once readi starts returning, playback still holds two
-  // periods, giving the loop ~21 ms of jitter budget before it underruns.
-  std::fill(raw_out_.begin(), raw_out_.end(), 0);
-  for (unsigned i = 0; i < 3; ++i) {
-    snd_pcm_sframes_t w = snd_pcm_writei(playback_, raw_out_.data(), opt_.period);
-    if (w < 0) {
-      set_error(std::string("prefill writei: ") + snd_strerror(static_cast<int>(w)));
-      return false;
-    }
-  }
-
-  err = snd_pcm_start(capture_);
-  if (err < 0) {
-    set_error(std::string("start: ") + snd_strerror(err));
-    return false;
-  }
-  return true;
-}
-
 bool AudioEngine::recover(int err) {
   xruns_.fetch_add(1);
   generation_.fetch_add(1);
-  LOG_WARN("xrun/recover: {} (total {})", snd_strerror(err), xruns_.load());
-
-  int r = snd_pcm_recover(capture_, err, 1);
-  if (r < 0) {
-    LOG_ERROR("capture recover failed: {}", snd_strerror(r));
-    return false;
-  }
-  const snd_pcm_state_t ps = snd_pcm_state(playback_);
-  if (ps != SND_PCM_STATE_PREPARED && ps != SND_PCM_STATE_RUNNING) {
-    r = snd_pcm_prepare(playback_);
-    if (r < 0) {
-      LOG_ERROR("playback prepare failed: {}", snd_strerror(r));
-      return false;
-    }
-  }
-  return prefill_and_start();
+  LOG_WARN("xrun/recover: {} (total {})", backend_strerror(err), xruns_.load());
+  return backend_->recover(err);
 }
 
-void AudioEngine::init_mixer() {
-  std::string card = opt_.device;
-  const size_t comma = card.find(',');
-  if (comma != std::string::npos) card = card.substr(0, comma);
-
-  snd_mixer_t* mixer = nullptr;
-  if (snd_mixer_open(&mixer, 0) < 0) return;
-  if (snd_mixer_attach(mixer, card.c_str()) < 0 ||
-      snd_mixer_selem_register(mixer, nullptr, nullptr) < 0 || snd_mixer_load(mixer) < 0) {
-    snd_mixer_close(mixer);
-    LOG_WARN("no mixer on {} — leaving the codec at driver defaults", card);
-    return;
-  }
-
-  // Start from a known codec state rather than whatever the driver left behind, and "known"
-  // means unity gain — 0 dB.
-  //
-  // Unity is not the control's maximum. On the CS42448 the DAC volume range tops out at 0 dB
-  // but the ADC range tops out at +24 dB, so driving both to their raw maximum leaves all six
-  // ADCs at +24 dB (VOLAIN1..6 = 0x30, read back from the codec on the running board) and every
-  // reported level is 24 dB too high. So ask ALSA for the 0 dB point from the control's own TLV
-  // instead of inferring it from the raw range. Fall back to the maximum only if a control
-  // carries no dB information at all, and log the dB actually achieved so the codec state is
-  // visible in the journal.
-  for (snd_mixer_elem_t* e = snd_mixer_first_elem(mixer); e; e = snd_mixer_elem_next(e)) {
-    const char* name = snd_mixer_selem_get_name(e);
-    long lo = 0, hi = 0, raw = 0, mdb = 0;
-
-    if (snd_mixer_selem_has_playback_volume(e)) {
-      if (snd_mixer_selem_set_playback_dB_all(e, 0, 0) < 0) {
-        snd_mixer_selem_get_playback_volume_range(e, &lo, &hi);
-        snd_mixer_selem_set_playback_volume_all(e, hi);
-        LOG_WARN("mixer: {} has no dB scale — using raw maximum {}", name ? name : "?", hi);
-      }
-      snd_mixer_selem_get_playback_volume(e, SND_MIXER_SCHN_FRONT_LEFT, &raw);
-      const bool has_db = snd_mixer_selem_get_playback_dB(e, SND_MIXER_SCHN_FRONT_LEFT, &mdb) == 0;
-      LOG_INFO("mixer: {} playback -> raw {} ({:.1f} dB)", name ? name : "?", raw,
-               has_db ? static_cast<double>(mdb) / 100.0 : 0.0);
-    }
-
-    if (snd_mixer_selem_has_capture_volume(e)) {
-      if (snd_mixer_selem_set_capture_dB_all(e, 0, 0) < 0) {
-        snd_mixer_selem_get_capture_volume_range(e, &lo, &hi);
-        snd_mixer_selem_set_capture_volume_all(e, hi);
-        LOG_WARN("mixer: {} has no dB scale — using raw maximum {}", name ? name : "?", hi);
-      }
-      snd_mixer_selem_get_capture_volume(e, SND_MIXER_SCHN_FRONT_LEFT, &raw);
-      const bool has_db = snd_mixer_selem_get_capture_dB(e, SND_MIXER_SCHN_FRONT_LEFT, &mdb) == 0;
-      LOG_INFO("mixer: {} capture -> raw {} ({:.1f} dB)", name ? name : "?", raw,
-               has_db ? static_cast<double>(mdb) / 100.0 : 0.0);
-    }
-  }
-  snd_mixer_close(mixer);
+void AudioEngine::publish_shape() {
+  const BackendShape shape = backend_->shape();
+  cap_ch_.store(shape.capture_channels, std::memory_order_relaxed);
+  period_.store(shape.period, std::memory_order_relaxed);
 }
 
-void AudioEngine::process_block(uint64_t n, size_t frames, float* in_all, float* out8) {
-  // Publish where the sample counter is right now, so a network client can aim a packet at an
-  // absolute index. This is the only place the card's clock is tied to CLOCK_MONOTONIC, and it
-  // is deliberately the same n that generators render at.
-  //
-  // n corresponds to audio the card captured a moment before this call, so the anchor carries a
-  // small systematic offset (a period plus the driver's own buffering). It is constant, so it
-  // shifts network audio uniformly rather than smearing it — loopback_offset_samples is the
-  // existing knob for taking it out.
-  ctl_.anchor.publish(n, mono_ns());
-
-  const unsigned delay = sync_capture_delay();
-
-  // Outputs are routed from the live block, so a passthrough keeps its near-zero latency; the
-  // ring gets the delayed one, so every channel in it shares a single axis. With no delay the
-  // two are literally the same buffer and the whole mechanism disappears.
-  float* ring_block = delay == 0 ? in_all : ring_block_.data();
-
-  if (NetAudioServer* net = net_.load(std::memory_order_relaxed)) {
-    net->read_block(n, frames, delay, in_all, ring_block);
-  } else {
-    for (unsigned c = kInputs; c < kTotalInputs; ++c) {
-      for (size_t i = 0; i < frames; ++i) in_all[i * kTotalInputs + c] = 0.0f;
-      if (ring_block != in_all)
-        for (size_t i = 0; i < frames; ++i) ring_block[i * kTotalInputs + c] = 0.0f;
-    }
+bool AudioEngine::run_block() {
+  const uint64_t n = ring_.counter();
+  float* const in = core_.in();
+  float* const out8 = core_.out8();
+  const long got = backend_->read_block(n, in);
+  if (got < 0) {
+    // An unrecoverable xrun ends this stream, not the engine: run_card() closes the card and
+    // reopens it, the same never-fatal path as a failed open.
+    return recover(static_cast<int>(got));
   }
+  const size_t frames = static_cast<size_t>(got);
 
-  // Input gain lands here, upstream of the ring, so there is one version of the truth: meters,
-  // spectrum, THD+N, the scope, listen streams, cross-correlation and anything routed to an
-  // output all see the amplified signal. Gaining further downstream (say, only in the listen
-  // path) would make the number on the meter disagree with what the operator hears.
-  //
-  // Clamped to full scale on the way in, because every consumer of the ring assumes |x| <= 1:
-  // the envelope columns and the listen stream both convert to int16, and letting a sample past
-  // 0 dBFS through would wrap into loud garbage. Clamping instead flat-tops the waveform on the
-  // scope and pins the peak meter at 0.0 dBFS.
-  //
-  // A sender that declared its stream un-mixable is left at unity: no slider, here or in
-  // alsamixer, may touch a reference stimulus.
-  auto input_gain = [this](unsigned c) {
-    const InputControl& in = ctl_.inputs[c];
-    if (in.bypass.load(std::memory_order_relaxed)) return 1.0f;
-    return in.mute.load(std::memory_order_relaxed)
-               ? 0.0f
-               : db_to_lin(in.gain_db.load(std::memory_order_relaxed));
-  };
+  core_.process_block(n, frames, in, out8);
 
-  for (unsigned c = 0; c < kTotalInputs; ++c) {
-    const float g = input_gain(c);
-    if (g == 1.0f) continue;  // unity: the common case, and bit-exact — do not touch the samples
-    for (size_t i = 0; i < frames; ++i) {
-      in_all[i * kTotalInputs + c] = clampf(g * in_all[i * kTotalInputs + c], -1.0f, 1.0f);
-    }
-  }
-
-  if (delay != 0) {
-    // Local audio reaches the ring through the delay line; the network channels reach it from the
-    // trailing timeline read, which has not been through the gain loop above, so it gets the same
-    // treatment here rather than a second version of the truth.
-    apply_capture_delay(frames, in_all, ring_block);
-    for (unsigned c = kInputs; c < kTotalInputs; ++c) {
-      const float g = input_gain(c);
-      if (g == 1.0f) continue;
-      for (size_t i = 0; i < frames; ++i)
-        ring_block[i * kTotalInputs + c] = clampf(g * ring_block[i * kTotalInputs + c], -1.0f, 1.0f);
-    }
-  }
-
-  ring_.write(ring_block, frames);
-
-  const SocFeed hdmi = soc_feed(hdmi_ring_, ctl_.hdmi, kHdmiMaxChannels);
-  const SocFeed lineout = soc_feed(lineout_ring_, ctl_.lineout, kLineoutChannels);
-
-  // Outputs play at n, undelayed — but capture is held back by cap_delay_frames_, so a ping
-  // emitted now shows up in the ring that much later. The log records where it will APPEAR, not
-  // where it was emitted, or the scope's ping markers and genie/sync would both aim a full
-  // second wide of the arrival the moment a network channel is in use.
-  //
-  // The melody is rendered only while something plays it. It is a pure function of n, so the
-  // blocks it skips cost it nothing: it picks up at the right place in the tune on its own.
-  bool want_music = false;
-  for (const OutputControl& oc : ctl_.outputs) want_music |= routes_gen(oc, GenId::Music);
-  for (unsigned s = 0; s < hdmi.speakers; ++s)
-    want_music |= routes_gen(ctl_.hdmi_outputs[s], GenId::Music);
-  for (unsigned s = 0; s < lineout.speakers; ++s)
-    want_music |= routes_gen(ctl_.lineout_outputs[s], GenId::Music);
-  if (!want_music) std::fill(gen_music_.begin(), gen_music_.begin() + frames, 0.0f);
-  gen_.render(n, frames, ctl_, gen_sine_.data(), gen_noise_.data(), gen_ping_.data(),
-              want_music ? gen_music_.data() : nullptr, ctl_.ping_log, cap_delay_frames_);
-
-  const float* gens[static_cast<size_t>(GenId::Count)] = {gen_sine_.data(), gen_noise_.data(),
-                                                          gen_ping_.data(), gen_music_.data()};
-
-  for (unsigned o = 0; o < kOutputs; ++o) {
-    route_output<kOutputs>(ctl_.outputs[o], n, frames, in_all, gens, gen_, identify_frames_,
-                           out8 + o);
-  }
-
-  feed_soc<kHdmiMaxChannels>(hdmi, ctl_.hdmi_outputs.data(), n, frames, in_all, gens, gen_,
-                             identify_frames_, hdmi_block_.data());
-  feed_soc<kLineoutChannels>(lineout, ctl_.lineout_outputs.data(), n, frames, in_all, gens, gen_,
-                             identify_frames_, lineout_block_.data());
+  const long put = backend_->write_block(n, out8, frames);
+  if (put < 0) return recover(static_cast<int>(put));
+  return true;
 }
 
-unsigned AudioEngine::sync_capture_delay() {
-  const unsigned want =
-      std::min<unsigned>(ctl_.net.delay_frames.load(std::memory_order_relaxed),
-                         static_cast<unsigned>(cap_delay_len_ ? cap_delay_len_ - 1 : 0));
-  if (want != cap_delay_frames_) {
-    // The capture axis just moved. Anything already frozen was measured against the old one, so
-    // this is a discontinuity in exactly the way an xrun is.
-    std::fill(cap_delay_.begin(), cap_delay_.end(), 0.0f);
-    cap_delay_pos_ = 0;
-    cap_delay_frames_ = want;
-    generation_.fetch_add(1);
-    LOG_INFO("capture delay now {} frames ({:.0f} ms)", want, 1000.0 * want / opt_.rate);
-  }
-  return want;
-}
-
-void AudioEngine::apply_capture_delay(size_t frames, const float* live, float* ring_out) {
-  const unsigned d = cap_delay_frames_;
-  // Read the delayed frames out before pushing the new ones in. That order is what makes this
-  // correct for any delay, including one shorter than a single block.
-  for (size_t i = 0; i < frames; ++i) {
-    const size_t rd = (cap_delay_pos_ + i - d) & cap_delay_mask_;
-    for (unsigned c = 0; c < kInputs; ++c)
-      ring_out[i * kTotalInputs + c] = cap_delay_[rd * kInputs + c];
-  }
-  for (size_t i = 0; i < frames; ++i) {
-    const size_t wr = (cap_delay_pos_ + i) & cap_delay_mask_;
-    for (unsigned c = 0; c < kInputs; ++c)
-      cap_delay_[wr * kInputs + c] = live[i * kTotalInputs + c];
-  }
-  cap_delay_pos_ = (cap_delay_pos_ + frames) & cap_delay_mask_;
-}
-
-void AudioEngine::run_alsa() {
+void AudioEngine::run_stream() {
   while (running_.load(std::memory_order_relaxed)) {
-    snd_pcm_sframes_t got = snd_pcm_readi(capture_, raw_in_.data(), opt_.period);
-    if (got < 0) {
-      // An unrecoverable xrun ends this stream, not the engine: thread_entry() closes the
-      // card and reopens it, the same never-fatal path as a failed open.
-      if (!recover(static_cast<int>(got))) return;
-      continue;
-    }
-    const size_t frames = static_cast<size_t>(got);
-    const uint64_t n = ring_.counter();
-
-    // Snapshot the channel maps once per block; loading an atomic per sample would keep
-    // the conversion loops scalar.
-    const unsigned cap_ch = cap_ch_.load(std::memory_order_relaxed);
-    unsigned imap[kInputs];
-    unsigned omap[kOutputs];
-    for (unsigned c = 0; c < kInputs; ++c) {
-      const unsigned slot = ctl_.input_map[c].load(std::memory_order_relaxed);
-      imap[c] = slot < cap_ch ? slot : c;
-    }
-    for (unsigned c = 0; c < kOutputs; ++c) {
-      const unsigned slot = ctl_.output_map[c].load(std::memory_order_relaxed);
-      omap[c] = slot < kOutputs ? slot : c;
-    }
-    for (unsigned c = 0; c < kInputs; ++c) {
-      const int32_t* src = raw_in_.data() + imap[c];
-      float* dst = in_.data() + c;
-      for (size_t i = 0; i < frames; ++i) dst[i * kTotalInputs] = s32_to_float(src[i * cap_ch]);
-    }
-
-    process_block(n, frames, in_.data(), out8_.data());
-
-    for (unsigned c = 0; c < kOutputs; ++c) {
-      const float* src = out8_.data() + c;
-      int32_t* dst = raw_out_.data() + omap[c];
-      for (size_t i = 0; i < frames; ++i) dst[i * kOutputs] = float_to_s32(src[i * kOutputs]);
-    }
-
-    size_t written = 0;
-    while (written < frames) {
-      snd_pcm_sframes_t w =
-          snd_pcm_writei(playback_, raw_out_.data() + written * kOutputs, frames - written);
-      if (w < 0) {
-        if (!recover(static_cast<int>(w))) return;
-        break;
-      }
-      written += static_cast<size_t>(w);
-    }
+    if (!run_block()) return;
   }
 }
 
 void AudioEngine::run_sim() {
-  const size_t period = opt_.period;
-  const double block_ns = 1e9 * static_cast<double>(period) / static_cast<double>(opt_.rate);
+  // The simulated card opens every time and never fails, so none of run_card()'s retrying.
+  backend_->open();
+  backend_->start();
+  streaming_.store(true);
+  run_stream();
+  streaming_.store(false);
+}
 
-  timespec next;
-  clock_gettime(CLOCK_MONOTONIC, &next);
+void AudioEngine::run_card() {
+  // The card is opened here, not in start(), and a failure is never fatal: it retries forever.
+  // Exiting when the card is unhappy would take the web console down with it, and that console
+  // is the only way to find out why. The error is reported through /api/state instead.
+  while (running_.load()) {
+    const bool opened = backend_->open();
+    // Even a failed open may have settled the capture width or the period on the way.
+    publish_shape();
+    if (!opened) {
+      LOG_ERROR("{} — retrying in {} s", error(), kReopenDelayS);
+      wait_before_retry();
+      continue;
+    }
+    core_.size_buffers(backend_->shape().period);
 
-  uint64_t seed = 0x9e3779b97f4a7c15ull;
-  auto noise = [&seed] { return xorshift_white(seed); };
-
-  while (running_.load(std::memory_order_relaxed)) {
-    const uint64_t n = ring_.counter();
-
-    // The simulated card is a loopback: output channel c reappears on input channel c
-    // delayed by period + c*stagger frames.
-    for (size_t i = 0; i < period; ++i) {
-      for (unsigned c = 0; c < kInputs; ++c) {
-        const size_t delay = period + static_cast<size_t>(c) * opt_.sim_stagger;
-        const size_t pos = (n + i + sim_delay_len_ - delay) % sim_delay_len_;
-        in_[i * kTotalInputs + c] = sim_delay_[pos * kInputs + c] + 3e-5f * noise();
-      }
+    if (!backend_->start()) {
+      LOG_ERROR("cannot start stream: {} — retrying in {} s", error(), kReopenDelayS);
+      backend_->close();
+      wait_before_retry();
+      continue;
     }
 
-    process_block(n, period, in_.data(), out8_.data());
+    LOG_INFO("stream running");
+    set_error({});
+    streaming_.store(true);
+    run_stream();
+    streaming_.store(false);
+    backend_->close();
 
-    for (size_t i = 0; i < period; ++i) {
-      const size_t pos = (n + i) % sim_delay_len_;
-      for (unsigned c = 0; c < kInputs; ++c) sim_delay_[pos * kInputs + c] = out8_[i * kOutputs + c];
+    if (running_.load()) {
+      LOG_WARN("stream stopped — reopening the card in {} s", kReopenDelayS);
+      wait_before_retry();
     }
-
-    next.tv_nsec += static_cast<long>(block_ns);
-    while (next.tv_nsec >= 1000000000L) {
-      next.tv_nsec -= 1000000000L;
-      next.tv_sec += 1;
-    }
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
   }
 }
 
@@ -605,96 +153,32 @@ void* AudioEngine::thread_entry(void* self) {
   make_realtime(kRtPriority, "audio");
 
   if (e->opt_.sim) {
-    LOG_INFO("simulator: {} Hz, period {}, virtual loopback OUT->IN (stagger {} frames/ch)",
-             e->opt_.rate, e->opt_.period, e->opt_.sim_stagger);
-    e->streaming_.store(true);
     e->run_sim();
-    e->streaming_.store(false);
-    return nullptr;
-  }
-
-  // The card is opened here, not in start(), and a failure is never fatal: it retries forever.
-  // Exiting when the card is unhappy would take the web console down with it, and that console
-  // is the only way to find out why. The error is reported through /api/state instead.
-  while (e->running_.load()) {
-    if (!e->open_alsa()) {
-      LOG_ERROR("{} — retrying in {} s", e->error(), kReopenDelayS);
-      e->wait_before_retry();
-      continue;
-    }
-    e->init_mixer();
-    e->size_buffers();
-
-    if (!e->prefill_and_start()) {
-      LOG_ERROR("cannot start stream: {} — retrying in {} s", e->error(), kReopenDelayS);
-      e->close_alsa();
-      e->wait_before_retry();
-      continue;
-    }
-
-    LOG_INFO("stream running");
-    e->set_error({});
-    e->streaming_.store(true);
-    e->run_alsa();
-    e->streaming_.store(false);
-    e->close_alsa();
-
-    if (e->running_.load()) {
-      LOG_WARN("stream stopped — reopening the card in {} s", kReopenDelayS);
-      e->wait_before_retry();
-    }
+  } else {
+    e->run_card();
   }
   return nullptr;
 }
 
 void AudioEngine::wait_before_retry() {
-  for (unsigned i = 0; i < kReopenDelayS * 10 && running_.load(); ++i) sleep_ms(100);
+  for (unsigned i = 0; i < kReopenDelayS * 10 && running_.load(); ++i)
+    clock_.sleep_until(clock_.now_ns() + 100000000ull);  // 100 ms
 }
 
-void AudioEngine::size_buffers() {
-  // The driver may have renegotiated the period, so size the DSP buffers only once it has
-  // agreed to something.
-  raw_in_.assign(static_cast<size_t>(opt_.period) * cap_ch_.load(std::memory_order_relaxed), 0);
-  raw_out_.assign(static_cast<size_t>(opt_.period) * kOutputs, 0);
-  in_.assign(static_cast<size_t>(opt_.period) * kTotalInputs, 0.0f);
-  ring_block_.assign(static_cast<size_t>(opt_.period) * kTotalInputs, 0.0f);
-
-  // Sized for the maximum delay plus a block of slack, rounded up to a power of two so the
-  // circular index is a mask rather than a modulo in a per-sample loop.
-  {
-    const size_t want =
-        static_cast<size_t>(kNetDelayMaxMs / 1000.0 * opt_.rate) + opt_.period + 16;
-    size_t p = 1;
-    while (p < want) p <<= 1;
-    cap_delay_len_ = p;
-    cap_delay_mask_ = p - 1;
-    cap_delay_pos_ = 0;
-    cap_delay_frames_ = 0;
-    cap_delay_.assign(cap_delay_len_ * kInputs, 0.0f);
-  }
-  out8_.assign(static_cast<size_t>(opt_.period) * kOutputs, 0.0f);
-  hdmi_block_.assign(static_cast<size_t>(opt_.period) * kHdmiMaxChannels, 0.0f);
-  lineout_block_.assign(static_cast<size_t>(opt_.period) * kLineoutChannels, 0.0f);
-  gen_sine_.assign(opt_.period, 0.0f);
-  gen_noise_.assign(opt_.period, 0.0f);
-  gen_ping_.assign(opt_.period, 0.0f);
-  gen_music_.assign(opt_.period, 0.0f);
-  gen_.init(opt_.rate);
-  identify_frames_ = static_cast<uint64_t>(kIdentifySeconds * opt_.rate);
+void AudioEngine::prepare() {
+  // Sized for the period the backend will ask for; run_card() sizes them again for whatever the
+  // driver agrees to.
+  const unsigned period = backend_->shape().period;
+  cap_ch_.store(opt_.capture_channels, std::memory_order_relaxed);
+  period_.store(period, std::memory_order_relaxed);
+  core_.size_buffers(period);
 }
 
 bool AudioEngine::start() {
-  cap_ch_.store(opt_.capture_channels, std::memory_order_relaxed);
-  period_.store(opt_.period, std::memory_order_relaxed);
-  size_buffers();
-
-  if (opt_.sim) {
-    sim_delay_len_ = static_cast<size_t>(opt_.period) * 4 + kInputs * opt_.sim_stagger + 16;
-    sim_delay_.assign(sim_delay_len_ * kInputs, 0.0f);
-  }
+  prepare();
 
   // The card is opened by the audio thread, which retries until it succeeds — see
-  // thread_entry(). start() failing here means the thread could not be created at all.
+  // run_card(). start() failing here means the thread could not be created at all.
   running_.store(true);
 
   pthread_attr_t attr;
@@ -717,7 +201,7 @@ void AudioEngine::stop() {
     pthread_join(thread_, nullptr);
     thread_valid_ = false;
   }
-  close_alsa();
+  backend_->close();
 }
 
 }  // namespace st

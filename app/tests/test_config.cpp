@@ -1,13 +1,39 @@
 #include "config.h"
 
-#include <iostream>
+#include <stdlib.h>
+#include <unistd.h>
 
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+#include "board_profile.h"
 #include "check.h"
 #include "control.h"
 
 using namespace st;
 
 namespace {
+
+std::string read_file(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+// Byte-for-byte, and where the first difference is when there is one: a 4 kB file printed whole
+// twice says nothing a person can find.
+bool same_bytes(const std::string& got, const std::string& want) {
+  if (got == want) return true;
+  size_t i = 0;
+  while (i < got.size() && i < want.size() && got[i] == want[i]) ++i;
+  std::cout << "  first difference at byte " << i << " of " << want.size() << ": got \""
+            << got.substr(i > 40 ? i - 40 : 0, 80) << "\"\n  want \""
+            << want.substr(i > 40 ? i - 40 : 0, 80) << "\"\n";
+  return false;
+}
 
 void test_json_round_trip() {
   Config a;
@@ -288,7 +314,7 @@ void test_hdmi_defaults_and_bad_values() {
   std::string err;
   CHECK(Config::from_json(R"({"rate": 96000})", &c, &err));
   CHECK(!c.hdmi.enabled);
-  CHECK_EQ(c.hdmi.device, std::string("hw:b1,0"));
+  CHECK_EQ(c.hdmi.device, rpi3_octo_profile().sink("hdmi")->device);
   CHECK_EQ(c.hdmi.sample_rate, kSocRateDefault);
   CHECK_EQ(c.hdmi.names.size(), static_cast<size_t>(kHdmiMaxChannels));
   CHECK_EQ(c.hdmi.layout, std::string("stereo"));
@@ -386,7 +412,96 @@ void test_lineout_round_trip() {
 
   // Defaults: off, on the jack's own card.
   CHECK(!Config{}.lineout.enabled);
-  CHECK_EQ(Config{}.lineout.device, std::string("hw:Headphones,0"));
+  CHECK_EQ(Config{}.lineout.device, rpi3_octo_profile().sink("lineout")->device);
+}
+
+// A file that leaves the clock out gets the board's.
+void test_defaults_are_the_boards() {
+  const BoardProfile& board = rpi3_octo_profile();
+  Config c;
+  std::string err;
+  CHECK(Config::from_json("{}", &c, &err));
+  CHECK_EQ(c.rate, board.clock.rate);
+  CHECK_EQ(c.period, board.clock.period);
+  CHECK_EQ(c.periods, board.clock.periods);
+  CHECK_EQ(c.device, board.clock.capture_device);
+  CHECK_EQ(c.capture_channels, board.clock.capture_slots.front());
+  CHECK_EQ(c.hdmi.device, board.sink("hdmi")->device);
+  CHECK_EQ(c.lineout.device, board.sink("lineout")->device);
+  CHECK_EQ(c.hdmi.outputs.size(), static_cast<size_t>(board.sink("hdmi")->width));
+  CHECK_EQ(c.lineout.outputs.size(), static_cast<size_t>(board.sink("lineout")->width));
+}
+
+// ---- The Pi's file, byte for byte ---------------------------------------------------------------
+
+// tests/data/pi-config-v1.json is this config as Config::to_json() wrote it before there were board
+// profiles: routes to an ADC ("3"), a network channel ("7") and the melody, a few names, and HDMI
+// in 5.1. It was written once by that code and is never regenerated from this one, so a change
+// that alters a single byte of what a Pi reads or writes fails here rather than on a Pi. Like the
+// file a save leaves on /data, it does not end in a newline.
+Config pi_config_v1() {
+  Config c;
+  c.outputs[0].source_type = "input";
+  c.outputs[0].source_index = "3";
+  c.outputs[0].gain_db = -6.0f;
+  c.outputs[1].source_type = "input";
+  c.outputs[1].source_index = "7";
+  c.outputs[1].mute = true;
+  c.outputs[2].source_type = "gen";
+  c.outputs[2].source_index = "music";
+  c.outputs[2].gain_db = -12.0f;
+  c.input_names[0] = "bench mic";
+  c.input_names[3] = "DUT left";
+  c.input_names[7] = "laptop";
+  c.output_names[0] = "to DUT";
+  c.output_names[7] = "sub";
+  c.hdmi.enabled = true;
+  c.hdmi.layout = "5.1";
+  c.hdmi.sample_rate = 48000;
+  c.hdmi.outputs[kSpkL].source_type = "gen";
+  c.hdmi.outputs[kSpkL].source_index = "music";
+  c.hdmi.outputs[kSpkR].source_type = "gen";
+  c.hdmi.outputs[kSpkR].source_index = "music";
+  c.hdmi.outputs[kSpkC].source_type = "input";
+  c.hdmi.outputs[kSpkC].source_index = "3";
+  c.hdmi.outputs[kSpkLfe].source_type = "input";
+  c.hdmi.outputs[kSpkLfe].source_index = "7";
+  c.hdmi.outputs[kSpkLfe].gain_db = -20.0f;
+  c.hdmi.names[kSpkL] = "soundbar L";
+  c.hdmi.names[kSpkLfe] = "subwoofer";
+  c.lineout.outputs[0].source_type = "input";
+  c.lineout.outputs[0].source_index = "3";
+  c.lineout.names[1] = "desk right";
+  return c;
+}
+
+void test_the_pi_config_file_is_unchanged() {
+  const std::string golden = read_file(ST_TEST_DATA_DIR "/pi-config-v1.json");
+  CHECK(!golden.empty());
+  if (golden.empty()) return;
+
+  // What the daemon writes for it.
+  CHECK(same_bytes(pi_config_v1().to_json(), golden));
+
+  // What it reads from it, written back out.
+  Config c;
+  std::string err;
+  CHECK(Config::from_json(golden, &c, &err));
+  if (!err.empty()) std::cout << "  parse error: " << err << "\n";
+  CHECK(same_bytes(c.to_json(), golden));
+  CHECK_EQ(c.outputs[1].source_index, std::string("7"));
+  CHECK_EQ(c.hdmi.layout, std::string("5.1"));
+
+  // And the way a Pi does both: loaded as the factory defaults, saved as the boot defaults.
+  const char* tmp = getenv("TMPDIR");
+  std::string dir = std::string(tmp && *tmp ? tmp : "/tmp") + "/st-config-XXXXXX";
+  CHECK(mkdtemp(dir.data()) != nullptr);
+  ConfigStore store(ST_TEST_DATA_DIR "/pi-config-v1.json", dir);
+  const Config loaded = store.load();
+  CHECK(store.save(loaded, &err));
+  CHECK(same_bytes(read_file(store.saved_path()), golden));
+  unlink(store.saved_path().c_str());
+  rmdir(dir.c_str());
 }
 
 void test_garbage_is_rejected() {
@@ -410,5 +525,7 @@ int main() {
   test_hdmi_round_trip();
   test_hdmi_defaults_and_bad_values();
   test_lineout_round_trip();
+  test_defaults_are_the_boards();
+  test_the_pi_config_file_is_unchanged();
   return report("config");
 }

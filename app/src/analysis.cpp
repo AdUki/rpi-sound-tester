@@ -23,7 +23,10 @@ constexpr float kSpecLowHz = 20.0f;
 
 }  // namespace
 
-Analysis::Analysis(const RingBuffer& ring, double rate) : ring_(ring), rate_(rate) {
+Analysis::Analysis(const RingBuffer& ring, double rate)
+    : ring_(ring),
+      rate_(rate),
+      env_col_frames_(st::env_column_frames(static_cast<unsigned>(rate))) {
   window_.resize(kSpectrumFft);
   for (unsigned i = 0; i < kSpectrumFft; ++i) {
     window_[i] = 0.5f * (1.0f - static_cast<float>(std::cos(kTwoPi * i / (kSpectrumFft - 1))));
@@ -50,7 +53,7 @@ Analysis::Analysis(const RingBuffer& ring, double rate) : ring_(ring), rate_(rat
   }
 
   for (auto& s : snap_.spectrum) s.assign(kSpectrumBins, kMinDb);
-  env_buf_.resize(kEnvColumnFrames * kTotalInputs);
+  env_buf_.resize(static_cast<size_t>(env_col_frames_) * kTotalInputs);
 }
 
 Analysis::~Analysis() { stop(); }
@@ -158,21 +161,22 @@ void Analysis::update_spectrum(unsigned ch, const float* buf) {
 }
 
 void Analysis::update_envelope(uint64_t now) {
-  const uint64_t newest_col = now / kEnvColumnFrames;
+  const unsigned frames = env_col_frames_;
+  const uint64_t newest_col = now / frames;
   const uint64_t oldest_sample = ring_.oldest(now);
-  const uint64_t oldest_col = (oldest_sample + kEnvColumnFrames - 1) / kEnvColumnFrames;
+  const uint64_t oldest_col = (oldest_sample + frames - 1) / frames;
   if (env_col_ < oldest_col) env_col_ = oldest_col;
 
   while (env_col_ < newest_col) {
-    const uint64_t start = env_col_ * kEnvColumnFrames;
-    if (!ring_.read_interleaved(start, kEnvColumnFrames, env_buf_.data())) {
-      env_col_ = ring_.oldest(ring_.counter()) / kEnvColumnFrames + 1;
+    const uint64_t start = env_col_ * frames;
+    if (!ring_.read_interleaved(start, frames, env_buf_.data())) {
+      env_col_ = ring_.oldest(ring_.counter()) / frames + 1;
       break;
     }
     EnvColumn col{};
     for (unsigned c = 0; c < kTotalInputs; ++c) {
       float lo = 1.0f, hi = -1.0f;
-      for (unsigned i = 0; i < kEnvColumnFrames; ++i) {
+      for (unsigned i = 0; i < frames; ++i) {
         const float v = env_buf_[i * kTotalInputs + c];
         lo = std::min(lo, v);
         hi = std::max(hi, v);
