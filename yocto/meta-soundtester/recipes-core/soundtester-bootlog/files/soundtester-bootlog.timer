@@ -1,0 +1,11 @@
+[Unit]
+Description=Write the boot log to the SD card's boot partition, twice after boot (bring-up)
+
+[Timer]
+# Once when the network has had time to come up, and once more a while later, so the log also
+# shows whether DHCP ever succeeded.
+OnBootSec=30s
+OnBootSec=120s
+
+[Install]
+WantedBy=timers.target

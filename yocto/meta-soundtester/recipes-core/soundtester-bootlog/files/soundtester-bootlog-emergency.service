@@ -1,0 +1,12 @@
+[Unit]
+Description=Write the boot log to the SD card's boot partition from emergency mode (bring-up)
+# Emergency mode is reached without the normal boot ordering; this only needs udev's by-label link.
+DefaultDependencies=no
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/soundtester-bootlog emergency
+
+[Install]
+WantedBy=emergency.target

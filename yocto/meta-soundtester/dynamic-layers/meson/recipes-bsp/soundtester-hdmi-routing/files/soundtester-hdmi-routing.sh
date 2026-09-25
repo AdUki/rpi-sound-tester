@@ -38,11 +38,13 @@ set_ctl() {
     fi
 }
 
+# TOHDMITX's I2S and SPDIF output enables share one kcontrol in the driver, and DAPM names a shared
+# control after the component alone: "TOHDMITX Switch", not "TOHDMITX I2S OUT EN Switch".
 set_ctl 'FRDDR_A SINK 1 SEL'          'OUT 0'
 set_ctl 'FRDDR_A SRC 1 EN Switch'     on
 set_ctl 'TDMOUT_A SRC SEL'            'IN 0'
 set_ctl 'TOHDMITX I2S SRC'            'I2S A'
-set_ctl 'TOHDMITX I2S OUT EN Switch'  on
+set_ctl 'TOHDMITX Switch'             on
 set_ctl 'TDMIN_A SRC SEL'             'IN 13'
 set_ctl 'TODDR_A SRC SEL'             'IN 0'
 

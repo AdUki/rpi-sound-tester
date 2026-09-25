@@ -20,6 +20,7 @@ IMAGE_INSTALL:append = " \
     usbutils \
     strace \
     htop \
+    soundtester-bootlog \
 "
 
 # The VIM3L's card plays nothing until its routing is set; for bring-up with alsa-utils, set it at

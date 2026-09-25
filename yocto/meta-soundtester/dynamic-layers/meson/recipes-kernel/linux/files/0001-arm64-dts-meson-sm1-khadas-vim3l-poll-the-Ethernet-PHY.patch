@@ -1,0 +1,27 @@
+From: Sound Tester <soundtester@localhost>
+Subject: [PATCH] arm64: dts: meson-sm1-khadas-vim3l: poll the Ethernet PHY
+
+The RTL8211F keeps its state across a warm boot (no reset line), and with its
+INTB/PMEB pin left in PMEB mode by a previous OS a link change never raises the
+PHY interrupt. Polling does not depend on that pin.
+
+Upstream-Status: Inappropriate [board workaround; the RTL8211F fix in 0002 is the real one]
+---
+--- a/arch/arm64/boot/dts/amlogic/meson-sm1-khadas-vim3l.dts	2026-09-25 12:38:07.796962845 +0200
++++ b/arch/arm64/boot/dts/amlogic/meson-sm1-khadas-vim3l.dts	2026-09-25 12:38:07.800693583 +0200
+@@ -111,3 +111,15 @@
+ &sd_emmc_a {
+ 	sd-uhs-sdr50;
+ };
++
++/*
++ * Poll the Ethernet PHY instead of taking its interrupt. The RTL8211F has no reset line on this
++ * board, so it keeps whatever state the previous OS or bootloader left it in across a warm boot,
++ * including its INTB/PMEB pin set to PMEB (wake-on-LAN) mode, in which a link change never raises
++ * the interrupt: the link comes up and Linux still reports no carrier. Polling reads the link
++ * state over MDIO once a second whatever that pin is doing.
++ */
++&external_phy {
++	/delete-property/ interrupt-parent;
++	/delete-property/ interrupts;
++};

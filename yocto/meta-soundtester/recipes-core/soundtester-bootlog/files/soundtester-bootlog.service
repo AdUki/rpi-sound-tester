@@ -1,0 +1,6 @@
+[Unit]
+Description=Write the boot log to the SD card's boot partition (bring-up)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/soundtester-bootlog up

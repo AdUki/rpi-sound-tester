@@ -3,7 +3,11 @@
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
-SRC_URI:append:khadas-vim3l = " file://vim3l-soundtester.cfg"
+SRC_URI:append:khadas-vim3l = " \
+    file://vim3l-soundtester.cfg \
+    file://0001-arm64-dts-meson-sm1-khadas-vim3l-poll-the-Ethernet-PHY.patch \
+    file://0002-net-phy-realtek-clear-RTL8211F-wake-on-LAN-state-on-init.patch \
+"
 
 # The HDMI DRM driver is what carries HDMI audio. meta-meson adds its fragment only when x11 or
 # wayland is a DISTRO_FEATURE; a distro without them would silently lose HDMI, so ask for it
