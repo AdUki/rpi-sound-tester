@@ -133,33 +133,17 @@
     <div id="netinputs" class="grid"></div>
   </div>
 
-  <h2>Outputs</h2>
-  <div id="outputs" class="grid"></div>
-
-  <!-- The Pi's own audio: its HDMI port and its 3.5 mm jack. Routed exactly like the outputs above
-       and on the same sample axis, so a ping through a TV can be measured like one through a DAC. -->
-  <div id="hdmisec" hidden>
-    <h2>HDMI output</h2>
-    <div class="socbar">
-      <label class="socon"><input type="checkbox" id="hdmion"> On</label>
-      <span id="hdmistate" class="pill">off</span>
-      <label>Rate <select id="hdmirate"></select></label>
-      <label id="hdmilaywrap" hidden>Channels <select id="hdmilayout"></select></label>
-    </div>
-    <div id="hdmidetail" class="socdetail muted small mono"></div>
-    <div id="hdmiouts" class="grid"></div>
+  <!-- The engine card's own outputs: the Octo's DACs. A board without one has none. -->
+  <div id="outsec">
+    <h2>Outputs</h2>
+    <div id="outputs" class="grid"></div>
   </div>
 
-  <div id="lineoutsec" hidden>
-    <h2>Line out</h2>
-    <div class="socbar">
-      <label class="socon"><input type="checkbox" id="lineouton"> On</label>
-      <span id="lineoutstate" class="pill">off</span>
-      <label>Rate <select id="lineoutrate"></select></label>
-    </div>
-    <div id="lineoutdetail" class="socdetail muted small mono"></div>
-    <div id="lineoutouts" class="grid"></div>
-  </div>
+  <!-- Sinks: every other playback device the daemon found (HDMI, a Pi's 3.5 mm jack, a USB
+       interface), one section each, generated from /api/state. Routed exactly like the outputs
+       above and on the same sample axis, so a ping through a TV can be measured like one through
+       a DAC. -->
+  <div id="sinks"></div>
 </section>
 
 <section id="scope" class="panel">
@@ -327,7 +311,7 @@
       <span id="musiclevelv" class="mono val"></span> dBFS</label>
   </div>
 
-  <div class="card wide">
+  <div id="mapcard" class="card wide">
     <h3>Channel map</h3>
     <p class="muted">
       The Octo's TDM slots can rotate after an I2S sync error, so what the driver calls
@@ -364,6 +348,13 @@
   <div class="card wide">
     <h3>Engine</h3>
     <table id="systable"></table>
+  </div>
+  <div class="card wide">
+    <h3>Sound devices</h3>
+    <p class="muted small">Every PCM device ALSA has, as <span class="mono">aplay -l</span> and
+      <span class="mono">arecord -l</span> list them, found again every couple of seconds: a USB
+      device plugged in now shows up here, and as an output above.</p>
+    <table id="devtable"></table>
   </div>
   <div class="card wide">
     <h3>Maintenance</h3>

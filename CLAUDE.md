@@ -2,10 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-A read-only Raspberry Pi (2/3/4, **not** Pi 5) appliance for bench-testing audio gear on an Audio
-Injector Octo (CS42448, 6 in / 8 out, 96 kHz S32_LE). One C++17 daemon, `soundtesterd`, serves a
-vanilla-JS web console. The kernel is pinned to **5.15.92** because the Octo produces only noise on
-every 6.x kernel — do not bump it.
+A read-only appliance for bench-testing audio gear: a Raspberry Pi (2/3/4, **not** Pi 5) with an
+Audio Injector Octo (CS42448, 6 in / 8 out, 96 kHz S32_LE), or a Khadas VIM3L with no card of its
+own. One C++17 daemon, `soundtesterd`, serves a vanilla-JS web console. The Pi's kernel is pinned
+to **5.15.92** because the Octo produces only noise on every 6.x kernel — do not bump it.
 
 ## Commands
 
@@ -14,7 +14,7 @@ make                  # list targets
 make build            # cmake configure (Release) + build into app/build
 make test             # ctest --test-dir app/build --output-on-failure
 make run              # http://localhost:8080 against the simulated card (--sim)
-make run DEVICE=hw:audioinjectoroc,0     # real card; HDMI=<alsa dev> / LINEOUT=<alsa dev> add those outputs
+make run DEVICE=hw:audioinjectoroc,0     # real engine card; SINK=default adds a desktop's sound server as an output
 make plugin           # the ALSA sender plugin in alsa-plugin/ (built for THIS host, not the Pi; VORBIS=0 drops libvorbis)
 make image [BOARD=rpi3|vim3l] [DEV=1]    # Yocto (plain poky/bitbake, scarthgap); needs `make configure` first
 make bitbake ARGS="soundtesterd" [BOARD=…]   # cross-build just the daemon (ARGS="-e <recipe>" to inspect variables)
@@ -37,17 +37,28 @@ from disk per request, so web edits are live on reload without a restart.
 
 ## Architecture
 
-Everything hangs off **one sample clock**: capture and playback are `snd_pcm_link()`ed on one card
-and every generator is driven from the same absolute sample counter `n` that indexes the capture
-ring. A sample index means the same instant on every channel — preserve this in any change.
+Everything hangs off **one sample clock**: the **engine card** (the Octo: capture and playback
+`snd_pcm_link()`ed, no resampling) or, on a board without one, a `CLOCK_MONOTONIC` timer. Every
+generator is driven from the same absolute sample counter `n` that indexes the capture ring. A
+sample index means the same instant on every channel — preserve this in any change. Every other
+ALSA device follows that clock through an ASRC.
 
 Threads (wired in `app/src/main.cpp`; objects are connected *before* the audio thread starts):
-- **AudioEngine** (`audio_engine.cpp`, SCHED_FIFO 80, mlocked): read 8 TDM slots → remap to 6
-  ADCs → append to `RingBuffer` (float32, ~87 s) → render each output via `route_output()`
-  (`output_route.h`, the single routing function shared by the Octo DACs, HDMI and line out) → write.
-- **SocOutput** (`soc_out.cpp`, one instance per sink: HDMI, 3.5 mm line out): consumes a handoff
-  ring the engine writes, on its own clock with ASRC trim; never on the audio thread's path.
-  HDMI slot order is CEA-861, not ALSA's (`hdmi_layout.h`).
+- **AudioEngine** (`audio_engine.cpp`, SCHED_FIFO 80, mlocked) drives an `AudioBackend`
+  (`AlsaLinkedBackend` = the Octo, `TimerBackend` = no card or `--sim`) and hands each block to
+  **EngineCore** (`engine_core.cpp`): read 8 TDM slots → remap to 6 ADCs → append to `RingBuffer`
+  (float32, ~87 s) → render each output and sink channel via `route_output()` (`output_route.h`,
+  the single routing function) → write.
+- **Devices** (`devices.cpp`, `alsa_devices.cpp`): scans ALSA every 2 s (what `aplay -l` /
+  `arecord -l` list) and binds each device other than the engine card: playback to one of 8 sink
+  slots, capture to device-input ring columns, by device id `<card id>,<dev>`; a USB device
+  unplugged keeps its slot, columns and routing. **DeviceInput** (`device_input.cpp`, one per
+  capture device) places each frame at the ring index it was captured at (engine position minus
+  what the driver still holds) into per-channel `NetTimeline`s, ASRC-trimmed; the audio thread reads
+  them a capture delay behind, and holds that delay at ≥ 150 ms while any is bound.
+  **SinkOutput** (`sink_out.cpp`, one per bound slot) consumes a handoff ring the engine writes at
+  the block's `n`, on the device's clock with ASRC trim; never on the audio thread's path. HDMI
+  sinks offer CEA-861 speaker layouts (`sink_layout.h`), others stereo and their own width.
 - **NetAudioServer** (`net_audio.cpp`): network inputs from the ALSA plugin. Each packet carries the
   absolute sample index it should play at; `NetTimeline` places it there (the timeline *is* the
   jitter buffer). Network channels occupy ring slots `[kInputs, kTotalInputs)` and are ordinary inputs
@@ -68,14 +79,22 @@ Concurrency rules that matter when editing:
 - Release flags are `-O3 -ftree-vectorize -fno-math-errno`, plus `-funsafe-math-optimizations` on
   32-bit ARM for NEON. Never `-ffast-math`: the analysis code relies on NaN/Inf guards.
 - An unopenable card/device is never fatal: threads retry and report the error in `/api/state`.
+- Channel counts are runtime (`channel_layout.h`, `channels()`, set once in main before any
+  thread): `[engine card's inputs (6 or 0) | NET 6 | device inputs (board.json)]`. Arrays are
+  sized by `kMaxInputs`; loops and strides use `channels().total()`.
 
 Web UI: `app/www/` (`app.js`, `index.html`, `style.css`), no build step. The console feature-detects
-daemon capabilities via `limits.*` in `/api/state`; console and daemon API renames must ship together.
+daemon capabilities via `limits.*` in `/api/state` and builds one section per entry of `sinks`;
+console and daemon API renames must ship together (static files go out with `Cache-Control:
+no-cache`, so a browser picks up a deploy on the next load).
 
 ## Boards (Yocto)
 
 `BOARD=` (default `rpi3`) selects `yocto/boards/<board>.mk` (MACHINE, BSP layer, daemon profile
-id) and `yocto/conf/boards/<board>.conf` (the board's bitbake settings). Each board builds in
+id) and `yocto/conf/boards/<board>.conf` (the board's bitbake settings). The profile id picks
+`app/config/boards/<profile>.json`, installed as `/etc/soundtester/board.json`: the engine card
+(none on the VIM3L), rate and period (patched from `SOUNDTESTER_RATE/PERIOD`), and optional
+labels, `hdmi` flags and `hidden` flags for device ids — the only per-board data the daemon has. Each board builds in
 `yocto/build-<board>/`; the Makefile writes its `bblayers.conf` and an `auto.conf` that sets
 MACHINE and `require`s the board conf by absolute path. `meta-soundtester` depends only on core;
 BSP-specific recipes live under `dynamic-layers/<collection>/` (the pinned 5.15 Pi kernel under

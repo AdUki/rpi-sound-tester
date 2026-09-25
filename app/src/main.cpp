@@ -1,21 +1,28 @@
 #include <CLI11.hpp>
+#include <alsa/asoundlib.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "analysis.h"
 #include "audio_engine.h"
-#include "board_profile.h"
+#include "board.h"
 #include "capture.h"
+#include "channel_layout.h"
 #include "config.h"
 #include "constants.h"
 #include "control.h"
+#include "devices.h"
 #include "kmsg_watch.h"
 #include "ring_buffer.h"
-#include "soc_out.h"
 #include "util/log.h"
 #include "webserver.h"
 
@@ -26,6 +33,21 @@ std::atomic<bool> g_stopping{false};
 void on_signal(int) {
   g_stopping.store(true);
   if (g_server) g_server->stop();
+}
+
+// alsa-lib prints its own line to stderr for every failed lookup, and a device that is not there
+// yet (the Octo early in boot) or any more (a USB interface unplugged) is looked up every few
+// seconds for as long as that lasts. The daemon says once, in its own words, what failed; alsa-lib's
+// version is for --verbose.
+void alsa_lib_message(const char* file, int line, const char* function, int err, const char* fmt,
+                      ...) {
+  char msg[512];
+  va_list ap;
+  va_start(ap, fmt);
+  std::vsnprintf(msg, sizeof msg, fmt, ap);
+  va_end(ap);
+  LOG_DEBUG("alsa-lib {}:{} {}: {}{}{}", file ? file : "?", line, function ? function : "?", msg,
+            err ? ": " : "", err ? snd_strerror(err) : "");
 }
 
 // Bound how long a stop can take. Each WebSocket connection has a reader thread parked in a
@@ -46,40 +68,38 @@ void start_shutdown_watchdog() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  // The defaults --help quotes are the ones Config and the engine start from.
-  const st::BoardProfile& board = st::rpi3_octo_profile();
-  CLI::App app{"soundtesterd — multichannel audio test appliance (" + board.label + ")"};
+  CLI::App app{"soundtesterd — multichannel audio test appliance"};
 
   bool sim = false;
   bool verbose = false;
   unsigned sim_stagger = 0;
+  std::string board_path = "/etc/soundtester/board.json";
   std::string device;
   unsigned rate = 0;
   unsigned period = 0;
   int port = 80;
   int net_port = 0;  // 0 = whatever the config says
-  std::string hdmi_device;
-  std::string lineout_device;
+  std::vector<std::string> extra_sinks;
   std::string www = "/usr/share/soundtester/www";
   std::string config_path = "/etc/soundtester/config.json";
   std::string data_dir = "/data";
 
+  app.add_option("--board", board_path,
+                 "What the image says about the board: its engine card, rate and period, and "
+                 "names for its devices (default /etc/soundtester/board.json; none is a desktop)");
   app.add_flag("--sim", sim, "Run without hardware: a simulated card loops each output back to its input");
   app.add_option("--sim-stagger", sim_stagger,
                  "Simulator: extra delay per input channel, in frames (channel c is delayed c x N)");
-  app.add_option("--device", device, "ALSA device (default " + board.clock.capture_device + ")");
-  app.add_option("--rate", rate, "Sample rate (default " + std::to_string(board.clock.rate) + ")");
-  app.add_option("--period", period,
-                 "Period size in frames (default " + std::to_string(board.clock.period) + ")");
+  app.add_option("--device", device,
+                 "The engine card: capture paces the engine, playback is linked to it (default "
+                 "board.json's; none means a timer paces it)");
+  app.add_option("--rate", rate, "Sample rate (default board.json's)");
+  app.add_option("--period", period, "Period size in frames (default board.json's)");
   app.add_option("--port", port, "HTTP port (default 80)");
   app.add_option("--net-port", net_port, "TCP port for network audio input (default 4010)");
-  app.add_option("--hdmi-device", hdmi_device,
-                 "ALSA device for the HDMI output, and turn it on (e.g. " +
-                     board.sink("hdmi")->device +
-                     ", or default to hear it through a desktop's speakers)");
-  app.add_option("--lineout-device", lineout_device,
-                 "ALSA device for the line out (the 3.5 mm jack), and turn it on (e.g. " +
-                     board.sink("lineout")->device + ")");
+  app.add_option("--sink", extra_sinks,
+                 "Also offer this ALSA device as a sink, e.g. default to hear it through a "
+                 "desktop's speakers (repeatable; hardware devices are found without it)");
   app.add_option("--www", www, "Directory of static web files");
   app.add_option("--config", config_path, "Path to the default config");
   app.add_option("--data-dir", data_dir, "Where saved settings live (the writable partition)");
@@ -87,6 +107,44 @@ int main(int argc, char** argv) {
   CLI11_PARSE(app, argc, argv);
 
   st::init_logging(verbose);
+  snd_lib_error_set_handler(alsa_lib_message);
+
+  st::Board board;
+  std::string berr;
+  if (!st::load_board(board_path, &board, &berr)) {
+    // A board file the image ships and cannot read is a broken image, not a desktop.
+    LOG_ERROR("{}", berr);
+    return 1;
+  }
+  // No file is a desktop. On a board it is a daemon copied without the /etc files that came with
+  // it: the engine card goes unused, so say so where it will be seen.
+  if (!sim && board.engine_device.empty() && device.empty() && access(board_path.c_str(), F_OK) != 0)
+    LOG_WARN("no {}: running with no engine card, as on a desktop", board_path);
+
+  // Command-line overrides win over the board file.
+  st::EngineOptions eopt;
+  eopt.sim = sim;
+  eopt.device = device.empty() ? board.engine_device : device;
+  eopt.rate = rate ? rate : board.rate;
+  eopt.period = period ? period : board.period;
+  eopt.periods = board.periods;
+  eopt.capture_channels = board.capture_channels;
+  eopt.sim_stagger = sim_stagger;
+
+  // The ring's columns, fixed from here on: the engine card's own channels, if it has one (the
+  // simulator is an Octo), then the network inputs.
+  st::ChannelLayout layout;
+  if (eopt.timer() && !sim) {
+    layout.local = 0;
+    layout.outputs = 0;
+  }
+  layout.device = std::min(board.device_inputs, st::kMaxInputs - layout.local - layout.net);
+  st::set_channels(layout);
+  LOG_INFO("board: {}; {} Hz, period {}; {} local inputs, {} outputs, {} network inputs, {} for "
+           "device inputs",
+           sim ? std::string("simulated Octo")
+               : eopt.device.empty() ? std::string("no engine card") : eopt.device,
+           eopt.rate, eopt.period, layout.local, layout.outputs, layout.net, layout.device);
 
   st::ConfigStore store(config_path, data_dir);
   st::Config cfg = store.load();
@@ -100,58 +158,23 @@ int main(int argc, char** argv) {
               data_dir);
   }
 
-  // Command-line overrides win over the config file.
-  if (!device.empty()) cfg.device = device;
-  if (rate) cfg.rate = rate;
-  if (period) cfg.period = period;
   if (net_port > 0) cfg.net_port = net_port;
-  // A simulated run is a desktop: a saved config asking for the Pi's own cards would only fill the
-  // log with devices that do not exist here. The console can still turn them on.
-  auto soc_override = [sim](st::SocConfig& c, const std::string& dev) {
-    if (!dev.empty()) {
-      c.device = dev;
-      c.enabled = true;
-    } else if (sim) {
-      c.enabled = false;
-    }
-  };
-  soc_override(cfg.hdmi, hdmi_device);
-  soc_override(cfg.lineout, lineout_device);
 
   st::Control ctl;
-  cfg.apply_to(ctl);
+  cfg.apply_to(ctl, eopt.rate);
 
-  st::EngineOptions eopt;
-  eopt.sim = sim;
-  eopt.device = cfg.device;
-  eopt.rate = cfg.rate;
-  eopt.period = cfg.period;
-  eopt.periods = cfg.periods;
-  eopt.capture_channels = cfg.capture_channels;
-  eopt.sim_stagger = sim_stagger;
-
-  st::RingBuffer ring(st::kRingFrames, st::kTotalInputs, 2ull * cfg.period);
+  st::RingBuffer ring(st::kRingFrames, layout.total(), 2ull * eopt.period);
   st::AudioEngine engine(ctl, ring, eopt);
 
   // Wired in before start(), so the audio thread never sees a half-constructed server. A bind
   // failure is reported through /api/net, not fatal — same reasoning as a card that will not
   // open: taking the console down removes the only way to find out what went wrong.
-  //
-  // The write guard is counted in the board's own period, not the configured one, so it stays the
-  // 2048 frames it has always been on the Pi, SOUNDTESTER_PERIOD=2048 included. Two of those
-  // longer blocks would be 4096 frames, and a net.delay_ms that works today, 21 to 43 ms, would
-  // then have every packet dropped as late.
-  st::NetAudioServer net(ctl, engine.rate(), board.clock.period, engine.clock());
+  st::NetAudioServer net(ctl, engine.rate(), st::kNetGuardPeriod, engine.clock());
   engine.set_net(&net);
   if (cfg.net_enabled) net.start(ctl.net.port.load());
 
-  // Same rule: their rings are handed to the engine before the audio thread exists, and a device
-  // that will not open is reported, never fatal.
-  st::SocOutput hdmi(st::kHdmiSink, ctl.hdmi, ctl, engine, cfg.hdmi.device, cfg.hdmi.sample_rate);
-  st::SocOutput lineout(st::kLineoutSink, ctl.lineout, ctl, engine, cfg.lineout.device,
-                        cfg.lineout.sample_rate);
-  engine.set_hdmi_ring(&hdmi.ring());
-  engine.set_lineout_ring(&lineout.ring());
+  // Sinks are found at runtime, and each hands the engine its ring when it is: see Devices.
+  st::Devices devices(ctl, engine, board, sim ? std::string() : eopt.device, extra_sinks);
 
   // A card that will not open is never fatal: the audio thread keeps retrying and the web
   // console comes up regardless, reporting the failure in /api/state. Only a thread that
@@ -161,16 +184,16 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (cfg.hdmi.enabled) hdmi.start();
-  if (cfg.lineout.enabled) lineout.start();
+  devices.start(cfg.sinks);
 
   st::Analysis analysis(ring, engine.rate());
   analysis.start();
 
   st::CaptureStore capture(ring, engine.rate(), engine.period());
 
+  // I2S sync errors are the engine card's: nothing to watch for without one.
   st::KmsgWatch kmsg;
-  kmsg.start();
+  if (layout.local) kmsg.start();
 
   st::WebOptions wopt;
   wopt.www_dir = www;
@@ -179,7 +202,7 @@ int main(int argc, char** argv) {
   // systemctl the host.
   wopt.allow_reboot = !sim;
 
-  st::Deps deps{ctl, net, hdmi, lineout, ring, engine, analysis, capture, kmsg, store, cfg};
+  st::Deps deps{ctl, net, devices, ring, engine, analysis, capture, kmsg, store, cfg};
   st::WebServer server(deps, wopt);
   g_server = &server;
 
@@ -193,8 +216,7 @@ int main(int argc, char** argv) {
   LOG_INFO("shutting down");
   kmsg.stop();
   analysis.stop();
-  hdmi.stop();
-  lineout.stop();
+  devices.stop();
   engine.stop();
   g_server = nullptr;
   return ok ? 0 : 1;

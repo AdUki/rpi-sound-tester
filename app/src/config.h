@@ -2,10 +2,10 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
-#include "board_profile.h"
 #include "constants.h"
 #include "control.h"
 
@@ -25,31 +25,22 @@ struct OutputConfig {
   bool mute = false;
 };
 
-// One of the SoC's own outputs: HDMI or the line out. `device` is an ALSA name, and
-// `sample_rate` the rate its PCM is opened at (never "rate": the image recipe patches every "rate"
-// key in config.json to the card's). `outputs` and `names` hold one entry per speaker the sink can
-// have, playing or not.
-struct SocConfig {
-  SocConfig(std::string dev, unsigned width)
-      : device(std::move(dev)), outputs(width), names(width) {}
-
+// A sink: one playback device other than the engine card, by its device id in Config::sinks.
+// `sample_rate` is the rate its PCM is opened at (never "rate": older images patched every "rate"
+// key in config.json) and 0, like an empty `layout`, means the device's default. `outputs` and
+// `names` hold one entry per channel a sink can have, played or not.
+struct SinkConfig {
   bool enabled = false;
-  std::string device;
-  unsigned sample_rate = kSocRateDefault;
-  std::string layout = hdmi_layout_name(kHdmiLayoutDefault);  // mono | stereo | 5.1 | 7.1
-  std::vector<OutputConfig> outputs;
-  std::vector<std::string> names;
+  unsigned sample_rate = 0;
+  std::string layout;
+  std::array<OutputConfig, kMaxSinkWidth> outputs{};
+  std::array<std::string, kMaxSinkWidth> names{};
 };
 
+// The operator's settings: what "Save as boot defaults" writes. What belongs to the board — the
+// engine card, its rate and period — is board.json's (board.h) and is never saved.
 struct Config {
-  // The compiled-in board's clock, until a file says otherwise.
-  unsigned rate = rpi3_octo_profile().clock.rate;
-  unsigned period = rpi3_octo_profile().clock.period;
-  unsigned periods = rpi3_octo_profile().clock.periods;
-  std::string device = rpi3_octo_profile().clock.capture_device;
-  unsigned capture_channels = rpi3_octo_profile().clock.capture_slots.front();
-
-  std::array<InputConfig, kTotalInputs> inputs{};
+  std::array<InputConfig, kMaxInputs> inputs{};
   std::array<OutputConfig, kOutputs> outputs{};
   float sine_freq_hz = 440.0f;
   float sine_level_db = -20.0f;
@@ -63,7 +54,7 @@ struct Config {
   std::array<uint8_t, kInputs> input_map{{0, 1, 2, 3, 4, 5}};
   std::array<uint8_t, kOutputs> output_map{{0, 1, 2, 3, 4, 5, 6, 7}};
 
-  std::vector<std::string> input_names{kTotalInputs};
+  std::vector<std::string> input_names{kMaxInputs};
   std::vector<std::string> output_names{kOutputs};
 
   int64_t loopback_offset_samples = 0;
@@ -81,17 +72,26 @@ struct Config {
   int net_port = kNetPort;
   int net_delay_ms = static_cast<int>(kNetDelayDefaultMs);
 
-  // On the devices the compiled-in board names for them. Only HDMI has a layout: the line out is
-  // always stereo, and neither reads nor writes one.
-  SocConfig hdmi{rpi3_octo_profile().sink("hdmi")->device, kHdmiMaxChannels};
-  SocConfig lineout{rpi3_octo_profile().sink("lineout")->device, kLineoutChannels};
+  // Every sink ever configured, by device id ("b1,0"), whether or not it is plugged in now: a USB
+  // interface gets its routing back when it returns.
+  std::map<std::string, SinkConfig> sinks;
 
+  // Inputs and names are written for the columns channels() has, so a file saved on one board
+  // reads the same on another with the same layout.
   std::string to_json() const;
   static bool from_json(const std::string& text, Config* out, std::string* err);
 
-  void apply_to(Control& ctl) const;
+  // `rate` is the engine's: the network delay is held in frames of it. Sinks are applied by
+  // Devices, as their devices are found.
+  void apply_to(Control& ctl, unsigned rate) const;
+  // Everything but the sinks, which Devices holds: see Devices::sink_configs().
   static Config from_control(const Control& ctl, const Config& base);
 };
+
+// One output's routing onto its control and back, shared by the engine card's outputs and every
+// sink's so they clamp alike.
+void apply_output(const OutputConfig& o, OutputControl& oc);
+OutputConfig output_from_control(const OutputControl& oc);
 
 // Boot order: the saved copy on the data partition wins, otherwise the read-only defaults.
 class ConfigStore {

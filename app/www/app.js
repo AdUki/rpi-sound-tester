@@ -14,21 +14,64 @@ const post = (p, obj) => api(p, {
 });
 
 const $ = id => document.getElementById(id);
-// NIN counts every input channel the ring carries: the card's ADCs plus any network channels.
-// NIN_LOCAL counts only the ADCs, and is what the channel map is about — TDM slots are physical,
-// so a network channel has no slot to be mapped to. Both are replaced from state.limits at
-// startup; the values here are only what an older daemon that reports neither would imply.
+
+// Periodic updates write only what changed. Rewriting an element with the same value still makes
+// the browser lay the page out again, and Chrome closes an open drop-down (a Source list, say)
+// when it does.
+const setText = (el, t) => { if (el && el.textContent !== t) el.textContent = t; };
+const setClass = (el, c) => { if (el && el.className !== c) el.className = c; };
+const setAttr = (el, k, v) => { if (el && el[k] !== v) el[k] = v; };
+// Replaces a <select>'s options only when the list itself changed.
+function setOptions(sel, html) {
+  if (!sel || sel._opts === html) return;
+  sel._opts = html;
+  sel.innerHTML = html;
+}
+// NIN counts every input channel the ring carries: the engine card's ADCs, the network channels
+// and the device inputs (a USB interface's). NIN_LOCAL counts only the ADCs, and is what the
+// channel map is about — TDM slots are physical, so no other channel has a slot to be mapped to.
+// Both are replaced from state.limits at startup; the values here are only what an older daemon
+// that reports neither would imply.
 let NIN = 6, NIN_LOCAL = 6;
 const NOUT = 8;
-const isNetInput = ch => ch >= NIN_LOCAL;
+// Per ring column, from state.inputs: `local` | `net` | `device`, what the daemon calls it, and
+// whether a device is on it. An older daemon sends no kind: its columns past the ADCs are network.
+const inputKind = [], inputNames = [], deviceActive = [];
+let NET_BASE = 6;
+const isNetInput = ch => (inputKind[ch] ? inputKind[ch] === 'net' : ch >= NIN_LOCAL);
+
+// Text from the daemon that came from a device (an ALSA card name, a USB product string) goes into
+// markup: escape it.
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 
 // A network channel's ring slot is permanent — it has to be, or a freeze taken after the sender
 // disconnected would have nothing to analyse — but there is no reason to SHOW one nobody has ever
 // used. This is the daemon's fact about the channel, deliberately kept apart from inputEnabled,
 // which is the user's own show/hide preference and must not be overwritten by a sender appearing.
 const netAvailable = [];
-const inputAvailable = ch => !isNetInput(ch) || netAvailable[ch - NIN_LOCAL] === true;
-const inputLabel = ch => (isNetInput(ch) ? `NET ${ch - NIN_LOCAL + 1}` : `IN ${ch + 1}`);
+const inputAvailable = ch => isNetInput(ch) ? netAvailable[ch - NET_BASE] === true
+  : inputKind[ch] === 'device' ? deviceActive[ch] === true : true;
+const inputLabel = ch => inputNames[ch] ||
+  (isNetInput(ch) ? `NET ${ch - NET_BASE + 1}` : `IN ${ch + 1}`);
+
+// Takes each column's kind, label and whether a device is on it from state.inputs. True when a
+// device input came or went, which is when the cards and lanes need building again.
+function applyInputMeta(inputs) {
+  let changed = false;
+  (inputs || []).forEach(i => {
+    const kind = i.kind || (i.ch >= NIN_LOCAL ? 'net' : 'local');
+    const label = i.label ? esc(i.label) : '';
+    const dev = kind === 'device' && i.active !== false;
+    if (inputKind[i.ch] !== kind || inputNames[i.ch] !== label || deviceActive[i.ch] !== dev) changed = true;
+    inputKind[i.ch] = kind;
+    inputNames[i.ch] = label;
+    deviceActive[i.ch] = dev;
+  });
+  const first = inputKind.indexOf('net');
+  NET_BASE = first >= 0 ? first : NIN_LOCAL;
+  return changed;
+}
 
 const tabActive = name => $(name).classList.contains('active');
 
@@ -625,7 +668,7 @@ function buildInputs() {
       <div class="chan-head">
         <label class="en" title="Enable / disable this input"><input type="checkbox"
           id="en${i.ch}" ${inputEnabled[i.ch] ? 'checked' : ''}></label>
-        <span class="chan-name">${inputLabel(i.ch)}${i.name ? ' — ' + i.name : ''}</span>
+        <span class="chan-name">${inputLabel(i.ch)}${i.name ? ' — ' + esc(i.name) : ''}</span>
         <span class="listen-grp">
           <button id="listenL${i.ch}" class="lbtn">Listen L</button>
           <button id="listenR${i.ch}" class="lbtn">Listen R</button>
@@ -687,24 +730,20 @@ function applyInputBypass(i) {
   const m = $('imute' + i.ch);
   const v = $('igainv' + i.ch);
   const why = 'This sender asked for its stream to be left alone (mixer off)';
-  if (g) {
-    g.disabled = on;
-    g.title = on ? why : '';
-  }
-  if (m) {
-    m.disabled = on;
-    m.title = on ? why : '';
-  }
-  const u = $('igainu' + i.ch);  // the unit goes with the number: "bypass dB" is not a reading
-  if (u) u.hidden = on;
+  setAttr(g, 'disabled', on);
+  setAttr(g, 'title', on ? why : '');
+  setAttr(m, 'disabled', on);
+  setAttr(m, 'title', on ? why : '');
+  // The unit goes with the number: "bypass dB" is not a reading.
+  setAttr($('igainu' + i.ch), 'hidden', on);
   if (!v) return;
   v.classList.toggle('bypassed', on);
   if (on) {
     v.classList.remove('active');  // not "boosted" either: that gain is not being applied
-    v.textContent = 'bypass';
-    v.title = why;
+    setText(v, 'bypass');
+    setAttr(v, 'title', why);
   } else {
-    v.title = '';
+    setAttr(v, 'title', '');
     setInputGainLabel(i.ch, i.gain_db);
   }
 }
@@ -714,7 +753,7 @@ function applyInputBypass(i) {
 function setInputGainLabel(ch, db) {
   const el = $('igainv' + ch);
   if (!el) return;
-  el.textContent = db > 0 ? '+' + db.toFixed(1) : db < 0 ? db.toFixed(1) : 'unity';
+  setText(el, db > 0 ? '+' + db.toFixed(1) : db < 0 ? db.toFixed(1) : 'unity');
   el.classList.toggle('active', db !== 0);
 }
 
@@ -738,7 +777,7 @@ function sourceValue(src) {
 function setPingVariant(variant) {
   if (state.generators && state.generators.ping) state.generators.ping.variant = variant;
   const val = 'ping:' + variant;
-  // Every sink's Source list, HDMI's and the line out's included: one generator, one variant.
+  // Every output's Source list, every sink's included: one generator, one variant.
   document.querySelectorAll('select.outsrc').forEach(el => {
     if (el.value.startsWith('ping:')) el.value = val;
   });
@@ -764,10 +803,9 @@ function optsFor(sel) {
     .join('');
 }
 
-// One card per channel, for any sink that routes like the Octo's DACs: the DACs themselves, HDMI
-// and the line out. `p` prefixes every element id so the sets never collide, and `path` is the
-// REST collection the card talks to (/outputs, /hdmi or /lineout) — same body, same Identify, same
-// clamps.
+// One card per channel, for the engine card's DACs and every sink alike. `p` prefixes every element
+// id so the sets never collide, and `path` is the REST collection the card talks to (/outputs or
+// /sinks/<id>) — same body, same Identify, same clamps.
 function buildOutputCards(el, outs, p, label, path) {
   el.innerHTML = outs.map(o => `
     <div class="card">
@@ -813,147 +851,192 @@ function buildOutputCards(el, outs, p, label, path) {
 }
 
 function buildOutputs() {
+  $('outsec').hidden = !state.outputs.length;   // a board without an engine card has none
   buildOutputCards($('outputs'), state.outputs, '', ch => `OUT ${ch + 1}`, '/outputs');
-  SOC_SINKS.forEach(buildSoc);
+  buildSinks();
 }
 
-// ---------------------------------------------------------------- HDMI output and line out
+// ---------------------------------------------------------------- sinks
 //
-// The Pi's own audio outputs: its HDMI port (mono, stereo, 5.1 or 7.1) and its 3.5 mm jack
-// (stereo). Each plays at the same sample index as every other output, a fixed latency later, so
-// the one thing worth watching here besides "is it playing" is that latency holding still. One set
-// of code for both: `k` is the sink's key in /api/state and the prefix of its element ids, `path`
-// its REST collection, `card` the prefix of its output cards' ids.
-const SOC_SINKS = [
-  {k: 'hdmi', path: '/hdmi', card: 'h', label: 'HDMI', title: 'HDMI output', layouts: true,
-   note: 'Engine to HDMI driver, held constant. The TV or receiver adds its own, also constant — ' +
-     'calibrate it once with a ping through an HDMI audio extractor.'},
-  {k: 'lineout', path: '/lineout', card: 'l', label: 'LINE', title: 'Line out', layouts: false,
-   note: 'Engine to the jack\'s driver, held constant. The firmware adds its own, also ' +
-     'constant — calibrate it once with a ping looped from the jack into an input.'},
-];
+// Every playback device other than the engine card, as the daemon found it: HDMI (mono, stereo,
+// 5.1 or 7.1), a Pi's 3.5 mm jack, a USB interface. Each plays at the same sample index as every
+// other output, a fixed latency later, so the one thing worth watching here besides "is it playing"
+// is that latency holding still. One set of code for all of them: `k` prefixes a sink's element
+// ids, `path` is its REST collection. Devices come and go (a USB interface plugged in), so the
+// sections are rebuilt whenever the set of sinks changes.
+const sinkKey = id => 'sk' + id.replace(/[^A-Za-z0-9]/g, '_');
+let sinks = [];        // descriptors, in slot order
+const sinkState = {};  // by key: the latest full status
 
-// Channels are named by speaker. The daemon says which position each routed channel is
-// (`position`); an older one that does not, numbers them.
+function sinkDesc(h) {
+  const k = sinkKey(h.id);
+  return {id: h.id, k, path: '/sinks/' + encodeURIComponent(h.id), card: k + 'c',
+          title: esc(h.label), hdmi: !!h.hdmi,
+          note: h.hdmi
+            ? 'Engine to HDMI driver, held constant. The TV or receiver adds its own, also constant — ' +
+              'calibrate it once with a ping through an HDMI audio extractor.'
+            : 'Engine to the device\'s driver, held constant. The device adds its own, also ' +
+              'constant — calibrate it once with a ping looped from it into an input.'};
+}
+
+const sinkIds = list => (list || []).map(h => h.id).join('\n');
+const sourceIds = list => (list || []).map(h => `${h.id}@${h.first}`).join('\n');
+
+// Takes a fresh /state's devices: builds the sections of sinks that appeared, and the cards and
+// lanes of device inputs that did, and updates the rest in place.
+function applyStructure(s2) {
+  state.devices = s2.devices;
+  state.sources = s2.sources;
+  if (sinkIds(s2.sinks) !== sinkIds(state.sinks)) {
+    state.sinks = s2.sinks;
+    buildSinks();
+  } else {
+    (s2.sinks || []).forEach(h => {
+      const sink = sinks.find(k => k.id === h.id);
+      if (sink) applySink(sink, h);
+    });
+  }
+  if (applyInputMeta(s2.inputs)) {
+    state.inputs = s2.inputs;
+    buildInputs();
+    buildLanes();
+    refreshOutputSourceOptions();
+    scopeDirty = true;
+  }
+}
+
+function buildSinks() {
+  const list = state.sinks || [];
+  sinks = list.map(sinkDesc);
+  $('sinks').innerHTML = sinks.map(k => `
+    <div id="${k.k}sec">
+      <h2>${k.title} <span class="muted small mono">${esc(k.id)}</span></h2>
+      <div class="socbar">
+        <label class="socon"><input type="checkbox" id="${k.k}on"> On</label>
+        <span id="${k.k}state" class="pill">off</span>
+        <label>Rate <select id="${k.k}rate"></select></label>
+        <label id="${k.k}laywrap" hidden>Channels <select id="${k.k}layout"></select></label>
+      </div>
+      <div id="${k.k}detail" class="socdetail muted small mono"></div>
+      <div id="${k.k}outs" class="grid"></div>
+    </div>`).join('');
+  sinks.forEach((k, i) => {
+    sinkState[k.k] = list[i];
+    buildSink(k);
+  });
+}
+
+// Channels are named by speaker on HDMI, by number elsewhere. The daemon says which each routed
+// channel is (`position`).
 const SPEAKERS = {
   M: 'mono', L: 'left', R: 'right', C: 'centre', LFE: 'subwoofer',
   Ls: 'surround left', Rs: 'surround right', Lb: 'back left', Rb: 'back right',
 };
-const HDMI_LAYOUT_LABELS = {mono: 'Mono', stereo: 'Stereo (2.0)', '5.1': '5.1', '7.1': '7.1'};
-// The Pi carries more than two HDMI channels only up to 48 kHz; the daemon refuses the rest.
+const LAYOUT_LABELS = {mono: 'Mono', stereo: 'Stereo (2.0)', '5.1': '5.1', '7.1': '7.1'};
+const layoutLabel = l => LAYOUT_LABELS[l] || l.replace(/^(\d+)ch$/, '$1 channels');
+// HDMI carries more than two channels only up to 48 kHz; the daemon refuses the rest.
 const SURROUND_MAX_RATE = 48000;
 const isSurround = layout => layout === '5.1' || layout === '7.1';
 const rateLabel = r => (r % 1000 ? (r / 1000).toFixed(1) : String(r / 1000)) + ' kHz';
-function buildSocCards(sink, h) {
-  const pos = ch => {
-    const o = h.outputs.find(x => x.ch === ch);
-    return o && o.position ? o.position : null;
-  };
+function buildSinkCards(sink, h) {
   const label = ch => {
-    const p = pos(ch);
-    if (!p) return `${sink.label} ${ch + 1}`;
-    return p === 'M' ? `${sink.label} mono`
-      : `${sink.label} ${p} <span class="muted small">${SPEAKERS[p] || ''}</span>`;
+    const o = h.outputs.find(x => x.ch === ch);
+    const p = o && o.position ? o.position : String(ch + 1);
+    if (p === 'M') return 'Mono';
+    return SPEAKERS[p] ? `${p} <span class="muted small">${SPEAKERS[p]}</span>` : `Channel ${p}`;
   };
   buildOutputCards($(sink.k + 'outs'), h.outputs, sink.card, label, sink.path);
 }
 
-function buildSoc(sink) {
-  const h = state[sink.k];
+function buildSink(sink) {
+  const h = sinkState[sink.k];
   const el = id => $(sink.k + id);
-  el('sec').hidden = !h;   // an older daemon has no such output
-  if (!h) return;
-  buildSocCards(sink, h);
+  buildSinkCards(sink, h);
   el('on').checked = !!h.enabled;
   el('on').onchange = e => put(sink.path, {enabled: e.target.checked})
-    .then(r => applySoc(sink, r))
+    .then(r => applySink(sink, r))
     .catch(err => { toast(err.message); e.target.checked = !e.target.checked; });
 
-  // Each picker applies as soon as it changes: the sink restarts on its own, the DACs never do.
+  // Each picker applies as soon as it changes: the sink restarts on its own, the engine never does.
   // A refusal puts the picker back to what is actually in force.
   const apply = body => put(sink.path, body)
-    .then(r => applySoc(sink, r))
-    .catch(err => { toast(err.message); syncSocPickers(sink, state[sink.k]); });
+    .then(r => applySink(sink, r))
+    .catch(err => { toast(err.message); syncSinkPickers(sink, sinkState[sink.k]); });
   el('rate').onchange = e => apply({sample_rate: parseInt(e.target.value, 10)});
-  if (sink.layouts) {
-    el('layout').onchange = e => {
-      const body = {layout: e.target.value};
-      // Surround above 48 kHz is refused, so bring the rate down with it in the same request.
-      if (isSurround(body.layout) && state[sink.k].sample_rate > SURROUND_MAX_RATE) {
-        body.sample_rate = SURROUND_MAX_RATE;
-        toast(`${body.layout} plays at up to 48 kHz: rate set to 48 kHz`);
-      }
-      apply(body);
-    };
-  }
-  syncSocPickers(sink, h);
-  renderSoc(sink, h);
+  el('layout').onchange = e => {
+    const body = {layout: e.target.value};
+    // Surround above 48 kHz is refused, so bring the rate down with it in the same request.
+    if (sink.hdmi && isSurround(body.layout) && sinkState[sink.k].sample_rate > SURROUND_MAX_RATE) {
+      body.sample_rate = SURROUND_MAX_RATE;
+      toast(`${body.layout} plays at up to 48 kHz: rate set to 48 kHz`);
+    }
+    apply(body);
+  };
+  syncSinkPickers(sink, h);
+  renderSink(sink, h);
 }
 
-// Fills the rate and channel pickers from a full status, leaving alone one the operator has open.
-function syncSocPickers(sink, h) {
+// Fills the rate and layout pickers from a full status, leaving alone one the operator has open.
+function syncSinkPickers(sink, h) {
   if (!h) return;
   const el = id => $(sink.k + id);
   const idle = x => document.activeElement !== x;
 
   const rate = el('rate');
   if (idle(rate)) {
-    const rates = (state.limits && state.limits[sink.k + '_rates']) || [44100, 48000, 96000];
-    const cap = sink.layouts && isSurround(h.layout) ? SURROUND_MAX_RATE : Infinity;
-    rate.innerHTML = rates.map(r =>
-      `<option value="${r}"${r > cap ? ' disabled' : ''}>${rateLabel(r)}</option>`).join('');
-    rate.value = String(h.sample_rate);
+    const rates = h.rates && h.rates.length ? h.rates : [44100, 48000, 96000];
+    const cap = sink.hdmi && isSurround(h.layout) ? SURROUND_MAX_RATE : Infinity;
+    setOptions(rate, rates.map(r =>
+      `<option value="${r}"${r > cap ? ' disabled' : ''}>${rateLabel(r)}</option>`).join(''));
+    setAttr(rate, 'value', String(h.sample_rate));
   }
 
-  if (sink.layouts) {
-    // An older daemon's HDMI is a fixed stereo pair with no layout to choose.
-    const layouts = (state.limits && state.limits.hdmi_layouts) || [];
-    el('laywrap').hidden = !layouts.length;
-    const lay = el('layout');
-    if (idle(lay)) {
-      lay.innerHTML = layouts
-        .map(l => `<option value="${l}">${HDMI_LAYOUT_LABELS[l] || l}</option>`).join('');
-      if (h.layout) lay.value = h.layout;
-    }
+  // A device with one layout has nothing to choose.
+  const layouts = h.layouts || [];
+  setAttr(el('laywrap'), 'hidden', layouts.length < 2);
+  const lay = el('layout');
+  if (idle(lay)) {
+    setOptions(lay, layouts.map(l => `<option value="${l}">${layoutLabel(l)}</option>`).join(''));
+    if (h.layout) setAttr(lay, 'value', h.layout);
   }
 }
 
 // Takes a full status with its outputs (PUT or GET on the sink, /api/state). The cards are rebuilt
 // only when the layout changed — possibly from another browser or a script — so a routing the
 // operator is in the middle of changing is not snapped back every five seconds.
-function applySoc(sink, h) {
+function applySink(sink, h) {
   if (!h || !Array.isArray(h.outputs)) return;
-  const was = state[sink.k];
+  const was = sinkState[sink.k];
   const had = was ? was.layout : undefined;
   const hadN = was && was.outputs ? was.outputs.length : -1;
-  state[sink.k] = h;
-  if (h.layout !== had || h.outputs.length !== hadN) buildSocCards(sink, h);
-  syncSocPickers(sink, h);
-  renderSoc(sink, h);
+  sinkState[sink.k] = h;
+  if (h.layout !== had || h.outputs.length !== hadN) buildSinkCards(sink, h);
+  syncSinkPickers(sink, h);
+  renderSink(sink, h);
 }
 
 // Takes either the full status (the sink's GET, /api/state) or the compact one in the 1 Hz system
 // frame; everything it reads is in both.
-function renderSoc(sink, h) {
+function renderSink(sink, h) {
   const pill = $(sink.k + 'state'), detail = $(sink.k + 'detail'), on = $(sink.k + 'on');
   if (!h || !pill) return;
-  if (document.activeElement !== on) on.checked = !!h.enabled;
+  if (document.activeElement !== on) setAttr(on, 'checked', !!h.enabled);
   if (!h.enabled) {
-    pill.textContent = 'off';
-    pill.className = 'pill';
-    detail.textContent = '';
+    setText(pill, h.present === false ? 'unplugged' : 'off');
+    setClass(pill, 'pill');
+    setText(detail, '');
   } else if (h.playing) {
-    pill.textContent = 'playing';
-    pill.className = 'pill ' + (h.xruns || h.resyncs ? 'warn' : 'good');
+    setText(pill, 'playing');
+    setClass(pill, 'pill ' + (h.xruns || h.resyncs ? 'warn' : 'good'));
     const t = Math.round(h.trim_ppm);   // and never "-0"
     const trim = t > 0 ? '+' + t : t < 0 ? String(t) : '0';
-    detail.textContent = `latency ${h.latency_ms.toFixed(1)} ms · clock trim ${trim} ppm` +
-      ` · xruns ${h.xruns} · resyncs ${h.resyncs}`;
-    detail.title = sink.note;
+    setText(detail, `latency ${h.latency_ms.toFixed(1)} ms · clock trim ${trim} ppm` +
+      ` · xruns ${h.xruns} · resyncs ${h.resyncs}`);
+    setAttr(detail, 'title', sink.note);
   } else {
-    pill.textContent = h.error ? 'no device' : 'starting';
-    pill.className = 'pill ' + (h.error ? 'bad' : 'warn');
-    detail.textContent = h.error || '';
+    setText(pill, h.present === false ? 'unplugged' : h.error ? 'no device' : 'starting');
+    setClass(pill, 'pill ' + (h.error || h.present === false ? 'bad' : 'warn'));
+    setText(detail, h.error || '');
   }
 }
 
@@ -1146,7 +1229,7 @@ function syncNetSection() {
   const sec = $('netsec');
   if (!sec) return;
   let any = false;
-  for (let c = NIN_LOCAL; c < NIN; c++) if (inputAvailable(c)) any = true;
+  for (let c = 0; c < NIN; c++) if (isNetInput(c) && inputAvailable(c)) any = true;
   sec.hidden = !any;
 }
 
@@ -2611,14 +2694,15 @@ function renderPower(t) {
 
 function buildSystem() {
   const e = state.engine, s = state.system;
+  const syncWatch = state.limits.sync_watch !== false;
   const rows = [
-    ['Device', e.device],
+    ['Engine card', e.backend === 'timer' ? 'none — a timer paces the engine' : e.device],
     ['Rate / format', `${e.rate} Hz, ${e.format}`],
     ['Period / buffer', `${e.period} frames x ${e.periods}`],
     ['Capture channels', e.capture_channels],
     ['Xruns', e.xruns],
     ['Timeline generation', e.generation],
-    ['I2S sync errors', s.sync_errors],
+    ...(syncWatch ? [['I2S sync errors', s.sync_errors]] : []),
     ['Captured samples', e.samples],
     ['Listen streams', s.listen_streams],
     ['CPU', s.cpu_pct.toFixed(1) + ' %'],
@@ -2632,15 +2716,23 @@ function buildSystem() {
     ['Saved config', s.has_saved_config ? 'yes (data partition)' : 'no (image defaults)'],
     ['Loopback offset', s.loopback_offset_samples + ' samples'],
   ];
-  SOC_SINKS.forEach(sink => {
-    const h = state[sink.k];
+  sinks.forEach(sink => {
+    const h = sinkState[sink.k];
     if (!h) return;
     rows.push([sink.title, !h.enabled ? 'off'
-      : `${h.device}, ${h.device_rate || h.sample_rate} Hz` +
-        (h.playing ? `, latency ${h.latency_ms.toFixed(1)} ms` : h.error ? ` — ${h.error}` : ', starting')]);
+      : `${esc(h.device)}, ${h.device_rate || h.sample_rate} Hz` + (h.format ? ` ${h.format}` : '') +
+        (h.playing ? `, latency ${h.latency_ms.toFixed(1)} ms`
+          : h.error ? ` — ${esc(h.error)}` : ', starting')]);
+  });
+  (state.sources || []).forEach(h => {
+    rows.push([`${esc(h.label)} (input)`, h.capturing
+      ? `${esc(h.device)}, ${h.device_rate} Hz ${h.format}, clock trim ${Math.round(h.trim_ppm)} ppm` +
+        (h.xruns || h.late ? `, xruns ${h.xruns}, late ${h.late}` : '')
+      : h.present === false ? 'unplugged' : h.error ? esc(h.error) : 'starting']);
   });
   if (e.last_error) rows.push(['Last error', e.last_error]);
   $('systable').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  buildDevices();
 
   renderHost(s);
   renderPower(s.throttle);
@@ -2669,6 +2761,31 @@ function buildSystem() {
       })
       .catch(e => { $('sysmsg').textContent = e.message; });
   };
+}
+
+// What the daemon found, as `aplay -l` / `arecord -l` would list it.
+function buildDevices() {
+  const devs = state.devices || [];
+  const dir = d => [d.playback ? 'playback' : '', d.capture ? 'capture' : ''].filter(Boolean).join(' + ');
+  const uses = d => {
+    if (d.engine) return 'engine card';
+    if (d.hidden) return 'not wired to anything on this board';
+    const u = [];
+    if (d.sink >= 0) u.push('output');
+    if (d.input >= 0) {
+      const last = d.input + (d.input_channels || 1) - 1;
+      u.push(`input (${[...new Set([d.input, last])].map(inputLabel).join(' … ')})`);
+    }
+    if (d.note) u.push(esc(d.note));
+    return u.join(', ') || '—';
+  };
+  $('devtable').innerHTML = devs.length
+    ? '<tr><th>Device</th><th>ALSA</th><th></th><th>Used as</th></tr>' +
+      devs.map(d => `<tr><td>${esc(d.label)}${d.usb ? ' <span class="pill">USB</span>' : ''}` +
+        `<br><span class="muted small">${esc(d.card_name)}: ${esc(d.name)}</span></td>` +
+        `<td class="mono small">${esc(d.alsa)}</td><td class="small">${dir(d)}</td>` +
+        `<td class="small">${uses(d)}</td></tr>`).join('')
+    : '<tr><td class="muted">none found</td></tr>';
 }
 
 // ---------------------------------------------------------------- telemetry
@@ -2704,21 +2821,28 @@ function onSpectrum(msg) {
 
 function onSystem(s) {
   applyNetAvailability(s.net_active);
-  $('xruns').textContent = `xruns ${s.xruns}`;
-  $('xruns').className = 'pill ' + (s.xruns ? 'warn' : 'good');
-  $('cpu').textContent = `cpu ${s.cpu_pct.toFixed(0)}%` + (s.temp_c > 0 ? ` · ${s.temp_c.toFixed(0)}°C` : '');
-  $('engine').textContent = s.engine_running ? 'engine running' : 'engine stopped';
-  $('engine').className = 'pill ' + (s.engine_running ? 'good' : 'bad');
-  $('syncbanner').classList.toggle('hidden', !s.sync_errors);
+  setText($('xruns'), `xruns ${s.xruns}`);
+  setClass($('xruns'), 'pill ' + (s.xruns ? 'warn' : 'good'));
+  setText($('cpu'), `cpu ${s.cpu_pct.toFixed(0)}%` + (s.temp_c > 0 ? ` · ${s.temp_c.toFixed(0)}°C` : ''));
+  setText($('engine'), s.engine_running ? 'engine running' : 'engine stopped');
+  setClass($('engine'), 'pill ' + (s.engine_running ? 'good' : 'bad'));
+  $('syncbanner').classList.toggle('hidden', !s.sync_errors || state.limits.sync_watch === false);
   renderHost(s);
   renderPower(s.throttle);
-  SOC_SINKS.forEach(sink => {
-    const h = s[sink.k];
-    if (!h) return;
-    renderSoc(sink, h);
-    // The layout changed somewhere else: fetch the routing for its speakers.
-    if (h.layout && state[sink.k] && h.layout !== state[sink.k].layout) {
-      api(sink.path).then(r => applySoc(sink, r)).catch(() => {});
+  // A device came or went: fetch the state that says where it is, and build its sections.
+  if ((Array.isArray(s.sinks) && sinkIds(s.sinks) !== sinkIds(state.sinks)) ||
+      (Array.isArray(s.sources) && sourceIds(s.sources) !== sourceIds(state.sources))) {
+    pollState();
+    return;
+  }
+  (s.sinks || []).forEach(h => {
+    const sink = sinks.find(k => k.id === h.id);
+    if (!sink) return;
+    renderSink(sink, Object.assign({}, sinkState[sink.k], h));
+    // The layout changed somewhere else: fetch the routing for its channels.
+    const was = sinkState[sink.k];
+    if (h.layout && was && h.layout !== was.layout) {
+      api(sink.path).then(r => applySink(sink, r)).catch(() => {});
     }
   });
 }
@@ -2768,7 +2892,11 @@ function connect() {
 // The 5 s /state poll: a browser or curl elsewhere may have frozen or resumed the shared capture,
 // and it keeps the System table current. Extracted into a named function so it can be stopped and
 // restarted with the push feed.
+// One at a time: a device that comes or goes asks for one every second until it lands.
+let statePending = false;
 function pollState() {
+  if (statePending) return;
+  statePending = true;
   api('/state').then(s2 => {
     const wasFrozen = srvFrozen();
     state.capture = s2.capture;
@@ -2777,10 +2905,10 @@ function pollState() {
       if (srvFrozen()) enterFrozen(s2.capture);
       else enterLive();
     }
+    applyStructure(s2);
     buildSystem();
     syncInputLevels(s2.inputs);
-    SOC_SINKS.forEach(sink => { if (s2[sink.k]) applySoc(sink, s2[sink.k]); });
-  }).catch(() => {});
+  }).catch(() => {}).finally(() => { statePending = false; });
   // Only while the panel is on screen — the same discipline refreshPings() uses, so a background
   // tab costs the daemon nothing.
   if (tabActive('net')) refreshNet();
@@ -2894,10 +3022,12 @@ api('/state').then(s => {
   // Channel counts come from the daemon: an older one reports neither and keeps the six-ADC
   // shape the constants above already assume.
   NIN = s.limits.inputs_total || s.inputs.length || 6;
-  NIN_LOCAL = s.limits.inputs_local || NIN;
-  for (let c = NIN_LOCAL; c < NIN; c++) {
+  NIN_LOCAL = s.limits.inputs_local ?? NIN;
+  applyInputMeta(s.inputs);
+  for (let c = 0; c < NIN; c++) {
+    if (!isNetInput(c)) continue;
     const inp = s.inputs[c];
-    netAvailable[c - NIN_LOCAL] = !inp || inp.active !== false;
+    netAvailable[c - NET_BASE] = !inp || inp.active !== false;
   }
   loadLaneMode();
 
@@ -2909,6 +3039,7 @@ api('/state').then(s => {
   buildOutputs();
   bindGenerators();
   buildMap();
+  $('mapcard').hidden = s.limits.channel_map === false;   // the TDM slots are the engine card's
   buildLanes();
   buildSystem();
   initScope();

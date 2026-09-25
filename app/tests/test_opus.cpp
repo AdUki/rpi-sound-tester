@@ -8,6 +8,7 @@
 
 #include <opus.h>
 
+#include "channel_layout.h"
 #include "check.h"
 #include "constants.h"
 #include "rates.h"
@@ -152,13 +153,13 @@ void test_ogg_stream_encodes(unsigned rate) {
   CHECK_EQ(last_granule(enc.headers()), 0);
 
   const int packets = 50;
-  std::vector<float> in(static_cast<size_t>(enc.in_frames()) * kTotalInputs);
+  std::vector<float> in(static_cast<size_t>(enc.in_frames()) * st::channels().total());
   std::string pages;
   long n = 0;
   for (int b = 0; b < packets; ++b) {
     for (unsigned i = 0; i < enc.in_frames(); ++i, ++n) {
       const float v = 0.25f * static_cast<float>(std::sin(2.0 * kPi * 440.0 * n / rate));
-      for (unsigned c = 0; c < kTotalInputs; ++c) in[i * kTotalInputs + c] = v;
+      for (unsigned c = 0; c < st::channels().total(); ++c) in[i * st::channels().total() + c] = v;
     }
     CHECK(enc.encode(in.data(), kListenBitrateDefaultKbps, &pages));
   }

@@ -57,11 +57,10 @@ DEVICE  ?=
 # Simulator: input channel c is fed from output c, delayed by c*STAGGER frames, so every
 # channel pair has a known delay to measure.
 STAGGER ?= 137
-# The HDMI output's and the line out's ALSA devices; naming one also turns it on. Both are off in
-# the simulator unless given:
-#   make run HDMI=default     # hear it through this machine's speakers
-HDMI    ?=
-LINEOUT ?=
+# Extra outputs beyond the sound cards the daemon finds by itself, e.g. this machine's speakers
+# through its sound server (switch it on in the console):
+#   make run SINK=default
+SINK    ?=
 DISK    ?=
 
 # What `make configure` writes. Neither is tracked by git.
@@ -116,16 +115,16 @@ test: build ## Run the test suite
 	@ctest --test-dir $(BUILD) --output-on-failure
 
 .PHONY: run
-run: build ## Run it: simulated card by default, or DEVICE=hw:... for a real one; HDMI=dev / LINEOUT=dev add those outputs
+run: build ## Run it: simulated card by default, or DEVICE=hw:... for a real one; SINK=dev adds an output (e.g. default)
 	@mkdir -p /tmp/soundtester
 ifeq ($(DEVICE),)
 	@echo -e "$(BOLD)http://localhost:$(PORT)$(OFF)  $(DIM)simulated card, each channel delayed $(STAGGER) frames$(OFF)"
-	@$(BIN) --sim --sim-stagger $(STAGGER) --port $(PORT) $(if $(HDMI),--hdmi-device $(HDMI)) \
-	        $(if $(LINEOUT),--lineout-device $(LINEOUT)) \
+	@$(BIN) --sim --sim-stagger $(STAGGER) --port $(PORT) --board $(APP)/config/boards/$(PROFILE).json \
+	        $(foreach d,$(SINK),--sink $(d)) \
 	        --www $(APP)/www --config $(APP)/config/default-config.json --data-dir /tmp/soundtester
 else
-	@$(BIN) --device $(DEVICE) --port $(PORT) $(if $(HDMI),--hdmi-device $(HDMI)) \
-	        $(if $(LINEOUT),--lineout-device $(LINEOUT)) \
+	@$(BIN) --device $(DEVICE) --port $(PORT) --board $(APP)/config/boards/$(PROFILE).json \
+	        $(foreach d,$(SINK),--sink $(d)) \
 	        --www $(APP)/www --config $(APP)/config/default-config.json --data-dir /tmp/soundtester
 endif
 
@@ -183,7 +182,7 @@ deploy-www: ## Copy app/www to a running board over ssh (no restart; TARGET=root
 	@echo -e "Done. Hard-refresh the browser $(DIM)(Ctrl+Shift+R)$(OFF)."
 
 .PHONY: deploy-daemon
-deploy-daemon: $(BUILD_CONF) ## Copy the cross-compiled daemon to a board, stop+restart it (TARGET=root@host)
+deploy-daemon: $(BUILD_CONF) ## Copy the cross-compiled daemon, its /etc files and app/www to a board, restart it (TARGET=root@host)
 	@set -e; \
 	eval "$$($(yocto_vars))"; \
 	bin="$$PKGDEST/soundtesterd/usr/bin/soundtesterd"; \
@@ -194,6 +193,9 @@ deploy-daemon: $(BUILD_CONF) ## Copy the cross-compiled daemon to a board, stop+
 	ssh $(TARGET) 'systemctl stop soundtesterd'; \
 	ssh $(TARGET) 'mount -o remount,rw /'; \
 	scp "$$bin" $(TARGET):$(BIN_DEST); \
+	: 'Its board and factory config files ride along: a new daemon may read keys an older'; \
+	: 'image did not ship.'; \
+	scp -q "$$PKGDEST"/soundtesterd/etc/soundtester/* $(TARGET):/etc/soundtester/; \
 	: 'A new DEPENDS reaches the board only through a reflash, so a binary that has grown a'; \
 	: 'library since the image was built would land here and then refuse to start. Carry over'; \
 	: 'anything it needs that the board has not got; a reflash installs them properly.'; \
@@ -208,9 +210,11 @@ deploy-daemon: $(BUILD_CONF) ## Copy the cross-compiled daemon to a board, stop+
 	    fi; \
 	  fi; \
 	done; \
+	: 'The console and the daemon change together, so the console goes too.'; \
+	scp -rq $(APP)/www/* $(TARGET):$(WWW_DEST)/; \
 	ssh $(TARGET) 'sync && mount -o remount,ro /'; \
 	ssh $(TARGET) 'systemctl start soundtesterd'; \
-	echo "Done. Daemon restarted with the new binary."
+	echo "Done. Daemon and console restarted with the new build."
 
 ## ─── configure ───────────────────────────────────────────────────────────────
 

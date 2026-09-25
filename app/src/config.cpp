@@ -13,6 +13,8 @@
 #include <nlohmann/json.hpp>
 #include <sstream>
 
+#include "alsa_devices.h"
+#include "channel_layout.h"
 #include "util/log.h"
 
 using json = nlohmann::json;
@@ -29,8 +31,8 @@ std::string read_file(const std::string& path) {
   return ss.str();
 }
 
-// One output's routing, shared by the Octo's outputs, HDMI and the line out so they cannot come to
-// disagree on the file format, the clamps or what an unknown source falls back to.
+// One output's routing, shared by the engine card's outputs and every sink's so they cannot come
+// to disagree on the file format, the clamps or what an unknown source falls back to.
 json output_to_json(const OutputConfig& o) {
   return {{"source", {{"type", o.source_type}, {"index", o.source_index}}},
           {"gain_db", o.gain_db},
@@ -52,13 +54,40 @@ OutputConfig output_from_json(const json& o) {
   return c;
 }
 
+json sink_to_json(const SinkConfig& c) {
+  json outs = json::array();
+  for (const auto& o : c.outputs) outs.push_back(output_to_json(o));
+  return {{"enabled", c.enabled},
+          {"sample_rate", c.sample_rate},
+          {"layout", c.layout},
+          {"outputs", outs},
+          {"names", c.names}};
+}
+
+void sink_from_json(const json& j, SinkConfig* c) {
+  c->enabled = j.value("enabled", c->enabled);
+  c->sample_rate = j.value("sample_rate", c->sample_rate);
+  c->layout = j.value("layout", c->layout);
+  if (j.contains("outputs")) {
+    const auto& arr = j.at("outputs");
+    for (size_t i = 0; i < arr.size() && i < c->outputs.size(); ++i)
+      c->outputs[i] = output_from_json(arr[i]);
+  }
+  if (j.contains("names")) {
+    const auto v = j.at("names").get<std::vector<std::string>>();
+    for (size_t i = 0; i < v.size() && i < c->names.size(); ++i) c->names[i] = v[i];
+  }
+}
+
+}  // namespace
+
 void apply_output(const OutputConfig& o, OutputControl& oc) {
   SourceType type = SourceType::Silence;
   uint8_t index = 0;
   if (o.source_type == "input") {
     type = SourceType::Input;
     index = static_cast<uint8_t>(std::clamp(std::atoi(o.source_index.c_str()), 0,
-                                            static_cast<int>(kTotalInputs) - 1));
+                                            static_cast<int>(kMaxInputs) - 1));
   } else if (o.source_type == "gen") {
     GenId g = GenId::Sine;
     if (parse_gen(o.source_index, &g)) {
@@ -87,67 +116,12 @@ OutputConfig output_from_control(const OutputControl& oc) {
   return c;
 }
 
-// One of the SoC's own outputs. Only HDMI carries a layout; the line out is stereo whatever a
-// hand-edited file says.
-json soc_to_json(const SocConfig& c, bool layouts) {
-  json outs = json::array();
-  for (const auto& o : c.outputs) outs.push_back(output_to_json(o));
-  json j{{"enabled", c.enabled}, {"device", c.device}, {"sample_rate", c.sample_rate}};
-  if (layouts) j["layout"] = c.layout;
-  j["outputs"] = outs;
-  j["names"] = c.names;
-  return j;
-}
-
-void soc_from_json(const json& j, bool layouts, SocConfig* c) {
-  c->enabled = j.value("enabled", c->enabled);
-  c->device = j.value("device", c->device);
-  c->sample_rate = j.value("sample_rate", c->sample_rate);
-  if (layouts) c->layout = j.value("layout", c->layout);
-  if (j.contains("outputs")) {
-    const auto& arr = j.at("outputs");
-    for (size_t i = 0; i < arr.size() && i < c->outputs.size(); ++i)
-      c->outputs[i] = output_from_json(arr[i]);
-  }
-  if (j.contains("names")) c->names = j.at("names").get<std::vector<std::string>>();
-}
-
-// Not clamped: a layout that does not exist is stereo, and a rate the sink cannot use — at all, or
-// for this layout — falls back to the one every sink accepts.
-void soc_sanitise(SocConfig* c) {
-  c->names.resize(c->outputs.size());
-  HdmiLayout layout = kHdmiLayoutDefault;
-  if (!parse_hdmi_layout(c->layout, &layout)) c->layout = hdmi_layout_name(layout);
-  if (!soc_rate_ok(c->sample_rate) || !hdmi_layout_rate_ok(layout, c->sample_rate))
-    c->sample_rate = kSocRateDefault;
-}
-
-void apply_soc(const SocConfig& c, bool layouts, OutputControl* outs, SocControl& sc) {
-  for (size_t i = 0; i < c.outputs.size(); ++i) apply_output(c.outputs[i], outs[i]);
-  sc.enabled.store(c.enabled);
-  HdmiLayout layout = kHdmiLayoutDefault;
-  if (layouts) parse_hdmi_layout(c.layout, &layout);
-  sc.layout.store(static_cast<uint8_t>(layout));
-}
-
-void soc_from_control(const OutputControl* outs, const SocControl& sc, SocConfig* c) {
-  for (size_t i = 0; i < c->outputs.size(); ++i) c->outputs[i] = output_from_control(outs[i]);
-  c->enabled = sc.enabled.load();
-  c->layout = hdmi_layout_name(soc_layout(sc, static_cast<unsigned>(c->outputs.size())));
-}
-
-}  // namespace
-
 std::string Config::to_json() const {
+  const unsigned total = channels().total();
   json j;
-  j["rate"] = rate;
-  j["period"] = period;
-  j["periods"] = periods;
-  j["device"] = device;
-  j["capture_channels"] = capture_channels;
-
   j["inputs"] = json::array();
-  for (const auto& i : inputs) j["inputs"].push_back({{"gain_db", i.gain_db}, {"mute", i.mute}});
+  for (unsigned c = 0; c < total; ++c)
+    j["inputs"].push_back({{"gain_db", inputs[c].gain_db}, {"mute", inputs[c].mute}});
 
   j["outputs"] = json::array();
   for (const auto& o : outputs) j["outputs"].push_back(output_to_json(o));
@@ -160,13 +134,14 @@ std::string Config::to_json() const {
 
   j["input_map"] = input_map;
   j["output_map"] = output_map;
-  j["input_names"] = input_names;
+  j["input_names"] =
+      std::vector<std::string>(input_names.begin(), input_names.begin() + total);
   j["output_names"] = output_names;
   j["loopback_offset_samples"] = loopback_offset_samples;
   j["listen"] = {{"codec", listen_codec}, {"bitrate_kbps", listen_bitrate_kbps}};
   j["net"] = {{"enabled", net_enabled}, {"port", net_port}, {"delay_ms", net_delay_ms}};
-  j["hdmi"] = soc_to_json(hdmi, true);
-  j["lineout"] = soc_to_json(lineout, false);
+  j["sinks"] = json::object();
+  for (const auto& [id, sc] : sinks) j["sinks"][id] = sink_to_json(sc);
   return j.dump(2);
 }
 
@@ -174,15 +149,9 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
   Config c;
   try {
     const json j = json::parse(text);
-    c.rate = j.value("rate", c.rate);
-    c.period = j.value("period", c.period);
-    c.periods = j.value("periods", c.periods);
-    c.device = j.value("device", c.device);
-    c.capture_channels = j.value("capture_channels", c.capture_channels);
-
     if (j.contains("inputs")) {
       const auto& arr = j.at("inputs");
-      for (size_t i = 0; i < arr.size() && i < kTotalInputs; ++i) {
+      for (size_t i = 0; i < arr.size() && i < kMaxInputs; ++i) {
         c.inputs[i].gain_db = arr[i].value("gain_db", 0.0f);
         c.inputs[i].mute = arr[i].value("mute", false);
       }
@@ -232,31 +201,37 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
       c.listen_codec = j["listen"].value("codec", c.listen_codec);
       c.listen_bitrate_kbps = j["listen"].value("bitrate_kbps", c.listen_bitrate_kbps);
     }
-    if (j.contains("hdmi")) soc_from_json(j.at("hdmi"), true, &c.hdmi);
-    if (j.contains("lineout")) soc_from_json(j.at("lineout"), false, &c.lineout);
+    if (j.contains("sinks")) {
+      for (const auto& [id, sj] : j.at("sinks").items()) sink_from_json(sj, &c.sinks[id]);
+    }
+    // Before sinks were found at runtime, the Pi's two had keys of their own and named their
+    // device. Read into the sink of that device, unless the file also has it under "sinks".
+    for (const char* key : {"hdmi", "lineout"}) {
+      if (!j.contains(key)) continue;
+      const json& sj = j.at(key);
+      const std::string id = pcm_device_id(sj.value("device", std::string()));
+      if (id.empty() || c.sinks.count(id)) continue;
+      sink_from_json(sj, &c.sinks[id]);
+    }
   } catch (const std::exception& e) {
     if (err) *err = e.what();
     return false;
   }
 
-  c.input_names.resize(kTotalInputs);
+  c.input_names.resize(kMaxInputs);
   c.output_names.resize(kOutputs);
-  soc_sanitise(&c.hdmi);
-  soc_sanitise(&c.lineout);
   *out = c;
   return true;
 }
 
-void Config::apply_to(Control& ctl) const {
-  for (unsigned i = 0; i < kTotalInputs; ++i) {
+void Config::apply_to(Control& ctl, unsigned rate) const {
+  for (unsigned i = 0; i < kMaxInputs; ++i) {
     ctl.inputs[i].gain_db.store(
-        std::clamp(inputs[i].gain_db, input_gain_min_db(i), kInputGainMaxDb));
+        std::clamp(inputs[i].gain_db, channels().gain_min_db(i), kInputGainMaxDb));
     ctl.inputs[i].mute.store(inputs[i].mute);
   }
 
   for (unsigned i = 0; i < kOutputs; ++i) apply_output(outputs[i], ctl.outputs[i]);
-  apply_soc(hdmi, true, ctl.hdmi_outputs.data(), ctl.hdmi);
-  apply_soc(lineout, false, ctl.lineout_outputs.data(), ctl.lineout);
 
   ctl.sine.freq_hz.store(std::clamp(sine_freq_hz, kSineFreqMinHz, kSineFreqMaxHz));
   ctl.sine.level_db.store(std::clamp(sine_level_db, kLevelMinDb, kLevelMaxDb));
@@ -308,14 +283,12 @@ void Config::apply_to(Control& ctl) const {
 
 Config Config::from_control(const Control& ctl, const Config& base) {
   Config c = base;
-  for (unsigned i = 0; i < kTotalInputs; ++i) {
+  for (unsigned i = 0; i < kMaxInputs; ++i) {
     c.inputs[i].gain_db = ctl.inputs[i].gain_db.load();
     c.inputs[i].mute = ctl.inputs[i].mute.load();
   }
 
   for (unsigned i = 0; i < kOutputs; ++i) c.outputs[i] = output_from_control(ctl.outputs[i]);
-  soc_from_control(ctl.hdmi_outputs.data(), ctl.hdmi, &c.hdmi);
-  soc_from_control(ctl.lineout_outputs.data(), ctl.lineout, &c.lineout);
 
   c.sine_freq_hz = ctl.sine.freq_hz.load();
   c.sine_level_db = ctl.sine.level_db.load();

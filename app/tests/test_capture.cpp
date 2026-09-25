@@ -6,6 +6,7 @@
 #include <random>
 #include <vector>
 
+#include "channel_layout.h"
 #include "check.h"
 #include "constants.h"
 #include "rates.h"
@@ -61,14 +62,14 @@ void fill_with_delayed_copy(RingBuffer& ring, int64_t delay, uint64_t frames, St
       src[i] = 0.5f * static_cast<float>(std::sin(2 * kPi * 440.0 * (i / rate)));
   }
 
-  std::vector<float> block(kPeriod * kTotalInputs);
+  std::vector<float> block(kPeriod * st::channels().total());
   for (uint64_t n = 0; n < frames; n += kPeriod) {
     for (unsigned i = 0; i < kPeriod; ++i) {
       const uint64_t t = n + i;
-      for (unsigned c = 0; c < kTotalInputs; ++c) block[i * kTotalInputs + c] = floor_noise(rng);
-      block[i * kTotalInputs + 0] += src[t + 4096];
+      for (unsigned c = 0; c < st::channels().total(); ++c) block[i * st::channels().total() + c] = floor_noise(rng);
+      block[i * st::channels().total() + 0] += src[t + 4096];
       const int64_t td = static_cast<int64_t>(t) + 4096 - delay;
-      if (td >= 0 && td < static_cast<int64_t>(src.size())) block[i * kTotalInputs + 1] += src[td];
+      if (td >= 0 && td < static_cast<int64_t>(src.size())) block[i * st::channels().total() + 1] += src[td];
     }
     ring.write(block.data(), kPeriod);
   }
@@ -76,7 +77,7 @@ void fill_with_delayed_copy(RingBuffer& ring, int64_t delay, uint64_t frames, St
 
 void test_xcorr_recovers_a_known_delay(double rate) {
   for (int64_t delay : {0, 137, 4321, -960}) {
-    RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+    RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
     CaptureStore cap(ring, rate, kPeriod);
     fill_with_delayed_copy(ring, delay, 400000, Stimulus::Broadband, rate);
 
@@ -105,7 +106,7 @@ void test_xcorr_recovers_a_known_delay(double rate) {
 // known modulo the interval. The lag still comes out right, but the confidence must drop
 // to say so.
 void test_xcorr_reports_low_confidence_on_a_periodic_stimulus(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
   fill_with_delayed_copy(ring, 500, 400000, Stimulus::PingTrain, rate);
 
@@ -135,7 +136,7 @@ void test_xcorr_reports_low_confidence_on_a_periodic_stimulus(double rate) {
 // — with the carrier's own oscillation never counted as a rival.
 void test_xcorr_ringing_tone_single_burst_is_confident(double rate) {
   for (int64_t delay : {137, -960}) {
-    RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+    RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
     CaptureStore cap(ring, rate, kPeriod);
     fill_with_delayed_copy(ring, delay, 400000, Stimulus::BongSingle, rate);
 
@@ -153,7 +154,7 @@ void test_xcorr_ringing_tone_single_burst_is_confident(double rate) {
 }
 
 void test_xcorr_ringing_tone_train_stays_on_the_true_interval(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
   fill_with_delayed_copy(ring, 527, 400000, Stimulus::BongTrain, rate);
 
@@ -176,7 +177,7 @@ void test_xcorr_ringing_tone_train_stays_on_the_true_interval(double rate) {
 // must never bless it. (The envelope alone can't catch this — a CW tone's envelope is one
 // window-wide lobe with no rivals — hence the runner-up-crest cap.)
 void test_xcorr_never_blesses_a_continuous_tone(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
   fill_with_delayed_copy(ring, 137, 400000, Stimulus::ContinuousSine, rate);
 
@@ -191,7 +192,7 @@ void test_xcorr_never_blesses_a_continuous_tone(double rate) {
 }
 
 void test_xcorr_needs_a_freeze(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
   fill_with_delayed_copy(ring, 100, 200000, Stimulus::Broadband, rate);
 
@@ -201,7 +202,7 @@ void test_xcorr_needs_a_freeze(double rate) {
 }
 
 void test_window_returns_raw_and_columns(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
   fill_with_delayed_copy(ring, 0, 200000, Stimulus::Broadband, rate);
   const CaptureStatus cs = cap.freeze(0);
@@ -221,7 +222,7 @@ void test_window_returns_raw_and_columns(double rate) {
 }
 
 void test_analyze_length_is_configurable(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
 
   // Default: a modest fixed window (kCaptureDefaultSeconds), capped at the maximum.
@@ -258,18 +259,18 @@ void test_analyze_length_is_configurable(double rate) {
 // The analyze length is the snapshot's *allocation*, not just its copy length: the console
 // tells the operator that a longer buffer costs RAM, and on a 1 GB Pi that has to be true.
 void test_analyze_length_drives_the_allocation(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
 
   const uint64_t at_default = cap.pinned_bytes();
-  CHECK_EQ(at_default, cap.analyze_frames() * kTotalInputs * sizeof(float));
+  CHECK_EQ(at_default, cap.analyze_frames() * st::channels().total() * sizeof(float));
   // Nowhere near the ceiling, which is what used to be pinned unconditionally.
-  CHECK(at_default < cap.max_frames() * kTotalInputs * sizeof(float) / 2);
+  CHECK(at_default < cap.max_frames() * st::channels().total() * sizeof(float) / 2);
 
   CHECK(cap.set_analyze_frames(static_cast<uint64_t>(5 * rate)));
   const uint64_t at_five = cap.pinned_bytes();
   CHECK(at_five < at_default);
-  CHECK_EQ(at_five, cap.analyze_frames() * kTotalInputs * sizeof(float));
+  CHECK_EQ(at_five, cap.analyze_frames() * st::channels().total() * sizeof(float));
 
   CHECK(cap.set_analyze_frames(static_cast<uint64_t>(40 * rate)));
   CHECK(cap.pinned_bytes() > at_five);
@@ -277,7 +278,7 @@ void test_analyze_length_drives_the_allocation(double rate) {
 
 // A resize while frozen must not pull the snapshot out from under an in-flight measurement.
 void test_resize_while_frozen_is_deferred(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
   fill_with_delayed_copy(ring, 137, 400000, Stimulus::PingTrain, rate);
 
@@ -297,25 +298,25 @@ void test_resize_while_frozen_is_deferred(double rate) {
   cap.resume();
   CHECK(!cap.status().frozen);
   CHECK(cap.pinned_bytes() < pinned_before);
-  CHECK_EQ(cap.pinned_bytes(), static_cast<uint64_t>(2 * rate) * kTotalInputs * sizeof(float));
+  CHECK_EQ(cap.pinned_bytes(), static_cast<uint64_t>(2 * rate) * st::channels().total() * sizeof(float));
 }
 
 // A freeze may never copy more frames than the buffer holds, however the two got out of step.
 void test_freeze_never_overruns_the_snapshot(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
   CHECK(cap.set_analyze_frames(static_cast<uint64_t>(1 * rate)));
   fill_with_delayed_copy(ring, 0, 400000, Stimulus::Broadband, rate);
 
   const CaptureStatus cs = cap.freeze(0);
   CHECK(cs.frozen);
-  CHECK(cs.valid_len <= cap.pinned_bytes() / (kTotalInputs * sizeof(float)));
+  CHECK(cs.valid_len <= cap.pinned_bytes() / (st::channels().total() * sizeof(float)));
   const WindowResult w = cap.window(0, cs.valid_start, 1024, 512);
   CHECK(w.ok);
 }
 
 void test_window_rejects_out_of_range(double rate) {
-  RingBuffer ring(kRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
   fill_with_delayed_copy(ring, 0, 200000, Stimulus::Broadband, rate);
   const CaptureStatus cs = cap.freeze(0);

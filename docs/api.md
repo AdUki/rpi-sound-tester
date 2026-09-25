@@ -1,14 +1,25 @@
 # HTTP API
 
 Base URL: `http://soundtester.local` (port 80 on the device; `--port` elsewhere). All bodies are
-JSON except the audio streams. Inputs are 0–11, outputs 0–7 (the UI labels them IN 1–6, NET 1–6
-and OUT 1–8). Inputs 0–5 are the card's ADCs; 6–11 are **network inputs** fed over the LAN, and
-everything that takes an input index takes those too. `GET /api/state` reports each input's `kind`
-as `local` or `net`, and `limits.inputs_local` says where the split is. Each input also carries
-`active`: a network channel reads `false` until a sender has used it, which is how the console
-keeps unused ones out of sight. The channel exists either way — the index is fixed, and the arrays
-in the meters, spectrum and envelope messages always carry every channel — so a headless client
-can ignore `active` entirely.
+JSON except the audio streams.
+
+How many inputs and outputs there are depends on the board. The **engine card** paces everything:
+on a Pi it is the Octo, whose 6 ADCs are inputs 0–5 (IN 1–6) and whose 8 DACs are outputs 0–7
+(OUT 1–8). A board without one (the Khadas VIM3L) has a timer for a clock and no inputs or outputs
+of its own. After the engine card's inputs come the 6 **network inputs** fed over the LAN (NET 1–6:
+inputs 6–11 on a Pi, 0–5 on a VIM3L), then the **device inputs**: columns kept for capture devices
+the daemon finds at runtime, a USB interface's inputs or the VIM3L's HDMI loopback (2 on a Pi, 4
+on a VIM3L; board.json's `device_inputs`). Everything that takes an input index takes all of them.
+`limits.inputs_local`, `limits.inputs_device`, `limits.inputs_total` and `limits.outputs` give the
+counts; each input in `GET /api/state` has a `kind` (`local`, `net` or `device`) and the `label` the
+console shows ("HDMI loopback L"). Each input also carries `active`: a network channel reads
+`false` until a sender has used it, a device input until a device is on it, which is how the
+console keeps unused ones out of sight. The channel exists either way — the index is fixed for the
+life of the daemon, and the arrays in the meters, spectrum and envelope messages always carry every
+channel — so a headless client can ignore `active` entirely.
+
+Every other playback device is a **sink** (HDMI, a Pi's 3.5 mm jack, a USB interface), found at
+runtime: see Sinks below.
 
 Every PUT field is optional — send only what changes. Out-of-range numbers clamp to their limits;
 bad enums and non-permutation maps are rejected.
@@ -19,14 +30,16 @@ This document, rendered to HTML (built from `api.md`). Also served as the static
 ## State
 
 ### `GET /api/state`
-The whole device state in one object: `inputs`, `outputs`, `hdmi`, `lineout`, `generators`,
+The whole device state in one object: `inputs`, `outputs`, `sinks`, `sources`, `devices`, `generators`,
 `channel_map`, `capture`, `engine`, `system`, and `limits` (slider ranges and feature flags the
-console reads).
+console reads). `engine.backend` is `card` (the engine card), `timer` (a board without one) or
+`simulator`. `limits.channel_map` and `limits.sync_watch` are `false` without an engine card: the
+TDM slot map and the I2S sync watch are the Octo's.
 Each input and output has a `name`, set only in `config.json` — there is no API to change it.
 
 ## Inputs
 
-### `PUT /api/inputs/{0-11}`
+### `PUT /api/inputs/{ch}`
 ```json
 {"gain_db": 12.0, "mute": false}
 ```
@@ -45,13 +58,14 @@ kept and applies again afterwards.
 ## Routing and outputs
 
 ### `PUT /api/outputs/{0-7}`
+The engine card's outputs; 404 on a board without one.
 ```json
 {"source": {"type": "input", "index": 3}, "gain_db": -6.0, "mute": false}
 {"source": {"type": "gen", "index": "ping"}}
 {"source": {"type": "silence"}}
 ```
-`type` is `silence` | `input` | `gen`. `index` is 0–11 for `input` — a network channel routes like
-any other — or `sine` | `noise` | `ping` | `music` for `gen`. `gain_db` clamps to −60…0.
+`type` is `silence` | `input` | `gen`. `index` is any input for `input` — a network channel routes
+like any other — or `sine` | `noise` | `ping` | `music` for `gen`. `gain_db` clamps to −60…0.
 
 ### `POST /api/outputs/{0-7}/identify`
 Three 100 ms beeps on that output only, then it reverts. Tells you which physical socket it is.
@@ -62,69 +76,101 @@ Three 100 ms beeps on that output only, then it reverts. Tells you which physica
 ```
 `input_map[logical]` = the TDM slot to capture from; `output_map[logical]` = the slot to play into.
 This corrects the Octo's slot rotation. Each map must be a permutation (in range, no duplicates) or
-the request is rejected.
+the request is rejected. 404 on a board without an engine card.
 
-## HDMI output
+## Sinks
 
-The Pi's own HDMI audio, as a mono, stereo, 5.1 or 7.1 sink beside the eight DACs. It plays the
-same sources at the same sample index as the DACs, rendered by the same code, so a ping routed to
-HDMI is logged and measured like any other. HDMI runs on the Pi's clock rather than the card's; a
-sample-rate converter follows the drift and holds the path's latency constant.
+Every playback device other than the engine card: HDMI, a Pi's 3.5 mm jack, a USB interface. The
+daemon asks ALSA for its devices at startup and every 2 s after, so one plugged in later appears on
+its own; nothing about a board's devices is compiled in. Each sink plays the same sources at the
+same sample index as the engine card's outputs, rendered by the same code, so a ping routed to it
+is logged and measured like any other. A sink runs on its device's clock rather than the engine's;
+a sample-rate converter follows the drift and holds the path's latency constant.
 
-### `PUT /api/hdmi/{0-7}` · `POST /api/hdmi/{0-7}/identify`
-Exactly as `PUT /api/outputs/{0-7}` and its identify, indexed by **speaker**: 0 L, 1 R, 2 C,
-3 LFE, 4 Ls, 5 Rs (surround; the side pair in 7.1), 6 Lb, 7 Rb (back, 7.1 only). Mono plays
-speaker 0. All eight keep their routing whatever the layout, so L stays L across layouts.
+A sink is named by its **device id**, `<card id>,<device>` as ALSA names them (`b1,0`, `Headphones,0`,
+`G12BKHADASVIM3L,0`, `Device,0` for a USB class device). Card ids do not change with probe order or
+USB port, so the id, the routing saved under it and the sink's place in `sinks` stay the same
+across reboots and replugs. A device that is unplugged keeps its sink (`present: false`), and plays
+again with the same routing when it comes back.
 
-### `GET /api/hdmi`
+### `GET /api/sinks` · `GET /api/sinks/{id}`
 ```json
-{"enabled": true, "open": true, "playing": true, "device": "hw:b1,0", "sample_rate": 48000,
- "device_rate": 48000, "layout": "stereo", "speakers": 2, "device_channels": 2,
- "latency_ms": 112.0, "target_ms": 112.0, "ring_ms": 27.4, "alsa_ms": 84.6, "trim_ppm": -1.2,
+{"id": "b1,0", "label": "HDMI", "hdmi": true, "usb": false, "present": true,
+ "layouts": ["mono", "stereo", "5.1", "7.1"], "rates": [32000, 44100, 48000, 96000],
+ "enabled": true, "open": true, "playing": true, "device": "hw:CARD=b1,DEV=0",
+ "sample_rate": 48000, "device_rate": 48000, "layout": "stereo", "speakers": 2,
+ "device_channels": 2, "format": "S16_LE", "latency_ms": 112.0, "target_ms": 112.0,
+ "ring_ms": 27.4, "alsa_ms": 84.6, "trim_ppm": -1.2,
  "xruns": 0, "underruns": 0, "overruns": 0, "resyncs": 0, "error": "",
  "outputs": [{"ch": 0, "position": "L", "slot": 0, "source": {"type": "gen", "index": "music"},
               "gain_db": 0, "mute": false}]}
 ```
-`latency_ms` is engine to HDMI driver, averaged, and it is held at `target_ms`. It leaves out the
-Pi firmware and the TV or receiver. Both are constant, so measure them once. Route a `tick` to
-HDMI, feed an HDMI audio extractor into an input, and run `genie/sync` against a DAC looped into
-another input. Keep the ping interval at 1 s or more, so each window holds exactly one arrival.
-`resyncs` counts re-anchors; each is a latency step. `error` says why a device will not open.
-`outputs` lists the layout's speakers, each with the PCM `slot` it is sent in.
+`latency_ms` is engine to driver, averaged, and it is held at `target_ms`. It leaves out the driver's
+own pipeline and the TV, receiver or interface. Both are constant, so measure them once: route a
+`tick` to the sink, bring it back into an input (an HDMI audio extractor, a loopback cable), and run
+`genie/sync` against a reference. Keep the ping interval at 1 s or more, so each window holds
+exactly one arrival. `resyncs` counts re-anchors; each is a latency step. `error` says why a device
+will not open. `outputs` lists the layout's channels, each with the PCM `slot` it is sent in.
+`format` is what the PCM opened in: the first of S16_LE, S32_LE, S24_3LE and S24_LE it takes.
 
-### `PUT /api/hdmi`
+### `PUT /api/sinks/{id}`
 ```json
-{"enabled": true, "device": "hw:b1,0", "sample_rate": 48000, "layout": "5.1"}
+{"enabled": true, "sample_rate": 48000, "layout": "5.1"}
 ```
-`layout` is `mono` | `stereo` | `5.1` | `7.1`. The Pi's HDMI driver tells the sink only a channel
-count, and the sink picks the speakers from it. Only these four counts map to one layout each.
-Four channels, for example, could be quad or 3.1, so it isn't offered. Mono is sent on both L
-and R of a stereo stream (`device_channels` 2). 5.1 and 7.1 need a `sample_rate` of 48000 or
-less: the Pi carries more than two HDMI channels only up to 48 kHz.
-`sample_rate` is 32000, 44100, 48000, 88200, 96000, 176400 or 192000. Use 48000 unless you know
-the sink takes more: the driver accepts any rate whether or not the TV can play it. The image
-names the device `hw:b1,0` (`snd_bcm2835.enable_compat_alsa=0`). Without that kernel option it is
-`hw:ALSA,1`. A new device, rate or layout restarts the HDMI output only; the DACs are never
-touched. HDMI is off by default, and `soundtesterd --hdmi-device DEV` turns it on at start.
+`layout` is one of the sink's `layouts`. An **HDMI** sink (a driver that names itself HDMI, or one
+board.json marks) offers `mono` | `stereo` | `5.1` | `7.1`, in HDMI's own slot order (CEA-861: FL FR
+LFE FC …). HDMI drivers tell the sink only a channel count, and the sink picks the speakers from it;
+only these four counts map to one layout each. Four channels, for example, could be quad or 3.1, so
+it isn't offered. Mono is sent on both L and R of a stereo stream (`device_channels` 2). 5.1 and 7.1
+need a `sample_rate` of 48000 or less: the Pi carries more than two HDMI channels only up to 48 kHz.
+Any other sink offers `stereo` and its own channel count (`6ch`, `8ch`), in the device's own order.
+`sample_rate` is one of the sink's `rates`: those of 32000, 44100, 48000, 88200, 96000, 176400 and
+192000 the device accepts. Use 48000 unless you know the sink takes more: an HDMI driver accepts any
+rate whether or not the TV can play it. A new rate or layout restarts that sink only; the engine is
+never touched. Sinks are off until switched on here, and a save keeps them on.
 
-## Line out
+### `PUT /api/sinks/{id}/{ch}` · `POST /api/sinks/{id}/{ch}/identify`
+Exactly as `PUT /api/outputs/{0-7}` and its identify, indexed by channel: on HDMI by **speaker**,
+0 L, 1 R, 2 C, 3 LFE, 4 Ls, 5 Rs (surround; the side pair in 7.1), 6 Lb, 7 Rb (back, 7.1 only),
+mono playing speaker 0; elsewhere the device's channels. All eight keep their routing whatever the
+layout, so L stays L across layouts.
 
-The Pi's own 3.5 mm jack, as a stereo sink. It works exactly like the HDMI output: same sources,
-same sample index, and its own converter holding its own latency constant. It has L and R only
-and no `layout`.
+## Device inputs
 
-### `PUT /api/lineout/{0-1}` · `POST /api/lineout/{0-1}/identify`
-Exactly as `PUT /api/outputs/{0-7}` and its identify: 0 is L, 1 is R.
+Every capture device other than the engine card: a USB interface's inputs, the VIM3L's HDMI
+loopback. Found like the sinks, each takes two adjacent device-input columns (one if it is mono, more
+if it cannot do two) and keeps them for the life of the daemon, so an input unplugged and plugged
+back in comes back on the same inputs. It is captured on its own clock, and a sample-rate converter
+places every frame at the sample index of the instant it was captured, so a sound heard by the
+engine card and by a USB microphone lands on the same index in both, to about a millisecond and a
+constant the device adds (its own ADC and USB latency: calibrate it once).
 
-### `GET /api/lineout` · `PUT /api/lineout`
+For that, the capture axis is held back while any device input is bound: `net.delay_ms`, but at
+least 150 ms. Every input in the ring is delayed alike, so nothing measured between two inputs
+changes, and the ping log accounts for it. A device input routed to an output is heard that much
+later too; it has no undelayed copy to pass through.
+
+### `GET /api/sources`
 ```json
-{"enabled": true, "device": "hw:Headphones,0", "sample_rate": 48000}
+[{"id": "Device,0", "label": "USB Advanced Audio Device", "first": 8, "channels": 2,
+  "present": true, "open": true, "capturing": true, "device": "hw:CARD=Device,DEV=0",
+  "device_rate": 48000, "format": "S16_LE", "trim_ppm": 13.0,
+  "xruns": 0, "resyncs": 0, "late": 0, "error": ""}]
 ```
-The status has the same fields as `GET /api/hdmi`, with `layout` always `stereo`. A `layout`
-other than `stereo` is rejected. The image names the device `hw:Headphones,0`; without
-`snd_bcm2835.enable_compat_alsa=0` it is `hw:ALSA,0`. `latency_ms` leaves out the firmware, so
-calibrate it once by looping the jack into an input. Off by default;
-`soundtesterd --lineout-device DEV` turns it on at start.
+`first` is its first input index. `late` counts blocks that arrived after the ring had read past
+them (their audio is lost, not moved). Also in `GET /api/state` as `sources`.
+
+### `GET /api/devices`
+Every PCM device ALSA has, as `aplay -l` and `arecord -l` list them, and what the daemon does with it:
+```json
+[{"id": "Device,0", "alsa": "hw:CARD=Device,DEV=0", "card": "Device",
+  "card_name": "USB Advanced Audio Device", "name": "USB Audio", "label": "USB Advanced Audio Device",
+  "playback": true, "capture": true, "usb": true, "engine": false, "hidden": false,
+  "sink": 1, "input": 8, "input_channels": 2, "note": ""}]
+```
+`engine` marks the engine card's own; `hidden` one board.json says the board wires to nothing.
+`sink` is the sink slot its playback is on and `input` the first input its capture is on, -1 for
+none; `note` says why one it could be is not (`no free sink slot`, `no free input columns`).
 
 ## Generators
 
@@ -474,7 +520,7 @@ can threshold by frequency directly. `?ch=0..5` for one input; omit for all six.
 | 10 Hz | `{"type":"meters","sample":…,"rms_db":[6],"peak_db":[6]}` |
 | 5 Hz | `{"type":"spectrum","channels":[{"ch":0,"bins":[240],"tone":{…}}]}` |
 | 10 Hz | binary envelope frame (below) |
-| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"cpu_pct":…,"temp_c":…,"hdmi":{…},"lineout":{…},…}` |
+| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"cpu_pct":…,"temp_c":…,"sinks":[{"id":…,"present":…,"enabled":…,"playing":…,"layout":…,"latency_ms":…,…}],"sources":[{"id":…,"first":…,"channels":…,"present":…,"capturing":…,"error":…}],…}` |
 
 Spectrum bins are quantised to 0.1 dB on the WS to save bandwidth; the GET gives full float precision.
 
@@ -491,7 +537,7 @@ frame). Global, last-writer-wins; resets to all-on at restart.
 ## System
 
 ### `POST /api/config/save`
-Writes routing (HDMI and line out included), generators and channel map to `/data/config.json` — the only
+Writes routing (every sink's included, by device id), generators and channel map to `/data/config.json` — the only
 state that survives a reboot. `/data` is remounted read-write for the write, then back. If `/data` did not mount the save
 is refused (`data_persistent: false` in `/api/state`).
 

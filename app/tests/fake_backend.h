@@ -37,8 +37,7 @@ inline int32_t fake_capture_code(uint64_t t, unsigned slot) {
 class FakeBackend final : public AudioBackend {
  public:
   explicit FakeBackend(const Control& ctl, unsigned capture_channels = kTdmSlots,
-                       unsigned period = rpi3_octo_profile().clock.period,
-                       unsigned rate = rpi3_octo_profile().clock.rate)
+                       unsigned period = 1024, unsigned rate = 96000)
       : ctl_(ctl), cap_ch_(capture_channels), period_(period), rate_(rate) {}
 
   bool open() override {

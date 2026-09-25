@@ -1,6 +1,7 @@
-SUMMARY = "Multichannel audio test appliance daemon (Audio Injector Octo)"
-DESCRIPTION = "Full-duplex 6-in/8-out audio engine with a web admin console: routing, \
-signal generators, spectrum/THD+N analysis and sample-accurate multiroom delay measurement."
+SUMMARY = "Multichannel audio test appliance daemon"
+DESCRIPTION = "Audio engine with a web admin console: routing, signal generators, \
+spectrum/THD+N analysis and sample-accurate multiroom delay measurement, on the board's engine \
+card (the Audio Injector Octo on a Pi) and every other sound card it finds."
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
@@ -43,9 +44,13 @@ do_configure:prepend() {
     rm -rf ${S}/build ${S}/build-vec
 }
 
+# Which app/config/boards/<board>.json becomes /etc/soundtester/board.json: set per board by the
+# Makefile's auto.conf, from yocto/boards/<board>.mk's PROFILE.
+SOUNDTESTER_BOARD ??= "rpi3-octo"
+
 # Release only; the NEON float-vectorization flag for 32-bit ARM is auto-detected in
 # app/CMakeLists.txt (ST_UNSAFE_MATH defaults on for arm32).
-EXTRA_OECMAKE = "-DCMAKE_BUILD_TYPE=Release"
+EXTRA_OECMAKE = "-DCMAKE_BUILD_TYPE=Release -DST_BOARD=${SOUNDTESTER_BOARD}"
 
 # Defaulted here, not only in the .sample: soundtester-device.conf is untracked and every copy
 # created before network input existed lacks this. Without a default the sed below would write
@@ -60,15 +65,14 @@ do_install:append() {
         > ${D}${systemd_system_unitdir}/soundtesterd.service
     chmod 0644 ${D}${systemd_system_unitdir}/soundtesterd.service
 
-    # The engine opens the card with whatever rate/period config.json says, so patch the
-    # shipped config to match the image settings (the board conf's). A config without the keys
-    # would ship the daemon's compiled-in 96 kHz whatever the board says, so refuse it.
-    grep -q '"rate": *[0-9]' ${D}${sysconfdir}/soundtester/config.json && \
-        grep -q '"period": *[0-9]' ${D}${sysconfdir}/soundtester/config.json || \
-        bbfatal "config.json has no \"rate\"/\"period\" to set to ${SOUNDTESTER_RATE}/${SOUNDTESTER_PERIOD}"
+    # The engine runs at whatever rate/period board.json says, so patch the shipped one to match
+    # the image settings (the board conf's). A board file without the keys would ship the
+    # daemon's compiled-in 48 kHz whatever the board says, so refuse it.
+    board=${D}${sysconfdir}/soundtester/board.json
+    grep -q '"rate": *[0-9]' $board && grep -q '"period": *[0-9]' $board || \
+        bbfatal "board.json has no \"rate\"/\"period\" to set to ${SOUNDTESTER_RATE}/${SOUNDTESTER_PERIOD}"
     sed -i -e 's|"rate": *[0-9]*|"rate": ${SOUNDTESTER_RATE}|' \
-           -e 's|"period": *[0-9]*|"period": ${SOUNDTESTER_PERIOD}|' \
-           ${D}${sysconfdir}/soundtester/config.json
+           -e 's|"period": *[0-9]*|"period": ${SOUNDTESTER_PERIOD}|' $board
 }
 
 FILES:${PN} += " \
@@ -78,3 +82,4 @@ FILES:${PN} += " \
 "
 
 do_install[vardeps] += "SOUNDTESTER_HTTP_PORT SOUNDTESTER_NET_PORT SOUNDTESTER_RATE SOUNDTESTER_PERIOD"
+do_configure[vardeps] += "SOUNDTESTER_BOARD"

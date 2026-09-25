@@ -3,6 +3,7 @@
 #include <cmath>
 #include <vector>
 
+#include "channel_layout.h"
 #include "check.h"
 #include "constants.h"
 #include "rates.h"
@@ -21,12 +22,12 @@ std::vector<float> ramp(size_t n, float base) {
   return v;
 }
 
-// Reads one channel back out of a kTotalInputs-interleaved block.
+// Reads one channel back out of a st::channels().total()-interleaved block.
 std::vector<float> read_one(NetTimeline& t, uint64_t at, size_t n, bool clear = true) {
-  std::vector<float> block(n * kTotalInputs, -1.0f);
-  t.read(at, n, block.data(), kTotalInputs, clear);
+  std::vector<float> block(n * st::channels().total(), -1.0f);
+  t.read(at, n, block.data(), st::channels().total(), clear);
   std::vector<float> out(n);
-  for (size_t i = 0; i < n; ++i) out[i] = block[i * kTotalInputs];
+  for (size_t i = 0; i < n; ++i) out[i] = block[i * st::channels().total()];
   return out;
 }
 

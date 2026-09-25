@@ -1,4 +1,5 @@
 #include "net_audio.h"
+#include "channel_layout.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -350,7 +351,7 @@ void NetAudioServer::release_channels(unsigned base, unsigned count) {
     c.resyncs.store(0);
     c.lead_valid.store(false);
     // The bypass went with the stream; the channel is ordinary again, and its gain applies.
-    ctl_.inputs[kInputs + base + i].bypass.store(false);
+    ctl_.inputs[st::channels().net_base() + base + i].bypass.store(false);
     {
       std::lock_guard<std::mutex> lock(c.m);
       c.last_device = c.device_locked();  // remembered for the console and for the next claim
@@ -465,7 +466,7 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
         c.timeline.reset();
         // Mixable until this stream's FORMAT says otherwise; the last holder may have declared
         // the opposite.
-        srv.ctl_.inputs[kInputs + base + i].bypass.store(false);
+        srv.ctl_.inputs[st::channels().net_base() + base + i].bypass.store(false);
       }
 
       uint8_t ack[ST_HELLO_ACK_BYTES] = {0};
@@ -479,7 +480,7 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
 
       LOG_INFO("net: {} ({}) took {} channel(s) from {} — input{} {}", peer,
                name.empty() ? "anonymous" : name, channels, base, channels > 1 ? "s" : "",
-               kInputs + base);
+               st::channels().net_base() + base);
 
       // Only now, with the handshake already answered, ask who this address belongs to. A
       // resolver with nothing to talk to blocks for seconds, and the sender is waiting.
@@ -527,7 +528,7 @@ bool NetAudioServer::Session::format(const uint8_t* p, uint32_t len) {
       // offer a volume-controlled PCM and an un-mixable one.
       const bool no_mixer = (sflags & ST_STREAM_F_NO_MIXER) != 0;
       for (unsigned i = 0; i < channels; ++i)
-        srv.ctl_.inputs[kInputs + base + i].bypass.store(no_mixer);
+        srv.ctl_.inputs[st::channels().net_base() + base + i].bypass.store(no_mixer);
 
       LOG_INFO("net: {} sends {} Hz {} x{}ch{}{}", peer, r,
                encoding == ST_ENC_VORBIS ? "vorbis" : "pcm", nch,
@@ -834,13 +835,13 @@ void NetAudioServer::read_block(uint64_t n, size_t frames, uint64_t delay, float
 
   for (unsigned c = 0; c < kNetInputs; ++c) {
     Channel& ch = *chans_[c];
-    float* lp = live + (kInputs + c);
-    float* rp = ring + (kInputs + c);
+    float* lp = live + (st::channels().net_base() + c);
+    float* rp = ring + (st::channels().net_base() + c);
 
     if (!ch.claimed.load(std::memory_order_relaxed)) {
-      for (size_t i = 0; i < frames; ++i) lp[i * kTotalInputs] = 0.0f;
+      for (size_t i = 0; i < frames; ++i) lp[i * st::channels().total()] = 0.0f;
       if (ring != live)
-        for (size_t i = 0; i < frames; ++i) rp[i * kTotalInputs] = 0.0f;
+        for (size_t i = 0; i < frames; ++i) rp[i * st::channels().total()] = 0.0f;
       continue;
     }
 
@@ -853,13 +854,13 @@ void NetAudioServer::read_block(uint64_t n, size_t frames, uint64_t delay, float
 
     // The live read must come first and must not clear, or the trailing read would find the
     // frames already gone.
-    ch.timeline.read(n, frames, lp, kTotalInputs, delay == 0);
+    ch.timeline.read(n, frames, lp, st::channels().total(), delay == 0);
     if (ring == live) continue;
 
     if (n < delay) {
-      for (size_t i = 0; i < frames; ++i) rp[i * kTotalInputs] = 0.0f;
+      for (size_t i = 0; i < frames; ++i) rp[i * st::channels().total()] = 0.0f;
     } else {
-      ch.timeline.read(n - delay, frames, rp, kTotalInputs, true);
+      ch.timeline.read(n - delay, frames, rp, st::channels().total(), true);
     }
   }
 }
@@ -899,15 +900,15 @@ void NetAudioServer::serve_ctl(int fd, const std::string& ip, uint16_t want) {
 
   // The run's first channel is the reference. Everything below reads and writes through `run`,
   // which moves under it.
-  auto gain_db = [&] { return ctl_.inputs[kInputs + run.base].gain_db.load(); };
+  auto gain_db = [&] { return ctl_.inputs[st::channels().net_base() + run.base].gain_db.load(); };
   auto gain_cdb = [&] { return static_cast<int32_t>(std::lround(gain_db() * 100.0f)); };
-  auto muted = [&] { return ctl_.inputs[kInputs + run.base].mute.load(); };
-  auto bypassed = [&] { return ctl_.inputs[kInputs + run.base].bypass.load(); };
+  auto muted = [&] { return ctl_.inputs[st::channels().net_base() + run.base].mute.load(); };
+  auto bypassed = [&] { return ctl_.inputs[st::channels().net_base() + run.base].bypass.load(); };
   auto flags = [&] { return bypassed() ? ST_MIX_ST_BYPASS : 0u; };
   auto set_all = [&](bool set_gain, float db, bool set_mute, bool m) {
     for (unsigned i = 0; i < run.count; ++i) {
-      if (set_gain) ctl_.inputs[kInputs + run.base + i].gain_db.store(db);
-      if (set_mute) ctl_.inputs[kInputs + run.base + i].mute.store(m);
+      if (set_gain) ctl_.inputs[st::channels().net_base() + run.base + i].gain_db.store(db);
+      if (set_mute) ctl_.inputs[st::channels().net_base() + run.base + i].mute.store(m);
     }
   };
 
@@ -923,7 +924,7 @@ void NetAudioServer::serve_ctl(int fd, const std::string& ip, uint16_t want) {
   st_put_u32(ack + ST_CTLA_O_FLAGS, flags());
   if (!send_msg(fd, ST_MSG_CTL_ACK, ack, sizeof(ack))) return;
   LOG_INFO("net: mixer from {} attached to {} channel(s) from {} — input {}", ip, run.count,
-           run.base, kInputs + run.base);
+           run.base, st::channels().net_base() + run.base);
 
   int32_t sent_gain = gain_cdb();
   bool sent_mute = muted();
@@ -964,7 +965,7 @@ void NetAudioServer::serve_ctl(int fd, const std::string& ip, uint16_t want) {
       run = now;
       if (!bypassed()) set_all(true, db, true, m);
       LOG_INFO("net: mixer from {} now drives {} channel(s) from {} — input {}", ip, run.count,
-               run.base, kInputs + run.base);
+               run.base, st::channels().net_base() + run.base);
     }
 
     // Push whatever the value is now, whoever changed it. This is what lets a slider moved in the

@@ -8,7 +8,6 @@
 #include <sstream>
 #include <string>
 
-#include "board_profile.h"
 #include "check.h"
 #include "control.h"
 
@@ -37,9 +36,6 @@ bool same_bytes(const std::string& got, const std::string& want) {
 
 void test_json_round_trip() {
   Config a;
-  a.rate = 48000;
-  a.period = 2048;
-  a.device = "hw:foo,0";
   a.outputs[0].source_type = "input";
   a.outputs[0].source_index = "3";
   a.outputs[0].gain_db = -12.0f;
@@ -47,8 +43,6 @@ void test_json_round_trip() {
   a.outputs[1].source_index = "ping";
   a.outputs[1].mute = true;
   a.inputs[2].gain_db = 18.5f;
-  a.periods = 6;
-  a.capture_channels = 6;
   a.sine_freq_hz = 996.09375f;
   a.sine_level_db = -12.0f;
   a.noise_mode = "pink";
@@ -75,9 +69,6 @@ void test_json_round_trip() {
   CHECK(Config::from_json(a.to_json(), &b, &err));
   if (!err.empty()) std::cout << "  parse error: " << err << "\n";
 
-  CHECK_EQ(b.rate, 48000u);
-  CHECK_EQ(b.period, 2048u);
-  CHECK_EQ(b.device, std::string("hw:foo,0"));
   CHECK_EQ(b.outputs[0].source_type, std::string("input"));
   CHECK_EQ(b.outputs[0].source_index, std::string("3"));
   CHECK_EQ(b.outputs[0].gain_db, -12.0f);
@@ -86,8 +77,6 @@ void test_json_round_trip() {
   CHECK_EQ(b.outputs[1].mute, true);
   CHECK_EQ(b.inputs[2].gain_db, 18.5f);
   CHECK_EQ(b.inputs[0].gain_db, 0.0f);
-  CHECK_EQ(b.periods, 6u);
-  CHECK_EQ(b.capture_channels, 6u);
   CHECK_EQ(b.sine_freq_hz, 996.09375f);
   CHECK_EQ(b.sine_level_db, -12.0f);
   CHECK_EQ(b.noise_mode, std::string("pink"));
@@ -115,21 +104,20 @@ void test_json_round_trip() {
 void test_capture_delay_is_zero_unless_network_input_is_on() {
   Control ctl;
   Config c;
-  c.rate = 96000;
   c.net_delay_ms = 1000;
 
   c.net_enabled = false;
-  c.apply_to(ctl);
+  c.apply_to(ctl, 96000);
   CHECK_EQ(ctl.net.delay_frames.load(), 0u);
   CHECK_EQ(ctl.net.delay_ms.load(), 1000u);  // remembered, just not in force
 
   c.net_enabled = true;
-  c.apply_to(ctl);
+  c.apply_to(ctl, 96000);
   CHECK_EQ(ctl.net.delay_frames.load(), 96000u);
 
   // Out of range clamps rather than being taken literally.
   c.net_delay_ms = 999999;
-  c.apply_to(ctl);
+  c.apply_to(ctl, 96000);
   CHECK_EQ(ctl.net.delay_ms.load(), kNetDelayMaxMs);
   CHECK_EQ(ctl.net.delay_frames.load(), static_cast<uint32_t>(1ull * kNetDelayMaxMs * 96000 / 1000));
 
@@ -157,7 +145,7 @@ void test_control_round_trip() {
   a.listen_bitrate_kbps = 64;
 
   Control ctl;
-  a.apply_to(ctl);
+  a.apply_to(ctl, 96000);
 
   CHECK_EQ(ctl.inputs[1].gain_db.load(), 12.0f);
   CHECK_EQ(ctl.listen.codec.load(), static_cast<uint8_t>(ListenCodec::Opus));
@@ -190,7 +178,7 @@ void test_control_round_trip() {
 void test_defaults_are_silent_and_identity_mapped() {
   Config c;
   Control ctl;
-  c.apply_to(ctl);
+  c.apply_to(ctl, 96000);
   for (unsigned i = 0; i < kOutputs; ++i) {
     CHECK_EQ(source_type(ctl.outputs[i].source.load()), SourceType::Silence);
     CHECK_EQ(ctl.outputs[i].mute.load(), false);
@@ -211,7 +199,7 @@ void test_saved_values_are_clamped() {
   c.music_level_db = 6.0f;
 
   Control ctl;
-  c.apply_to(ctl);
+  c.apply_to(ctl, 96000);
 
   CHECK_EQ(ctl.inputs[0].gain_db.load(), kInputGainMaxDb);
   CHECK_EQ(ctl.inputs[1].gain_db.load(), kInputGainMinDb);
@@ -237,7 +225,7 @@ void test_net_port_rides_the_control_path() {
   Config c;
   c.net_port = 4321;
   Control ctl;
-  c.apply_to(ctl);
+  c.apply_to(ctl, 96000);
   CHECK_EQ(ctl.net.port.load(), 4321);
 
   ctl.net.port.store(4555);  // what PUT /api/net does, enabled or not
@@ -245,261 +233,153 @@ void test_net_port_rides_the_control_path() {
 
   // A hand-edited file cannot ask for a port whose per-channel ports would run off the end.
   c.net_port = 70000;
-  c.apply_to(ctl);
+  c.apply_to(ctl, 96000);
   CHECK_EQ(static_cast<int>(ctl.net.port.load()), kNetPortMax);
   c.net_port = 0;
-  c.apply_to(ctl);
+  c.apply_to(ctl, 96000);
   CHECK_EQ(static_cast<int>(ctl.net.port.load()), kNetPortMin);
 }
 
-// The HDMI block rides the same file and the same Config<->Control path as everything else.
-void test_hdmi_round_trip() {
+// Sinks ride the file by device id, every channel's routing and name with them, whether or not the
+// device is plugged in: Devices applies them when it finds the device.
+void test_sink_round_trip() {
   Config a;
-  a.hdmi.enabled = true;
-  a.hdmi.device = "hw:ALSA,1";
-  a.hdmi.sample_rate = 44100;
-  a.hdmi.layout = "5.1";
-  a.hdmi.outputs[5].source_type = "gen";
-  a.hdmi.outputs[5].source_index = "ping";
-  a.hdmi.outputs[0].source_type = "gen";
-  a.hdmi.outputs[0].source_index = "music";
-  a.hdmi.outputs[0].gain_db = -3.0f;
-  a.hdmi.outputs[1].source_type = "input";
-  a.hdmi.outputs[1].source_index = "7";
-  a.hdmi.outputs[1].mute = true;
-  a.hdmi.names[1] = "tv right";
+  SinkConfig& hdmi = a.sinks["b1,0"];
+  hdmi.enabled = true;
+  hdmi.sample_rate = 44100;
+  hdmi.layout = "5.1";
+  hdmi.outputs[5].source_type = "gen";
+  hdmi.outputs[5].source_index = "ping";
+  hdmi.outputs[1].source_type = "input";
+  hdmi.outputs[1].source_index = "7";
+  hdmi.outputs[1].mute = true;
+  hdmi.names[1] = "tv right";
+  SinkConfig& usb = a.sinks["Device,0"];
+  usb.outputs[0].source_type = "gen";
+  usb.outputs[0].source_index = "music";
+  usb.outputs[0].gain_db = -3.0f;
 
   Config b;
   std::string err;
   CHECK(Config::from_json(a.to_json(), &b, &err));
-  CHECK(b.hdmi.enabled);
-  CHECK_EQ(b.hdmi.device, std::string("hw:ALSA,1"));
-  CHECK_EQ(b.hdmi.sample_rate, 44100u);
-  CHECK_EQ(b.hdmi.layout, std::string("5.1"));
-  CHECK_EQ(b.hdmi.outputs[5].source_index, std::string("ping"));
-  CHECK_EQ(b.hdmi.outputs[0].source_index, std::string("music"));
-  CHECK_EQ(b.hdmi.outputs[0].gain_db, -3.0f);
-  CHECK_EQ(b.hdmi.outputs[1].source_type, std::string("input"));
-  CHECK_EQ(b.hdmi.outputs[1].source_index, std::string("7"));
-  CHECK(b.hdmi.outputs[1].mute);
-  CHECK_EQ(b.hdmi.names[1], std::string("tv right"));
+  CHECK_EQ(b.sinks.size(), 2u);
+  const SinkConfig& h = b.sinks["b1,0"];
+  CHECK(h.enabled);
+  CHECK_EQ(h.sample_rate, 44100u);
+  CHECK_EQ(h.layout, std::string("5.1"));
+  CHECK_EQ(h.outputs[5].source_index, std::string("ping"));
+  CHECK_EQ(h.outputs[1].source_type, std::string("input"));
+  CHECK_EQ(h.outputs[1].source_index, std::string("7"));
+  CHECK(h.outputs[1].mute);
+  CHECK_EQ(h.names[1], std::string("tv right"));
+  const SinkConfig& u = b.sinks["Device,0"];
+  CHECK(!u.enabled);
+  CHECK_EQ(u.sample_rate, 0u);          // the device's default
+  CHECK_EQ(u.layout, std::string());    // likewise
+  CHECK_EQ(u.outputs[0].source_index, std::string("music"));
+  CHECK_EQ(u.outputs[0].gain_db, -3.0f);
 
-  Control ctl;
-  b.apply_to(ctl);
-  CHECK(ctl.hdmi.enabled.load());
-  CHECK_EQ(soc_layout(ctl.hdmi, kHdmiMaxChannels), HdmiLayout::S51);
-  CHECK_EQ(source_index(ctl.hdmi_outputs[5].source.load()), static_cast<uint8_t>(GenId::Ping));
-  CHECK_EQ(source_type(ctl.hdmi_outputs[0].source.load()), SourceType::Gen);
-  CHECK_EQ(source_index(ctl.hdmi_outputs[0].source.load()), static_cast<uint8_t>(GenId::Music));
-  CHECK_EQ(source_index(ctl.hdmi_outputs[1].source.load()), 7);
-  // The Octo's outputs and the line out are untouched by HDMI.
-  CHECK_EQ(source_type(ctl.lineout_outputs[1].source.load()), SourceType::Silence);
-  CHECK_EQ(source_type(ctl.outputs[0].source.load()), SourceType::Silence);
-
-  ctl.hdmi.enabled.store(false);
-  ctl.hdmi.layout.store(static_cast<uint8_t>(HdmiLayout::S71));
-  ctl.hdmi_outputs[1].gain_db.store(-12.0f);
-  const Config c = Config::from_control(ctl, b);
-  CHECK(!c.hdmi.enabled);
-  CHECK_EQ(c.hdmi.layout, std::string("7.1"));
-  CHECK_EQ(c.hdmi.outputs[1].gain_db, -12.0f);
-  CHECK_EQ(c.hdmi.outputs[0].source_index, std::string("music"));
-  CHECK_EQ(c.hdmi.device, std::string("hw:ALSA,1"));  // not live: carried over from the base
-}
-
-// A config written before HDMI existed must load with HDMI off, and a rate the HDMI path cannot
-// use falls back to the one every sink accepts rather than being passed to the driver.
-void test_hdmi_defaults_and_bad_values() {
+  // No sinks is none; the factory file ships none.
   Config c;
-  std::string err;
-  CHECK(Config::from_json(R"({"rate": 96000})", &c, &err));
-  CHECK(!c.hdmi.enabled);
-  CHECK_EQ(c.hdmi.device, rpi3_octo_profile().sink("hdmi")->device);
-  CHECK_EQ(c.hdmi.sample_rate, kSocRateDefault);
-  CHECK_EQ(c.hdmi.names.size(), static_cast<size_t>(kHdmiMaxChannels));
-  CHECK_EQ(c.hdmi.layout, std::string("stereo"));
-
-  CHECK(Config::from_json(R"({"hdmi": {"sample_rate": 22050,
-      "outputs": [{"source": {"type": "gen", "index": "nope"}, "gain_db": 12.0}]}})", &c, &err));
-  CHECK_EQ(c.hdmi.sample_rate, kSocRateDefault);
-  Control ctl;
-  c.apply_to(ctl);
-
-  // A layout that does not exist is stereo, and surround asked for at a rate the Pi cannot carry
-  // it at comes back at 48 kHz rather than reaching the firmware.
-  Config odd;
-  CHECK(Config::from_json(R"({"hdmi": {"layout": "5"}})", &odd, &err));
-  CHECK_EQ(odd.hdmi.layout, std::string("stereo"));
-  CHECK(Config::from_json(R"({"hdmi": {"layout": "7.1", "sample_rate": 96000}})", &odd, &err));
-  CHECK_EQ(odd.hdmi.layout, std::string("7.1"));
-  CHECK_EQ(odd.hdmi.sample_rate, 48000u);
-  CHECK(Config::from_json(R"({"hdmi": {"layout": "stereo", "sample_rate": 96000}})", &odd, &err));
-  CHECK_EQ(odd.hdmi.sample_rate, 96000u);
-  // Every HDMI audio rate is offered for stereo, and only those.
-  CHECK(Config::from_json(R"({"hdmi": {"layout": "stereo", "sample_rate": 192000}})", &odd, &err));
-  CHECK_EQ(odd.hdmi.sample_rate, 192000u);
-  CHECK(Config::from_json(R"({"hdmi": {"layout": "5.1", "sample_rate": 32000}})", &odd, &err));
-  CHECK_EQ(odd.hdmi.sample_rate, 32000u);
-  CHECK(Config::from_json(R"({"hdmi": {"layout": "5.1", "sample_rate": 88200}})", &odd, &err));
-  CHECK_EQ(odd.hdmi.sample_rate, 48000u);
-  for (unsigned r : {32000u, 44100u, 48000u, 88200u, 96000u, 176400u, 192000u})
-    CHECK(soc_rate_ok(r));
-  for (unsigned r : {0u, 8000u, 22050u, 64000u, 384000u}) CHECK(!soc_rate_ok(r));
-  odd.hdmi.layout = "bogus";
-  odd.apply_to(ctl);
-  CHECK_EQ(soc_layout(ctl.hdmi, kHdmiMaxChannels), HdmiLayout::Stereo);
-  c.apply_to(ctl);
-  CHECK_EQ(source_type(ctl.hdmi_outputs[0].source.load()), SourceType::Silence);
-  CHECK_EQ(ctl.hdmi_outputs[0].gain_db.load(), kLevelMaxDb);
-
-  // The shipped defaults parse, and ship HDMI off.
-  CHECK(!Config{}.hdmi.enabled);
-}
-
-// The line out rides the same file and path as HDMI, but has no layout: it is stereo whatever a
-// file or a stray control value says, and the file does not carry one.
-void test_lineout_round_trip() {
-  Config a;
-  a.lineout.enabled = true;
-  a.lineout.device = "hw:ALSA,0";
-  a.lineout.sample_rate = 44100;
-  a.lineout.outputs[0].source_type = "gen";
-  a.lineout.outputs[0].source_index = "music";
-  a.lineout.outputs[1].source_type = "input";
-  a.lineout.outputs[1].source_index = "3";
-  a.lineout.outputs[1].gain_db = -6.0f;
-  a.lineout.names[0] = "desk left";
-
-  const std::string text = a.to_json();
-  CHECK(text.find("\"lineout\"") != std::string::npos);
-  Config b;
-  std::string err;
-  CHECK(Config::from_json(text, &b, &err));
-  CHECK(b.lineout.enabled);
-  CHECK_EQ(b.lineout.device, std::string("hw:ALSA,0"));
-  CHECK_EQ(b.lineout.sample_rate, 44100u);
-  CHECK_EQ(b.lineout.outputs.size(), static_cast<size_t>(kLineoutChannels));
-  CHECK_EQ(b.lineout.outputs[0].source_index, std::string("music"));
-  CHECK_EQ(b.lineout.outputs[1].gain_db, -6.0f);
-  CHECK_EQ(b.lineout.names[0], std::string("desk left"));
-  CHECK_EQ(b.lineout.names.size(), static_cast<size_t>(kLineoutChannels));
-
-  Control ctl;
-  b.apply_to(ctl);
-  CHECK(ctl.lineout.enabled.load());
-  CHECK(!ctl.hdmi.enabled.load());
-  CHECK_EQ(source_index(ctl.lineout_outputs[0].source.load()), static_cast<uint8_t>(GenId::Music));
-  CHECK_EQ(source_index(ctl.lineout_outputs[1].source.load()), 3);
-  CHECK_EQ(source_type(ctl.hdmi_outputs[0].source.load()), SourceType::Silence);
-  CHECK_EQ(soc_layout(ctl.lineout, kLineoutChannels), HdmiLayout::Stereo);
-
-  ctl.lineout.enabled.store(false);
-  ctl.lineout_outputs[0].mute.store(true);
-  const Config c = Config::from_control(ctl, b);
-  CHECK(!c.lineout.enabled);
-  CHECK(c.lineout.outputs[0].mute);
-  CHECK_EQ(c.lineout.device, std::string("hw:ALSA,0"));  // not live: carried over from the base
-
-  // A layout in the file is not the line out's to have.
-  Config odd;
-  CHECK(Config::from_json(R"({"lineout": {"layout": "7.1", "sample_rate": 22050,
-      "names": ["a", "b", "c"]}})", &odd, &err));
-  CHECK_EQ(odd.lineout.layout, std::string("stereo"));
-  CHECK_EQ(odd.lineout.sample_rate, kSocRateDefault);
-  CHECK_EQ(odd.lineout.names.size(), static_cast<size_t>(kLineoutChannels));
-  odd.apply_to(ctl);
-  CHECK_EQ(ctl.lineout.layout.load(), static_cast<uint8_t>(HdmiLayout::Stereo));
-
-  // Defaults: off, on the jack's own card.
-  CHECK(!Config{}.lineout.enabled);
-  CHECK_EQ(Config{}.lineout.device, rpi3_octo_profile().sink("lineout")->device);
-}
-
-// A file that leaves the clock out gets the board's.
-void test_defaults_are_the_boards() {
-  const BoardProfile& board = rpi3_octo_profile();
-  Config c;
-  std::string err;
   CHECK(Config::from_json("{}", &c, &err));
-  CHECK_EQ(c.rate, board.clock.rate);
-  CHECK_EQ(c.period, board.clock.period);
-  CHECK_EQ(c.periods, board.clock.periods);
-  CHECK_EQ(c.device, board.clock.capture_device);
-  CHECK_EQ(c.capture_channels, board.clock.capture_slots.front());
-  CHECK_EQ(c.hdmi.device, board.sink("hdmi")->device);
-  CHECK_EQ(c.lineout.device, board.sink("lineout")->device);
-  CHECK_EQ(c.hdmi.outputs.size(), static_cast<size_t>(board.sink("hdmi")->width));
-  CHECK_EQ(c.lineout.outputs.size(), static_cast<size_t>(board.sink("lineout")->width));
+  CHECK(c.sinks.empty());
+}
+
+// A file saved before sinks were found at runtime has the Pi's two under keys of their own, each
+// naming its device: they load as the sinks of those devices.
+void test_old_sink_keys_are_read() {
+  Config c;
+  std::string err;
+  CHECK(Config::from_json(R"({
+      "hdmi": {"enabled": true, "device": "hw:b1,0", "sample_rate": 48000, "layout": "5.1",
+               "outputs": [{"source": {"type": "gen", "index": "music"}, "gain_db": -3.0,
+                            "mute": false}],
+               "names": ["soundbar L"]},
+      "lineout": {"enabled": false, "device": "hw:Headphones,0", "sample_rate": 44100,
+                  "outputs": [{"source": {"type": "input", "index": "3"}, "gain_db": 0.0,
+                               "mute": true}]},
+      "rate": 96000, "device": "hw:audioinjectoroc,0"})", &c, &err));
+  CHECK_EQ(c.sinks.size(), 2u);
+  CHECK(c.sinks["b1,0"].enabled);
+  CHECK_EQ(c.sinks["b1,0"].layout, std::string("5.1"));
+  CHECK_EQ(c.sinks["b1,0"].outputs[0].source_index, std::string("music"));
+  CHECK_EQ(c.sinks["b1,0"].names[0], std::string("soundbar L"));
+  CHECK_EQ(c.sinks["Headphones,0"].sample_rate, 44100u);
+  CHECK(c.sinks["Headphones,0"].outputs[0].mute);
+
+  // One the file also has under "sinks" is that one's.
+  CHECK(Config::from_json(R"({"sinks": {"b1,0": {"layout": "7.1"}},
+                              "hdmi": {"device": "hw:b1,0", "layout": "5.1"}})", &c, &err));
+  CHECK_EQ(c.sinks["b1,0"].layout, std::string("7.1"));
+  // A device that is not hardware has no id to be kept under.
+  CHECK(Config::from_json(R"({"hdmi": {"device": "default"}})", &c, &err));
+  CHECK(c.sinks.empty());
 }
 
 // ---- The Pi's file, byte for byte ---------------------------------------------------------------
 
-// tests/data/pi-config-v1.json is this config as Config::to_json() wrote it before there were board
-// profiles: routes to an ADC ("3"), a network channel ("7") and the melody, a few names, and HDMI
-// in 5.1. It was written once by that code and is never regenerated from this one, so a change
-// that alters a single byte of what a Pi reads or writes fails here rather than on a Pi. Like the
-// file a save leaves on /data, it does not end in a newline.
-Config pi_config_v1() {
-  Config c;
-  c.outputs[0].source_type = "input";
-  c.outputs[0].source_index = "3";
-  c.outputs[0].gain_db = -6.0f;
-  c.outputs[1].source_type = "input";
-  c.outputs[1].source_index = "7";
-  c.outputs[1].mute = true;
-  c.outputs[2].source_type = "gen";
-  c.outputs[2].source_index = "music";
-  c.outputs[2].gain_db = -12.0f;
-  c.input_names[0] = "bench mic";
-  c.input_names[3] = "DUT left";
-  c.input_names[7] = "laptop";
-  c.output_names[0] = "to DUT";
-  c.output_names[7] = "sub";
-  c.hdmi.enabled = true;
-  c.hdmi.layout = "5.1";
-  c.hdmi.sample_rate = 48000;
-  c.hdmi.outputs[kSpkL].source_type = "gen";
-  c.hdmi.outputs[kSpkL].source_index = "music";
-  c.hdmi.outputs[kSpkR].source_type = "gen";
-  c.hdmi.outputs[kSpkR].source_index = "music";
-  c.hdmi.outputs[kSpkC].source_type = "input";
-  c.hdmi.outputs[kSpkC].source_index = "3";
-  c.hdmi.outputs[kSpkLfe].source_type = "input";
-  c.hdmi.outputs[kSpkLfe].source_index = "7";
-  c.hdmi.outputs[kSpkLfe].gain_db = -20.0f;
-  c.hdmi.names[kSpkL] = "soundbar L";
-  c.hdmi.names[kSpkLfe] = "subwoofer";
-  c.lineout.outputs[0].source_type = "input";
-  c.lineout.outputs[0].source_index = "3";
-  c.lineout.names[1] = "desk right";
-  return c;
+// tests/data/pi-config-v1.json is this config as Config::to_json() wrote it before sinks were found
+// at runtime: routes to an ADC ("3"), a network channel ("7") and the melody, a few names, and HDMI
+// in 5.1. It was written once by that code and is never regenerated, so it is what every Pi that
+// saved its settings has on /data. It must still load to the same routing.
+//
+// tests/data/pi-config-v2.json is what this code writes for it, and is pinned the same way: a
+// change that alters a single byte of what a Pi reads or writes fails here rather than on a Pi.
+// Like the file a save leaves on /data, neither ends in a newline.
+void check_pi_config(const Config& c) {
+  CHECK_EQ(c.outputs[0].source_index, std::string("3"));
+  CHECK_EQ(c.outputs[0].gain_db, -6.0f);
+  CHECK_EQ(c.outputs[1].source_index, std::string("7"));
+  CHECK(c.outputs[1].mute);
+  CHECK_EQ(c.outputs[2].source_index, std::string("music"));
+  CHECK_EQ(c.input_names[0], std::string("bench mic"));
+  CHECK_EQ(c.input_names[7], std::string("laptop"));
+  CHECK_EQ(c.output_names[7], std::string("sub"));
+  CHECK_EQ(c.sinks.size(), 2u);
+  const auto hdmi = c.sinks.find("b1,0");
+  const auto jack = c.sinks.find("Headphones,0");
+  CHECK(hdmi != c.sinks.end() && jack != c.sinks.end());
+  if (hdmi == c.sinks.end() || jack == c.sinks.end()) return;
+  CHECK(hdmi->second.enabled);
+  CHECK_EQ(hdmi->second.layout, std::string("5.1"));
+  CHECK_EQ(hdmi->second.sample_rate, 48000u);
+  CHECK_EQ(hdmi->second.outputs[kSpkL].source_index, std::string("music"));
+  CHECK_EQ(hdmi->second.outputs[kSpkC].source_index, std::string("3"));
+  CHECK_EQ(hdmi->second.outputs[kSpkLfe].source_index, std::string("7"));
+  CHECK_EQ(hdmi->second.outputs[kSpkLfe].gain_db, -20.0f);
+  CHECK_EQ(hdmi->second.names[kSpkLfe], std::string("subwoofer"));
+  CHECK(!jack->second.enabled);
+  CHECK_EQ(jack->second.outputs[0].source_index, std::string("3"));
+  CHECK_EQ(jack->second.names[1], std::string("desk right"));
 }
 
-void test_the_pi_config_file_is_unchanged() {
-  const std::string golden = read_file(ST_TEST_DATA_DIR "/pi-config-v1.json");
-  CHECK(!golden.empty());
-  if (golden.empty()) return;
+void test_the_pi_config_file_still_loads() {
+  const std::string v1 = read_file(ST_TEST_DATA_DIR "/pi-config-v1.json");
+  const std::string v2 = read_file(ST_TEST_DATA_DIR "/pi-config-v2.json");
+  CHECK(!v1.empty() && !v2.empty());
+  if (v1.empty() || v2.empty()) return;
 
-  // What the daemon writes for it.
-  CHECK(same_bytes(pi_config_v1().to_json(), golden));
-
-  // What it reads from it, written back out.
   Config c;
   std::string err;
-  CHECK(Config::from_json(golden, &c, &err));
+  CHECK(Config::from_json(v1, &c, &err));
   if (!err.empty()) std::cout << "  parse error: " << err << "\n";
-  CHECK(same_bytes(c.to_json(), golden));
-  CHECK_EQ(c.outputs[1].source_index, std::string("7"));
-  CHECK_EQ(c.hdmi.layout, std::string("5.1"));
+  check_pi_config(c);
+  CHECK(same_bytes(c.to_json(), v2));
 
-  // And the way a Pi does both: loaded as the factory defaults, saved as the boot defaults.
+  // The new file reads back to the same, and writes the same.
+  Config d;
+  CHECK(Config::from_json(v2, &d, &err));
+  check_pi_config(d);
+  CHECK(same_bytes(d.to_json(), v2));
+
+  // And the way a Pi does both: loaded as the boot defaults, saved again.
   const char* tmp = getenv("TMPDIR");
   std::string dir = std::string(tmp && *tmp ? tmp : "/tmp") + "/st-config-XXXXXX";
   CHECK(mkdtemp(dir.data()) != nullptr);
   ConfigStore store(ST_TEST_DATA_DIR "/pi-config-v1.json", dir);
   const Config loaded = store.load();
   CHECK(store.save(loaded, &err));
-  CHECK(same_bytes(read_file(store.saved_path()), golden));
+  CHECK(same_bytes(read_file(store.saved_path()), v2));
   unlink(store.saved_path().c_str());
   rmdir(dir.c_str());
 }
@@ -522,10 +402,8 @@ int main() {
   test_garbage_is_rejected();
   test_capture_delay_is_zero_unless_network_input_is_on();
   test_net_port_rides_the_control_path();
-  test_hdmi_round_trip();
-  test_hdmi_defaults_and_bad_values();
-  test_lineout_round_trip();
-  test_defaults_are_the_boards();
-  test_the_pi_config_file_is_unchanged();
+  test_sink_round_trip();
+  test_old_sink_keys_are_read();
+  test_the_pi_config_file_still_loads();
   return report("config");
 }

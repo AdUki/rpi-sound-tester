@@ -6,7 +6,6 @@
 #include <string>
 #include <vector>
 
-#include "board_profile.h"
 #include "constants.h"
 #include "control.h"
 #include "util/clock.h"
@@ -15,16 +14,20 @@ typedef struct _snd_pcm snd_pcm_t;
 
 namespace st {
 
-// What the engine opens, and the shape it asks for: the compiled-in board's clock unless main()
-// says otherwise. Here rather than beside AudioEngine because the backends are built from it.
+// What the engine opens, and the shape it asks for: board.json's, unless the command line says
+// otherwise. Here rather than beside AudioEngine because the backends are built from it.
 struct EngineOptions {
   bool sim = false;
-  std::string device = rpi3_octo_profile().clock.capture_device;
-  unsigned rate = rpi3_octo_profile().clock.rate;
-  unsigned period = rpi3_octo_profile().clock.period;
-  unsigned periods = rpi3_octo_profile().clock.periods;
+  // The engine card: the Octo. Empty for none, and a timer paces the engine instead.
+  std::string device;
+  unsigned rate = 48000;
+  unsigned period = 1024;
+  unsigned periods = 4;
   // Falls back to kInputs if 8 ch cannot be opened.
-  unsigned capture_channels = rpi3_octo_profile().clock.capture_slots.front();
+  unsigned capture_channels = 8;
+
+  // Whether a timer paces the engine: the simulator, or a board with no engine card.
+  bool timer() const { return sim || device.empty(); }
   // Simulator only: output channel c loops back into input channel c, delayed by
   // period + c*sim_stagger frames.
   unsigned sim_stagger = 0;
@@ -57,8 +60,8 @@ class AudioBackend {
   virtual void close() = 0;
   // Starts an open device. False, with the reason in error(), and the engine closes it.
   virtual bool start() = 0;
-  // Waits for the next captured block and writes it into channels [0, kInputs) of `in_all`, which
-  // is kTotalInputs wide and one period long. `n` is the ring index the block will be published at.
+  // Waits for the next captured block and writes it into the local channels of `in_all`, which
+  // is channels().total() wide and one period long. `n` is the ring index the block will be published at.
   // Returns the block's length in frames, or an error code (an xrun) for recover().
   virtual long read_block(uint64_t n, float* in_all) = 0;
   // Plays `frames` frames of `out8` (kOutputs wide), the block rendered for ring index `n`.
@@ -95,7 +98,8 @@ struct SlotMaps {
 };
 SlotMaps snapshot_slot_maps(const Control& ctl, unsigned capture_channels);
 
-// `frames` capture frames, `channels` slots each, into channels [0, kInputs) of `in_all`.
+// `frames` capture frames, `channels` slots each, into channels [0, kInputs) of `in_all`, which
+// is channels().total() wide.
 void s32_to_inputs(const int32_t* raw, size_t frames, unsigned channels, const SlotMaps& maps,
                    float* in_all);
 // `frames` frames of `out8` into playback frames kOutputs slots wide.
@@ -142,10 +146,11 @@ class AlsaLinkedBackend final : public AudioBackend {
   std::vector<int32_t> raw_out_;
 };
 
-// The simulated card: blocks paced by a clock rather than by a device, and a loopback where the
-// codec would be. Output channel c comes back on input c period + c*sim_stagger frames later, under
-// a small noise floor, so a delay measurement has something exact to find: with --sim-stagger 137,
-// IN1->IN2 reads 137 samples and IN1->IN3 274.
+// Blocks paced by a clock rather than by a device: the engine of a board with no engine card,
+// which captures nothing and plays nothing of its own, or with opt.sim the simulated card, a
+// loopback where the codec would be. There output channel c comes back on input c
+// period + c*sim_stagger frames later, under a small noise floor, so a delay measurement has
+// something exact to find: with --sim-stagger 137, IN1->IN2 reads 137 samples and IN1->IN3 274.
 class TimerBackend final : public AudioBackend {
  public:
   TimerBackend(const EngineOptions& opt, Clock& clock);

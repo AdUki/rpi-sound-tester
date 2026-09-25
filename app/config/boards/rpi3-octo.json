@@ -1,0 +1,13 @@
+{
+  "engine": {
+    "device": "hw:audioinjectoroc,0",
+    "capture_channels": 8
+  },
+  "rate": 96000,
+  "period": 1024,
+  "periods": 4,
+  "devices": {
+    "b1,0": { "label": "HDMI" },
+    "Headphones,0": { "label": "Line out" }
+  }
+}

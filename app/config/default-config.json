@@ -1,9 +1,4 @@
 {
-  "rate": 96000,
-  "period": 1024,
-  "periods": 4,
-  "device": "hw:audioinjectoroc,0",
-  "capture_channels": 8,
   "inputs": [
     { "gain_db": 0.0, "mute": false },
     { "gain_db": 0.0, "mute": false },
@@ -41,25 +36,5 @@
   "loopback_offset_samples": 0,
   "listen": { "codec": "opus", "bitrate_kbps": 96 },
   "net": { "enabled": false, "port": 4010, "delay_ms": 1000 },
-  "hdmi": {
-    "enabled": false,
-    "device": "hw:b1,0",
-    "sample_rate": 48000,
-    "layout": "stereo",
-    "outputs": [
-      { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
-      { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false }
-    ],
-    "names": ["", ""]
-  },
-  "lineout": {
-    "enabled": false,
-    "device": "hw:Headphones,0",
-    "sample_rate": 48000,
-    "outputs": [
-      { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false },
-      { "source": { "type": "silence", "index": "" }, "gain_db": 0.0, "mute": false }
-    ],
-    "names": ["", ""]
-  }
+  "sinks": {}
 }

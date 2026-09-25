@@ -1,4 +1,4 @@
-#include "soc_out.h"
+#include "sink_out.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "board_profile.h"
+#include "channel_layout.h"
 #include "check.h"
 #include "constants.h"
 #include "control.h"
@@ -17,6 +17,10 @@
 #include "util/dsp.h"
 
 using namespace st;
+
+namespace {
+constexpr unsigned kStereo = 2;
+}
 
 namespace {
 
@@ -46,7 +50,7 @@ void test_pull_tracks_absolute_index() {
   std::vector<float> out(2 * 777);
   for (int pass = 0; pass < 3; ++pass) {
     const uint64_t at = r_n;
-    CHECK(soc_pull(ring, &r_n, 777, out.data()) == SocPull::Ok);
+    CHECK(sink_pull(ring, &r_n, 777, out.data()) == SinkPull::Ok);
     CHECK_EQ(r_n, at + 777);
     bool exact = true;
     for (size_t i = 0; i < 777; ++i) {
@@ -65,16 +69,16 @@ void test_pull_starved_leaves_the_reader_alone() {
   std::vector<float> out(2 * 512);
 
   uint64_t r_n = 700;
-  CHECK(soc_pull(ring, &r_n, 512, out.data()) == SocPull::Starved);
+  CHECK(sink_pull(ring, &r_n, 512, out.data()) == SinkPull::Starved);
   CHECK_EQ(r_n, 700u);
 
   // Beyond the head altogether.
   uint64_t far = 5000;
-  CHECK(soc_pull(ring, &far, 16, out.data()) == SocPull::Starved);
+  CHECK(sink_pull(ring, &far, 16, out.data()) == SinkPull::Starved);
   CHECK_EQ(far, 5000u);
 
   write_ramp(ring, 1024, 1024);
-  CHECK(soc_pull(ring, &r_n, 512, out.data()) == SocPull::Ok);
+  CHECK(sink_pull(ring, &r_n, 512, out.data()) == SinkPull::Ok);
   CHECK_EQ(out[0], 700.0f);
 }
 
@@ -85,7 +89,7 @@ void test_pull_lapped_is_reported() {
   write_ramp(ring, 3 * 4096, 1024);
   std::vector<float> out(2 * 256);
   uint64_t r_n = 0;
-  CHECK(soc_pull(ring, &r_n, 256, out.data()) == SocPull::Lapped);
+  CHECK(sink_pull(ring, &r_n, 256, out.data()) == SinkPull::Lapped);
   CHECK_EQ(r_n, 0u);
 }
 
@@ -94,7 +98,7 @@ void test_pull_lapped_is_reported() {
 // too. The servo has to hold the latency anyway, and do it by slewing the ratio, never stepping.
 struct LoopModel {
   explicit LoopModel(double engine_rate)
-      : rate(engine_rate), chunk_in(engine_rate * kSocPeriodMs / 1000) {}
+      : rate(engine_rate), chunk_in(engine_rate * kSinkPeriodMs / 1000) {}
 
   double rate;                // engine nominal
   double dev_rate = 48000.0;  // device nominal
@@ -102,7 +106,7 @@ struct LoopModel {
   double device_ppm = 0.0;
   double chunk_in;            // one device period, in engine frames
   double buffer = 3840.0;     // PCM buffer, device frames
-  double ring_lag = static_cast<double>(kSocRingLagPeriods) * kTestPeriod;
+  double ring_lag = static_cast<double>(kSinkRingLagPeriods) * kTestPeriod;
 
   double target() const { return ring_lag + buffer * rate / dev_rate; }
 };
@@ -115,7 +119,7 @@ struct LoopResult {
 };
 
 LoopResult run_loop(const LoopModel& m, double initial_error, double seconds) {
-  SocServo servo;
+  SinkServo servo;
   const double target = m.target();
   double lag = m.ring_lag + initial_error;  // the driver term is a full buffer at each measurement
   uint64_t prng = 0x1234567887654321ull;
@@ -138,7 +142,7 @@ LoopResult run_loop(const LoopModel& m, double initial_error, double seconds) {
     if (!first) r.worst_trim_step = std::max(r.worst_trim_step, std::fabs(servo.trim - prev_trim));
     first = false;
     r.worst_trim_dev = std::max(r.worst_trim_dev, std::fabs(servo.trim - 1.0));
-    r.ever_adrift |= servo.adrift(target, kSocResyncS * m.rate);
+    r.ever_adrift |= servo.adrift(target, kSinkResyncS * m.rate);
     prev_trim = servo.trim;
   }
   r.final_error = servo.filter.avg - target;
@@ -147,7 +151,7 @@ LoopResult run_loop(const LoopModel& m, double initial_error, double seconds) {
 
 // The model with the engine at either rate against a 48 kHz device, so that the servo's frame
 // counts and gain are the Pi's at 96 kHz and the VIM3L's at 48 kHz. Only the ratio is modelled: no
-// converter runs here, and neither does SocOutput itself, whose anchor() and stream() need a PCM.
+// converter runs here, and neither does SinkOutput itself, whose anchor() and stream() need a PCM.
 void test_servo_holds_latency_against_drift(double rate) {
   // Slews, never steps: from one pass to the next the filtered latency moves by a few frames of
   // the measurement's jitter, and the trim follows it at 1 / (rate x tau) per frame. The jitter is
@@ -182,7 +186,7 @@ void test_servo_walks_back_an_offset(double rate) {
 }
 
 void test_servo_adrift() {
-  SocServo s;
+  SinkServo s;
   CHECK(!s.adrift(1000.0, 100.0));  // nothing measured yet
   s.update(1050.0, 0.02, 1000.0, 96000.0);
   CHECK(!s.adrift(1000.0, 100.0));
@@ -209,7 +213,7 @@ void test_route_identical_across_strides() {
   for (size_t i = 0; i < kFrames; ++i) bus[i] = 0.5f * std::sin(0.01f * static_cast<float>(i));
   const float* gens[static_cast<size_t>(GenId::Count)] = {bus.data(), bus.data(), bus.data(),
                                                           bus.data()};
-  std::vector<float> in_all(kFrames * kTotalInputs);
+  std::vector<float> in_all(kFrames * st::channels().total());
   for (size_t i = 0; i < in_all.size(); ++i) in_all[i] = 0.001f * static_cast<float>(i % 997);
 
   struct Case {
@@ -237,24 +241,25 @@ void test_route_identical_across_strides() {
     if (c.identify_offset > 0) oc.identify_until.store(n + c.identify_offset);
 
     std::vector<float> out8(kFrames * kOutputs, 99.0f);
-    std::vector<float> outh(kFrames * kHdmiMaxChannels, 99.0f);
-    std::vector<float> outl(kFrames * kLineoutChannels, 99.0f);
-    route_output<kOutputs>(oc, n, kFrames, in_all.data(), gens, gen, identify_frames,
+    std::vector<float> outh(kFrames * kMaxSinkWidth, 99.0f);
+    std::vector<float> outl(kFrames * kStereo, 99.0f);
+    const unsigned in_stride = st::channels().total();
+    route_output<kOutputs>(oc, n, kFrames, in_all.data(), in_stride, gens, gen, identify_frames,
                            out8.data() + 5);
-    route_output<kHdmiMaxChannels>(oc, n, kFrames, in_all.data(), gens, gen, identify_frames,
-                                   outh.data() + 1);
-    route_output<kLineoutChannels>(oc, n, kFrames, in_all.data(), gens, gen, identify_frames,
-                                   outl.data() + 1);
+    route_output<kMaxSinkWidth>(oc, n, kFrames, in_all.data(), in_stride, gens, gen,
+                                identify_frames, outh.data() + 1);
+    route_output<kStereo>(oc, n, kFrames, in_all.data(), in_stride, gens, gen, identify_frames,
+                          outl.data() + 1);
 
     const float g = c.mute ? 0.0f : db_to_lin(c.gain_db);
     bool same = true, right = true, untouched = true;
     for (size_t i = 0; i < kFrames; ++i) {
       const float a = out8[i * kOutputs + 5];
-      const float b = outh[i * kHdmiMaxChannels + 1];
-      const float l = outl[i * kLineoutChannels + 1];
+      const float b = outh[i * kMaxSinkWidth + 1];
+      const float l = outl[i * kStereo + 1];
       same &= a == b && a == l;
-      untouched &= out8[i * kOutputs + 4] == 99.0f && outh[i * kHdmiMaxChannels] == 99.0f &&
-                   outh[i * kHdmiMaxChannels + 2] == 99.0f && outl[i * kLineoutChannels] == 99.0f;
+      untouched &= out8[i * kOutputs + 4] == 99.0f && outh[i * kMaxSinkWidth] == 99.0f &&
+                   outh[i * kMaxSinkWidth + 2] == 99.0f && outl[i * kStereo] == 99.0f;
 
       float want = 0.0f;
       if (c.identify_offset > 0 && static_cast<int64_t>(i) < c.identify_offset) {
@@ -262,7 +267,7 @@ void test_route_identical_across_strides() {
       } else if (c.type == SourceType::Gen) {
         want = g * bus[i];
       } else if (c.type == SourceType::Input) {
-        want = g * in_all[i * kTotalInputs + c.index];
+        want = g * in_all[i * st::channels().total() + c.index];
       }
       right &= a == want;
     }
@@ -275,14 +280,14 @@ void test_route_identical_across_strides() {
 // The converter only ever sees the channels in play, in order, whatever the ring's width.
 void test_select_keeps_the_channels_in_play() {
   constexpr size_t kFrames = 5;
-  std::vector<float> ring(kFrames * kHdmiMaxChannels);
+  std::vector<float> ring(kFrames * kMaxSinkWidth);
   for (size_t i = 0; i < kFrames; ++i)
-    for (unsigned c = 0; c < kHdmiMaxChannels; ++c)
-      ring[i * kHdmiMaxChannels + c] = static_cast<float>(100 * i + c);
+    for (unsigned c = 0; c < kMaxSinkWidth; ++c)
+      ring[i * kMaxSinkWidth + c] = static_cast<float>(100 * i + c);
 
-  for (unsigned ch = 1; ch <= kHdmiMaxChannels; ++ch) {
+  for (unsigned ch = 1; ch <= kMaxSinkWidth; ++ch) {
     std::vector<float> sel(kFrames * ch, -1.0f);
-    soc_select(ring.data(), kFrames, kHdmiMaxChannels, ch, sel.data());
+    sink_select(ring.data(), kFrames, kMaxSinkWidth, ch, sel.data());
     bool exact = true;
     for (size_t i = 0; i < kFrames; ++i)
       for (unsigned c = 0; c < ch; ++c) exact &= sel[i * ch + c] == static_cast<float>(100 * i + c);
@@ -294,7 +299,7 @@ void test_select_keeps_the_channels_in_play() {
 void test_s16_layout() {
   const float mono[] = {0.5f, -0.25f, 2.0f};  // the last one clips
   int16_t pcm[6] = {};
-  soc_to_s16(mono, 3, 1, pcm);
+  pcm_from_float(mono, 3, 1, 2, PcmFormat::S16_LE, reinterpret_cast<uint8_t*>(pcm));
   CHECK_EQ(pcm[0], float_to_s16(0.5f));
   CHECK_EQ(pcm[1], float_to_s16(0.5f));
   CHECK_EQ(pcm[2], float_to_s16(-0.25f));
@@ -305,65 +310,73 @@ void test_s16_layout() {
   std::vector<float> six(2 * 6);
   for (size_t i = 0; i < six.size(); ++i) six[i] = 0.01f * static_cast<float>(i);
   std::vector<int16_t> out(six.size(), 0);
-  soc_to_s16(six.data(), 2, 6, out.data());
+  pcm_from_float(six.data(), 2, 6, 6, PcmFormat::S16_LE, reinterpret_cast<uint8_t*>(out.data()));
   bool through = true;
   for (size_t i = 0; i < six.size(); ++i) through &= out[i] == float_to_s16(six[i]);
   CHECK(through);
+
+  // A one-channel device is one channel wide, not two.
+  int16_t one[3] = {};
+  pcm_from_float(mono, 3, 1, 1, PcmFormat::S16_LE, reinterpret_cast<uint8_t*>(one));
+  CHECK_EQ(one[1], float_to_s16(-0.25f));
 }
 
 // Every layout sends each of its speakers to its own PCM slot, and fills the PCM: no slot carries
 // two speakers (they would sum), none is left out (a speaker the sink expects would be silent),
 // and the converter carries exactly what the PCM holds. Mono is the one exception by design.
 void test_layout_tables_are_clean() {
-  for (uint8_t i = 0; i < static_cast<uint8_t>(HdmiLayout::Count); ++i) {
-    const auto l = static_cast<HdmiLayout>(i);
-    const HdmiLayoutInfo& lay = hdmi_layout_info(l);
-    CHECK(lay.speakers >= 1 && lay.speakers <= kHdmiMaxChannels);
-    CHECK(lay.pcm_channels >= 2 && lay.pcm_channels <= kHdmiMaxChannels);
-    if (l == HdmiLayout::Mono) {
+  for (uint8_t i = 0; i < static_cast<uint8_t>(SinkLayout::Count); ++i) {
+    const auto l = static_cast<SinkLayout>(i);
+    const SinkLayoutInfo& lay = sink_layout_info(l);
+    CHECK(lay.speakers >= 1 && lay.speakers <= kMaxSinkWidth);
+    CHECK(lay.pcm_channels >= 1 && lay.pcm_channels <= kMaxSinkWidth);
+    if (l == SinkLayout::Mono) {
       CHECK_EQ(lay.speakers, 1u);
       CHECK_EQ(lay.pcm_channels, 2u);
       CHECK_EQ(lay.slot[0], 0);
-      CHECK_EQ(soc_converted_channels(lay), 1u);
+      CHECK_EQ(sink_converted_channels(lay), 1u);
       continue;
     }
     CHECK_EQ(lay.speakers, lay.pcm_channels);
-    CHECK_EQ(soc_converted_channels(lay), lay.pcm_channels);
-    bool used[kHdmiMaxChannels] = {};
+    CHECK_EQ(sink_converted_channels(lay), lay.pcm_channels);
+    bool used[kMaxSinkWidth] = {};
     for (unsigned s = 0; s < lay.speakers; ++s) {
       CHECK(lay.slot[s] < lay.pcm_channels);
-      if (lay.slot[s] < kHdmiMaxChannels) {
+      if (lay.slot[s] < kMaxSinkWidth) {
         CHECK(!used[lay.slot[s]]);
         used[lay.slot[s]] = true;
       }
     }
     // L and R are the first two slots in every layout: stereo content stays where it belongs.
     CHECK_EQ(lay.slot[kSpkL], 0);
-    CHECK_EQ(lay.slot[kSpkR], 1);
+    if (lay.pcm_channels >= 2) CHECK_EQ(lay.slot[kSpkR], 1);
+    // Only HDMI's layouts reorder: any other device's channels are its own.
+    if (!lay.hdmi && l != SinkLayout::Stereo)
+      for (unsigned c = 0; c < lay.speakers; ++c) CHECK_EQ(lay.slot[c], c);
     // The name round-trips.
-    HdmiLayout back = HdmiLayout::Mono;
-    CHECK(parse_hdmi_layout(lay.name, &back));
+    SinkLayout back = SinkLayout::Mono;
+    CHECK(parse_sink_layout(lay.name, &back));
     CHECK_EQ(back, l);
   }
-  HdmiLayout x;
-  CHECK(!parse_hdmi_layout("5", &x));
-  CHECK(!parse_hdmi_layout("quad", &x));
-  CHECK_EQ(std::string(hdmi_speaker_name(HdmiLayout::Mono, 0)), std::string("M"));
-  CHECK_EQ(std::string(hdmi_speaker_name(HdmiLayout::S71, kSpkLb)), std::string("Lb"));
+  SinkLayout x;
+  CHECK(!parse_sink_layout("5", &x));
+  CHECK(!parse_sink_layout("quad", &x));
+  CHECK_EQ(std::string(sink_speaker_name(SinkLayout::Mono, 0)), std::string("M"));
+  CHECK_EQ(std::string(sink_speaker_name(SinkLayout::S71, kSpkLb)), std::string("Lb"));
 }
 
 // The slots are HDMI's order (CEA-861: FL FR LFE FC RL RR RLC RRC), which the firmware passes to
 // the sink as they are. ALSA's order (FL FR RL RR FC LFE) put C on a soundbar's surround left and
 // the surround pair on its subwoofer and centre.
 void test_surround_slots_are_hdmi_order() {
-  const HdmiLayoutInfo& s51 = hdmi_layout_info(HdmiLayout::S51);
+  const SinkLayoutInfo& s51 = sink_layout_info(SinkLayout::S51);
   CHECK_EQ(s51.slot[kSpkL], 0);
   CHECK_EQ(s51.slot[kSpkR], 1);
   CHECK_EQ(s51.slot[kSpkLfe], 2);
   CHECK_EQ(s51.slot[kSpkC], 3);
   CHECK_EQ(s51.slot[kSpkLs], 4);
   CHECK_EQ(s51.slot[kSpkRs], 5);
-  const HdmiLayoutInfo& s71 = hdmi_layout_info(HdmiLayout::S71);
+  const SinkLayoutInfo& s71 = sink_layout_info(SinkLayout::S71);
   for (unsigned sp = 0; sp < 6; ++sp) CHECK_EQ(s71.slot[sp], s51.slot[sp]);
   CHECK_EQ(s71.slot[kSpkLb], 6);
   CHECK_EQ(s71.slot[kSpkRb], 7);
@@ -371,67 +384,54 @@ void test_surround_slots_are_hdmi_order() {
 
 // The Pi carries more than two HDMI channels only up to 48 kHz.
 void test_surround_is_refused_above_48k() {
-  CHECK(hdmi_layout_rate_ok(HdmiLayout::Stereo, 96000));
-  CHECK(hdmi_layout_rate_ok(HdmiLayout::Mono, 96000));
-  CHECK(hdmi_layout_rate_ok(HdmiLayout::S51, 48000));
-  CHECK(hdmi_layout_rate_ok(HdmiLayout::S71, 44100));
-  CHECK(!hdmi_layout_rate_ok(HdmiLayout::S51, 96000));
-  CHECK(!hdmi_layout_rate_ok(HdmiLayout::S71, 96000));
+  CHECK(surround_rate_ok(SinkLayout::Stereo, 96000));
+  CHECK(surround_rate_ok(SinkLayout::Mono, 96000));
+  CHECK(surround_rate_ok(SinkLayout::S51, 48000));
+  CHECK(surround_rate_ok(SinkLayout::S71, 44100));
+  CHECK(!surround_rate_ok(SinkLayout::S51, 96000));
+  CHECK(!surround_rate_ok(SinkLayout::S71, 96000));
 }
 
-// The audio thread and a sink's thread both index the slot table with the stored layout and write
-// its slots into a ring the sink's width, so a value outside the table, or a layout wider than the
-// sink, must read back as something that fits rather than off either end.
+// The audio thread and a sink's thread both index the slot table with the stored layout, so a
+// value outside the table must read back as something that fits rather than off its end.
 void test_layout_is_always_usable() {
-  SocControl h;
-  CHECK_EQ(soc_layout(h, kHdmiMaxChannels), kHdmiLayoutDefault);
+  SinkControl h;
+  CHECK_EQ(sink_layout(h), kSinkLayoutDefault);
   h.layout.store(200);
-  CHECK_EQ(soc_layout(h, kHdmiMaxChannels), kHdmiLayoutDefault);
-  h.layout.store(static_cast<uint8_t>(HdmiLayout::S71));
-  CHECK_EQ(soc_layout(h, kHdmiMaxChannels), HdmiLayout::S71);
-  // The line out is two slots wide: surround stored there by anything reads as stereo.
-  CHECK_EQ(soc_layout(h, kLineoutChannels), HdmiLayout::Stereo);
-  h.layout.store(static_cast<uint8_t>(HdmiLayout::S51));
-  CHECK_EQ(soc_layout(h, kLineoutChannels), HdmiLayout::Stereo);
-  // And the line out's layout puts L and R in slots 0 and 1 of its two.
-  const HdmiLayoutInfo& lay = hdmi_layout_info(soc_layout(SocControl{}, kLineoutChannels));
-  CHECK_EQ(lay.speakers, kLineoutChannels);
-  CHECK_EQ(lay.pcm_channels, kLineoutChannels);
+  CHECK_EQ(sink_layout(h), kSinkLayoutDefault);
+  h.layout.store(static_cast<uint8_t>(SinkLayout::S71));
+  CHECK_EQ(sink_layout(h), SinkLayout::S71);
+  // Stereo puts L and R in slots 0 and 1 of its two.
+  const SinkLayoutInfo& lay = sink_layout_info(sink_layout(SinkControl{}));
+  CHECK_EQ(lay.speakers, kStereo);
+  CHECK_EQ(lay.pcm_channels, kStereo);
   CHECK_EQ(lay.slot[kSpkL], 0);
   CHECK_EQ(lay.slot[kSpkR], 1);
 }
 
-// A two-wide ring (the line out) is read through as it is.
-void test_select_at_the_line_outs_width() {
+// A two-wide ring is read through as it is.
+void test_select_at_stereo_width() {
   const float ring[] = {1, 2, 3, 4, 5, 6};
   float sel[6] = {};
-  soc_select(ring, 3, kLineoutChannels, kLineoutChannels, sel);
+  sink_select(ring, 3, kStereo, kStereo, sel);
   CHECK(std::equal(ring, ring + 6, sel));
 }
 
-// Each sink says which one it is, so two of them never log or fail under the other's name, and
-// its ring is as wide as the most slots it can have. All of it is what the board's profile says,
-// and the hint for a missing device names the device the profile opens.
-void test_sinks_are_told_apart() {
-  const BoardProfile& board = rpi3_octo_profile();
-  const SinkProfile* hdmi = board.sink("hdmi");
-  const SinkProfile* lineout = board.sink("lineout");
-  CHECK(hdmi && lineout);
-  if (!hdmi || !lineout) return;
+// A slot starts with what its device offers: stereo and 48 kHz where it has them, else its first.
+void test_device_defaults() {
+  SinkDevice usb;
+  usb.layouts = {SinkLayout::Stereo};
+  usb.rates = {44100, 48000};
+  CHECK_EQ(usb.default_layout(), SinkLayout::Stereo);
+  CHECK_EQ(usb.default_rate(), 48000u);
+  CHECK(usb.offers(SinkLayout::Stereo) && !usb.offers(SinkLayout::S51));
+  CHECK(usb.offers_rate(44100) && !usb.offers_rate(96000));
 
-  CHECK_EQ(std::string(kHdmiSink.name), hdmi->id);
-  CHECK_EQ(std::string(kLineoutSink.name), lineout->id);
-  CHECK_EQ(std::string(kHdmiSink.name), std::string("hdmi"));
-  CHECK_EQ(std::string(kLineoutSink.name), std::string("lineout"));
-  CHECK_EQ(kHdmiSink.width, hdmi->width);
-  CHECK_EQ(kLineoutSink.width, lineout->width);
-  // The engine renders each sink at a width fixed when it is compiled.
-  CHECK_EQ(kHdmiSink.width, kHdmiMaxChannels);
-  CHECK_EQ(kLineoutSink.width, kLineoutChannels);
-  CHECK_EQ(std::string(kHdmiSink.where), hdmi->where_hint);
-  CHECK_EQ(std::string(kLineoutSink.where), lineout->where_hint);
-  CHECK(hdmi->where_hint.find(hdmi->device) != std::string::npos);
-  CHECK(lineout->where_hint.find(lineout->device) != std::string::npos);
+  SinkDevice odd;
+  odd.layouts = {SinkLayout::Ch1};
+  odd.rates = {96000};
+  CHECK_EQ(odd.default_layout(), SinkLayout::Ch1);
+  CHECK_EQ(odd.default_rate(), 96000u);
 }
 
 }  // namespace
@@ -453,7 +453,7 @@ int main() {
   test_surround_slots_are_hdmi_order();
   test_surround_is_refused_above_48k();
   test_layout_is_always_usable();
-  test_select_at_the_line_outs_width();
-  test_sinks_are_told_apart();
-  return report("soc_out");
+  test_select_at_stereo_width();
+  test_device_defaults();
+  return report("sink_out");
 }

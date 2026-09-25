@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "constants.h"
-#include "hdmi_layout.h"
+#include "sink_layout.h"
 #include "util/clock.h"
 
 namespace st {
@@ -185,40 +185,37 @@ struct NetControl {
   std::atomic<uint16_t> port{kNetPort};
 };
 
-// One of the SoC's own outputs: HDMI or the line out. The audio thread reads both fields: while
-// `enabled` is off the sink's speakers are neither rendered nor keep the melody alive, and `layout`
-// says which speakers are rendered and into which PCM slots. The sink's thread reads `layout` when
-// it opens its PCM, so a change needs that thread restarted. Only HDMI's layout ever changes; the
-// line out's stays stereo. The device and its rate are not live values; they belong to the sink's
-// thread and the config.
-struct SocControl {
+// One sink slot: a playback device other than the engine card (HDMI, a USB interface). The audio
+// thread reads all of it: while `enabled` is off the slot's channels are neither rendered nor keep
+// the melody alive, and `layout` says which channels are rendered and into which PCM slots. The
+// sink's thread reads `layout` when it opens its PCM, so a change needs that thread restarted.
+// Whoever stores a layout stores only one the slot's device offers (sink_layouts()). The device
+// and its rate are not live values; they belong to the sink's thread and the config.
+struct SinkControl {
   std::atomic<bool> enabled{false};
-  std::atomic<uint8_t> layout{static_cast<uint8_t>(kHdmiLayoutDefault)};
+  std::atomic<uint8_t> layout{static_cast<uint8_t>(kSinkLayoutDefault)};
+  // Indexed by channel: HDMI's speakers (L R C LFE Ls Rs Lb Rb), any other device's channels in
+  // its own order. All eight keep their routing whatever the layout; only the layout's are played.
+  std::array<OutputControl, kMaxSinkWidth> outputs;
 };
 
-// The layout in force for a sink `width` channels wide, whatever was stored: the audio thread and
-// the sink's thread both index the slot table with it and write the slots into a ring that wide,
-// so a value outside the table, or a layout wider than the sink, must never reach them.
-inline HdmiLayout soc_layout(const SocControl& s, unsigned width) {
+// The layout in force on a sink, whatever was stored: the audio thread and the sink's thread both
+// index the slot table with it, so a value outside the table must never reach them.
+inline SinkLayout sink_layout(const SinkControl& s) {
   const uint8_t l = s.layout.load(std::memory_order_relaxed);
-  const auto layout = l < static_cast<uint8_t>(HdmiLayout::Count) ? static_cast<HdmiLayout>(l)
-                                                                   : kHdmiLayoutDefault;
-  return hdmi_layout_info(layout).pcm_channels <= width ? layout : HdmiLayout::Stereo;
+  return l < static_cast<uint8_t>(SinkLayout::Count) ? static_cast<SinkLayout>(l)
+                                                      : kSinkLayoutDefault;
 }
 
 // Written by web handlers, read by the audio thread at the top of each block. Scalars are
 // independent atomics; tearing across a block boundary there is benign.
 struct Control {
-  std::array<InputControl, kTotalInputs> inputs;
+  // Every column the ring can have; channels() says how many a run uses.
+  std::array<InputControl, kMaxInputs> inputs;
+  // The engine card's outputs: the Octo's DACs. A board without an engine card has none.
   std::array<OutputControl, kOutputs> outputs;
-  // The HDMI speakers, indexed by HdmiSpeaker (L R C LFE Ls Rs Lb Rb): routed exactly like the
-  // Octo's outputs, and on the same sample axis. All eight keep their routing whatever the layout;
-  // only the layout's speakers are played.
-  std::array<OutputControl, kHdmiMaxChannels> hdmi_outputs;
-  SocControl hdmi;
-  // The 3.5 mm jack's L and R, routed the same way. Always the stereo layout.
-  std::array<OutputControl, kLineoutChannels> lineout_outputs;
-  SocControl lineout;
+  // Routed exactly like the engine card's outputs, and on the same sample axis.
+  std::array<SinkControl, kMaxSinks> sinks;
   SineControl sine;
   NoiseControl noise;
   PingControl ping;
@@ -233,6 +230,10 @@ struct Control {
 
   PingLog ping_log;
   TimeAnchor anchor;
+  // How far the capture axis is held back right now, in frames: the network delay, or at least
+  // kDeviceInputDelayMs while a device input is bound. Written by the audio thread only; a device
+  // input's thread reads it to know where the ring will read its frames.
+  std::atomic<uint32_t> capture_delay{0};
 
   Control() {
     for (unsigned i = 0; i < kInputs; ++i) input_map[i].store(static_cast<uint8_t>(i));

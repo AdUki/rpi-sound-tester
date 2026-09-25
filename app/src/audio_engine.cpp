@@ -23,7 +23,7 @@ void prefault_stack() {
 
 std::unique_ptr<AudioBackend> make_backend(const Control& ctl, const EngineOptions& opt,
                                            Clock& clock) {
-  if (opt.sim) return std::make_unique<TimerBackend>(opt, clock);
+  if (opt.timer()) return std::make_unique<TimerBackend>(opt, clock);
   return std::make_unique<AlsaLinkedBackend>(ctl, opt, clock);
 }
 
@@ -51,12 +51,14 @@ EngineStats AudioEngine::stats() const {
   EngineStats s;
   s.running = streaming_.load();
   s.sim = opt_.sim;
+  s.backend = opt_.sim ? "simulator" : opt_.timer() ? "timer" : "card";
   s.device = opt_.sim ? "simulator" : opt_.device;
   s.rate = opt_.rate;
   s.period = period_.load(std::memory_order_relaxed);
   s.periods = opt_.periods;
-  s.capture_channels = opt_.sim ? kInputs : cap_ch_.load(std::memory_order_relaxed);
-  s.format = opt_.sim ? "float32 (simulated)" : "S32_LE";
+  s.capture_channels = opt_.timer() ? backend_->shape().capture_channels
+                                     : cap_ch_.load(std::memory_order_relaxed);
+  s.format = opt_.timer() ? backend_->shape().format : "S32_LE";
   s.xruns = xruns_.load();
   s.generation = generation_.load();
   s.samples = ring_.counter();
@@ -152,7 +154,7 @@ void* AudioEngine::thread_entry(void* self) {
   prefault_stack();
   make_realtime(kRtPriority, "audio");
 
-  if (e->opt_.sim) {
+  if (e->opt_.timer()) {
     e->run_sim();
   } else {
     e->run_card();

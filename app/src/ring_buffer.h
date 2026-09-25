@@ -46,7 +46,13 @@ class RingBuffer {
 
   // Audio thread only.
   void write(const float* interleaved, size_t frames) {
-    const uint64_t n = n_.load(std::memory_order_relaxed);
+    write_at(n_.load(std::memory_order_relaxed), interleaved, frames);
+  }
+
+  // Audio thread only. Writes the frames for absolute index `n` on, and moves the counter there:
+  // for a ring that must count with another (a sink's handoff ring, the capture ring's) but was
+  // wired in after it started. Frames skipped over are whatever the ring held, zeros in a new one.
+  void write_at(uint64_t n, const float* interleaved, size_t frames) {
     const size_t idx = static_cast<size_t>(n & mask_);
     const size_t first = std::min(frames, frames_ - idx);
     std::memcpy(&buf_[idx * channels_], interleaved, first * channels_ * sizeof(float));

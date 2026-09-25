@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "channel_layout.h"
 #include "check.h"
 #include "control.h"
 #include "manual_clock.h"
@@ -263,7 +264,7 @@ struct Sender {
 struct AudioThread {
   AudioThread(Control& c, NetAudioServer& n, ManualClock& k, double r, unsigned p)
       : ctl(c), net(n), clock(k), rate(r), period(p), start_ns(k.now_ns()),
-        live(static_cast<size_t>(p) * kTotalInputs), ring(static_cast<size_t>(p) * kTotalInputs) {}
+        live(static_cast<size_t>(p) * st::channels().total()), ring(static_cast<size_t>(p) * st::channels().total()) {}
 
   // Every block that is due by now.
   void run_due() {

@@ -1,0 +1,14 @@
+{
+  "rate": 48000,
+  "period": 1024,
+  "periods": 4,
+  "device_inputs": 4,
+  "devices": {
+    "G12BKHADASVIM3L,0": { "label": "HDMI", "hdmi": true },
+    "G12BKHADASVIM3L,1": { "hidden": true },
+    "G12BKHADASVIM3L,2": { "hidden": true },
+    "G12BKHADASVIM3L,3": { "label": "HDMI loopback" },
+    "G12BKHADASVIM3L,4": { "hidden": true },
+    "G12BKHADASVIM3L,5": { "hidden": true }
+  }
+}

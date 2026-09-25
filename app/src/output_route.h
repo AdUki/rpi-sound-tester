@@ -14,17 +14,17 @@ namespace st {
 // Identify burst laid over the top while one is running. `dst` is that channel's first sample in
 // an interleaved block `DstStride` channels wide.
 //
-// One function for every sink, so the Octo's eight DACs, HDMI and the line out cannot disagree
-// about what a source, a gain or an Identify means. The stride is a template parameter so each
+// One function for every output, so the engine card's DACs and every sink's channels cannot
+// disagree about what a source, a gain or an Identify means. The stride is a template parameter so each
 // caller gets a loop with a compile-time step, which is what the vectorizer needs.
 //
-// `in_all` is the LIVE input block (kTotalInputs wide), never the capture-axis copy: a passthrough
-// must not pick up the alignment delay. `gens` holds one bus per GenId. Audio thread only; every
+// `in_all` is the LIVE input block (`in_stride` = channels().total() wide), never the capture-axis
+// copy: a passthrough must not pick up the alignment delay. `gens` holds one bus per GenId. Audio thread only; every
 // control value is read once per block, never per sample, since an atomic load inside the sample
 // loop would defeat the vectorizer.
 template <size_t DstStride>
 inline void route_output(const OutputControl& oc, uint64_t n, size_t frames, const float* in_all,
-                         const float* const* gens, const Generators& gen, uint64_t identify_frames,
+                         unsigned in_stride, const float* const* gens, const Generators& gen, uint64_t identify_frames,
                          float* dst) {
   const uint32_t packed = oc.source.load(std::memory_order_relaxed);
   const SourceType type = source_type(packed);
@@ -36,9 +36,9 @@ inline void route_output(const OutputControl& oc, uint64_t n, size_t frames, con
 
   const float* src = nullptr;
   size_t stride = 1;
-  if (type == SourceType::Input && index < kTotalInputs) {
+  if (type == SourceType::Input && index < in_stride) {
     src = in_all + index;
-    stride = kTotalInputs;
+    stride = in_stride;
   } else if (type == SourceType::Gen && index < static_cast<uint8_t>(GenId::Count)) {
     src = gens[index];
   }

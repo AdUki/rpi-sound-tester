@@ -21,18 +21,19 @@
 
 #include "audio_backend.h"
 #include "capture.h"
+#include "channel_layout.h"
 #include "check.h"
 #include "constants.h"
 #include "control.h"
 #include "fake_backend.h"
 #include "generators.h"
-#include "hdmi_layout.h"
+#include "sink_layout.h"
 #include "manual_clock.h"
 #include "net_audio.h"
 #include "output_route.h"
 #include "rates.h"
 #include "ring_buffer.h"
-#include "soc_out.h"
+#include "sink_out.h"
 #include "util/dsp.h"
 
 namespace st {
@@ -65,7 +66,7 @@ struct EngineTestAccess {
   // overrunning them.
   static size_t block_frames(const AudioEngine& e) {
     const EngineCore& c = e.core_;
-    return std::min(c.in_.size() / kTotalInputs, c.out8_.size() / kOutputs);
+    return std::min(c.in_.size() / st::channels().total(), c.out8_.size() / kOutputs);
   }
 
   // One pass of the audio thread's streaming loop: read, process, write.
@@ -93,10 +94,11 @@ constexpr float kSimNoise = 3e-5f;
 // tests use the shortest interval there is, so that ping is half a second in.
 constexpr float kPingIntervalS = kPingIntervalMinS;
 
-// What main() asks of an engine on a board clocked at `rate`: the compiled-in board's clock with
-// the rate replaced, as the VIM3L's factory config.json replaces it with 48000.
+// What main() asks of an engine on a board with an engine card clocked at `rate`: the Pi's
+// board.json with the rate replaced.
 EngineOptions options_at(unsigned rate) {
   EngineOptions o;
+  o.device = "hw:audioinjectoroc,0";
   o.rate = rate;
   return o;
 }
@@ -165,9 +167,9 @@ bool ring_holds(const RingBuffer& ring, uint64_t from, uint64_t to, Want want) {
 // engine renders has a reference to be compared with.
 struct BlockRig {
   Control ctl;
-  RingBuffer ring{kBlockRingFrames, kTotalInputs, 2 * kPeriod};
+  RingBuffer ring{kBlockRingFrames, st::channels().total(), 2 * kPeriod};
   AudioEngine engine;
-  std::vector<float> in = std::vector<float>(kPeriod * kTotalInputs);
+  std::vector<float> in = std::vector<float>(kPeriod * st::channels().total());
   std::vector<float> out = std::vector<float>(kPeriod * kOutputs);
 
   Generators ref;
@@ -189,7 +191,7 @@ struct BlockRig {
   uint64_t block(Fill fill) {
     const uint64_t n = ring.counter();
     for (size_t i = 0; i < kPeriod; ++i)
-      for (unsigned c = 0; c < kTotalInputs; ++c) in[i * kTotalInputs + c] = fill(n + i, c);
+      for (unsigned c = 0; c < st::channels().total(); ++c) in[i * st::channels().total() + c] = fill(n + i, c);
     std::fill(out.begin(), out.end(), 99.0f);
     EngineTestAccess::process_block(engine, n, kPeriod, in.data(), out.data());
     // The melody always, whatever the engine skipped: it is a pure function of n.
@@ -199,7 +201,7 @@ struct BlockRig {
   }
 
   uint32_t generation() const { return engine.stats().generation; }
-  float in_at(size_t i, unsigned c) const { return in[i * kTotalInputs + c]; }
+  float in_at(size_t i, unsigned c) const { return in[i * st::channels().total() + c]; }
   float out_at(size_t i, unsigned o) const { return out[i * kOutputs + o]; }
 };
 
@@ -218,7 +220,7 @@ void test_block_without_a_net_server(unsigned rate) {
     CHECK_EQ(an, n);
     CHECK(at >= before && at <= mono_ns());
     for (size_t i = 0; i < kPeriod; ++i) {
-      for (unsigned c = 0; c < kTotalInputs; ++c) {
+      for (unsigned c = 0; c < st::channels().total(); ++c) {
         const float v = r.in_at(i, c);
         if (c < kInputs) {
           local_untouched &= v == code(n + i, c);
@@ -275,7 +277,7 @@ void test_input_gain_mute_bypass_and_clamp(unsigned rate) {
 
   bool in_place = true, routed_after_gain = true;
   for (size_t i = 0; i < kPeriod; ++i) {
-    for (unsigned c = 0; c < kTotalInputs; ++c) in_place &= r.in_at(i, c) == want(n + i, c);
+    for (unsigned c = 0; c < st::channels().total(); ++c) in_place &= r.in_at(i, c) == want(n + i, c);
     routed_after_gain &= r.out_at(i, 0) == want(n + i, 1) && r.out_at(i, 1) == want(n + i, 0);
   }
   CHECK(in_place);
@@ -472,8 +474,8 @@ void test_each_dac_renders_its_route(unsigned rate) {
                    std::equal(r.ref_music.begin(), r.ref_music.end(), bus[3]);
 
     for (unsigned k = 0; k < kOutputs; ++k) {
-      route_output<kOutputs>(r.ctl.outputs[k], n, kPeriod, r.in.data(), bus, gen, identify_frames,
-                             want.data() + k);
+      route_output<kOutputs>(r.ctl.outputs[k], n, kPeriod, r.in.data(), st::channels().total(),
+                             bus, gen, identify_frames, want.data() + k);
     }
     as_route_output &= want == r.out;
 
@@ -501,27 +503,26 @@ void test_each_dac_renders_its_route(unsigned rate) {
   CHECK(ping_peak > 0.05f);  // and so was a ping
 }
 
-// Each SoC sink's handoff ring is written every block, whether the sink is on or not, so its
-// counter is always the capture ring's. While on, each speaker of the layout is rendered into the
-// layout's PCM slot for it and every other slot is silence (mono is not duplicated here; the sink's
-// thread does that). While off, the whole block is silence whatever the speakers are routed to.
-// The line out plays stereo whatever layout is stored for it.
+// Each sink's handoff ring is written every block, whether the sink is on or not, so its counter
+// is always the capture ring's. While on, each channel of the layout is rendered into the layout's
+// PCM slot for it and every other slot is silence (mono is not duplicated here; the sink's thread
+// does that). While off, the whole block is silence whatever the channels are routed to.
 void test_sink_rings_are_written_every_block(unsigned rate) {
   BlockRig r(rate);
-  RingBuffer hdmi(kSinkRingFrames, kHdmiMaxChannels, 256);
-  RingBuffer lineout(kSinkRingFrames, kLineoutChannels, 256);
-  r.engine.set_hdmi_ring(&hdmi);
-  r.engine.set_lineout_ring(&lineout);
+  RingBuffer hdmi(kSinkRingFrames, kMaxSinkWidth, 256);
+  RingBuffer lineout(kSinkRingFrames, kMaxSinkWidth, 256);
+  r.engine.set_sink_ring(0, &hdmi);
+  r.engine.set_sink_ring(1, &lineout);
 
   // Every speaker from a source of its own, so a speaker in the wrong slot cannot pass.
-  for (unsigned s = 0; s < kInputs; ++s) r.ctl.hdmi_outputs[s].source.store(input_src(s));
-  r.ctl.hdmi_outputs[kSpkLb].source.store(gen_src(GenId::Sine));
-  r.ctl.hdmi_outputs[kSpkRb].source.store(gen_src(GenId::Noise));
-  r.ctl.lineout_outputs[kSpkL].source.store(input_src(4));
-  r.ctl.lineout_outputs[kSpkR].source.store(input_src(5));
-  r.ctl.lineout.layout.store(static_cast<uint8_t>(HdmiLayout::S51));
-  r.ctl.hdmi.enabled.store(true);
-  r.ctl.lineout.enabled.store(true);
+  for (unsigned s = 0; s < kInputs; ++s) r.ctl.sinks[0].outputs[s].source.store(input_src(s));
+  r.ctl.sinks[0].outputs[kSpkLb].source.store(gen_src(GenId::Sine));
+  r.ctl.sinks[0].outputs[kSpkRb].source.store(gen_src(GenId::Noise));
+  r.ctl.sinks[1].outputs[kSpkL].source.store(input_src(4));
+  r.ctl.sinks[1].outputs[kSpkR].source.store(input_src(5));
+  r.ctl.sinks[1].layout.store(static_cast<uint8_t>(SinkLayout::Stereo));
+  r.ctl.sinks[0].enabled.store(true);
+  r.ctl.sinks[1].enabled.store(true);
 
   // What speaker s plays at sample t of the block just rendered.
   auto speaker = [&r](unsigned s, uint64_t t) {
@@ -532,9 +533,9 @@ void test_sink_rings_are_written_every_block(unsigned rate) {
     return hdmi.counter() == r.ring.counter() && lineout.counter() == r.ring.counter();
   };
 
-  for (uint8_t l = 0; l < static_cast<uint8_t>(HdmiLayout::Count); ++l) {
-    r.ctl.hdmi.layout.store(l);
-    const HdmiLayoutInfo& lay = hdmi_layout_info(static_cast<HdmiLayout>(l));
+  for (uint8_t l = 0; l < static_cast<uint8_t>(SinkLayout::Count); ++l) {
+    r.ctl.sinks[0].layout.store(l);
+    const SinkLayoutInfo& lay = sink_layout_info(static_cast<SinkLayout>(l));
     const uint64_t n = r.block(code);
     CHECK(in_step());
     auto hdmi_want = [&](uint64_t t, unsigned slot) {
@@ -542,14 +543,14 @@ void test_sink_rings_are_written_every_block(unsigned rate) {
         if (lay.slot[s] == slot) return speaker(s, t);
       return 0.0f;
     };
-    auto lineout_want = [](uint64_t t, unsigned slot) { return code(t, 4 + slot); };
+    auto lineout_want = [](uint64_t t, unsigned slot) { return slot < 2 ? code(t, 4 + slot) : 0.0f; };
     CHECK(ring_holds(hdmi, n, n + kPeriod, hdmi_want));
     CHECK(ring_holds(lineout, n, n + kPeriod, lineout_want));
   }
 
   // Enough blocks to overwrite everything the loop above left, so silence read back was written.
-  r.ctl.hdmi.enabled.store(false);
-  r.ctl.lineout.enabled.store(false);
+  r.ctl.sinks[0].enabled.store(false);
+  r.ctl.sinks[1].enabled.store(false);
   auto silence = [](uint64_t, unsigned) { return 0.0f; };
   bool stepped = true, silent = true;
   for (size_t b = 0; b < kSinkRingFrames / kPeriod; ++b) {
@@ -566,10 +567,10 @@ void test_sink_rings_are_written_every_block(unsigned rate) {
 // in the layout of an enabled sink. Otherwise its bus is silence.
 void test_music_is_rendered_only_while_played(unsigned rate) {
   BlockRig r(rate);
-  RingBuffer hdmi(kSinkRingFrames, kHdmiMaxChannels, 256);
-  RingBuffer lineout(kSinkRingFrames, kLineoutChannels, 256);
-  r.engine.set_hdmi_ring(&hdmi);
-  r.engine.set_lineout_ring(&lineout);
+  RingBuffer hdmi(kSinkRingFrames, kMaxSinkWidth, 256);
+  RingBuffer lineout(kSinkRingFrames, kMaxSinkWidth, 256);
+  r.engine.set_sink_ring(0, &hdmi);
+  r.engine.set_sink_ring(1, &lineout);
   const uint32_t music = gen_src(GenId::Music);
   const uint32_t silence = pack_source(SourceType::Silence, 0);
 
@@ -587,35 +588,35 @@ void test_music_is_rendered_only_while_played(unsigned rate) {
   r.block(code);
   CHECK(skipped());  // nothing routes it
 
-  r.ctl.hdmi_outputs[kSpkL].source.store(music);
+  r.ctl.sinks[0].outputs[kSpkL].source.store(music);
   r.block(code);
   CHECK(skipped());  // HDMI is off
 
-  r.ctl.hdmi.enabled.store(true);
+  r.ctl.sinks[0].enabled.store(true);
   r.block(code);
   CHECK(rendered());  // HDMI L, stereo
 
-  r.ctl.hdmi_outputs[kSpkL].source.store(silence);
-  r.ctl.hdmi_outputs[kSpkC].source.store(music);
+  r.ctl.sinks[0].outputs[kSpkL].source.store(silence);
+  r.ctl.sinks[0].outputs[kSpkC].source.store(music);
   r.block(code);
   CHECK(skipped());  // stereo has no centre
 
-  r.ctl.hdmi.layout.store(static_cast<uint8_t>(HdmiLayout::S51));
+  r.ctl.sinks[0].layout.store(static_cast<uint8_t>(SinkLayout::S51));
   const uint64_t n = r.block(code);
   CHECK(rendered());
-  const uint8_t c_slot = hdmi_layout_info(HdmiLayout::S51).slot[kSpkC];
+  const uint8_t c_slot = sink_layout_info(SinkLayout::S51).slot[kSpkC];
   auto centre = [&](uint64_t t, unsigned slot) {
     return slot == c_slot ? r.ref_music[t % kPeriod] : 0.0f;
   };
   CHECK(ring_holds(hdmi, n, n + kPeriod, centre));
 
-  r.ctl.hdmi.enabled.store(false);
-  r.ctl.lineout.enabled.store(true);
-  r.ctl.lineout_outputs[kSpkR].source.store(music);
+  r.ctl.sinks[0].enabled.store(false);
+  r.ctl.sinks[1].enabled.store(true);
+  r.ctl.sinks[1].outputs[kSpkR].source.store(music);
   r.block(code);
   CHECK(rendered());  // the line out's R
 
-  r.ctl.lineout.enabled.store(false);
+  r.ctl.sinks[1].enabled.store(false);
   r.block(code);
   CHECK(skipped());
 
@@ -638,16 +639,16 @@ EngineOptions sim_options(unsigned rate) {
 // audio thread starts, though neither sink's own thread ever runs here.
 struct SimRig {
   Control ctl;
-  RingBuffer ring{kSimRingFrames, kTotalInputs, 2 * kPeriod};
+  RingBuffer ring{kSimRingFrames, st::channels().total(), 2 * kPeriod};
   AudioEngine engine;
   NetAudioServer net{ctl, engine.rate(), static_cast<unsigned>(kPeriod), engine.clock()};
-  SocOutput hdmi{kHdmiSink, ctl.hdmi, ctl, engine, "", kSocRateDefault};
-  SocOutput lineout{kLineoutSink, ctl.lineout, ctl, engine, "", kSocRateDefault};
+  SinkOutput hdmi{0, ctl.sinks[0], ctl, engine};
+  SinkOutput lineout{1, ctl.sinks[1], ctl, engine};
 
   explicit SimRig(unsigned rate) : engine(ctl, ring, sim_options(rate)) {
     engine.set_net(&net);
-    CHECK(engine.set_hdmi_ring(&hdmi.ring()));
-    CHECK(engine.set_lineout_ring(&lineout.ring()));
+    CHECK(engine.set_sink_ring(0, &hdmi.ring()));
+    CHECK(engine.set_sink_ring(1, &lineout.ring()));
   }
   // The audio thread writes the sinks' rings, so it has to stop before they go.
   ~SimRig() { engine.stop(); }
@@ -729,7 +730,7 @@ void test_sim_run_keeps_one_sample_axis(unsigned rate) {
   CHECK_EQ(s.rate, rate);
   CHECK_EQ(rig.engine.rate(), static_cast<double>(rate));
   CHECK_EQ(static_cast<size_t>(s.period), kPeriod);
-  CHECK_EQ(s.periods, rpi3_octo_profile().clock.periods);
+  CHECK_EQ(s.periods, 4u);
   CHECK_EQ(s.capture_channels, kInputs);
   CHECK_EQ(s.format, std::string("float32 (simulated)"));
   CHECK_EQ(s.xruns, 0u);
@@ -788,7 +789,7 @@ void test_sim_loops_outputs_back_staggered(unsigned rate) {
       CHECK(e > 1e-3f);
     }
   }
-  for (unsigned c = kInputs; c < kTotalInputs; ++c) {
+  for (unsigned c = kInputs; c < st::channels().total(); ++c) {
     CHECK(rig.ring.read_channel(0, until, c, x.data()));
     CHECK(std::all_of(x.begin(), x.end(), [](float v) { return v == 0.0f; }));
   }
@@ -809,7 +810,7 @@ void test_sim_loops_outputs_back_staggered(unsigned rate) {
 // the audio thread's loop is run on the test's own thread, a block or a whole run_card() at a time.
 struct FakeRig {
   Control ctl;
-  RingBuffer ring{kBlockRingFrames, kTotalInputs, 2 * kPeriod};
+  RingBuffer ring{kBlockRingFrames, st::channels().total(), 2 * kPeriod};
   FakeBackend card;
   ManualClock clock;
   AudioEngine engine;
@@ -828,10 +829,10 @@ struct FakeRig {
 // captured at.
 void test_fake_card_remaps_both_ways(unsigned rate) {
   FakeRig r(rate);
-  RingBuffer hdmi(kSinkRingFrames, kHdmiMaxChannels, 256);
-  RingBuffer lineout(kSinkRingFrames, kLineoutChannels, 256);
-  r.engine.set_hdmi_ring(&hdmi);
-  r.engine.set_lineout_ring(&lineout);
+  RingBuffer hdmi(kSinkRingFrames, kMaxSinkWidth, 256);
+  RingBuffer lineout(kSinkRingFrames, kMaxSinkWidth, 256);
+  r.engine.set_sink_ring(0, &hdmi);
+  r.engine.set_sink_ring(1, &lineout);
 
   const uint8_t imap[kInputs] = {7, 5, 3, 1, 0, 9};
   const unsigned in_slot[kInputs] = {7, 5, 3, 1, 0, 5};  // 9 is past 8 slots: IN 6's own
@@ -1019,13 +1020,13 @@ void test_card_is_retried_until_it_streams(unsigned rate) {
 // has been.
 void test_simulator_steps_on_a_manual_clock(unsigned rate) {
   Control ctl;
-  RingBuffer ring(kBlockRingFrames, kTotalInputs, 2 * kPeriod);
-  RingBuffer hdmi(kSinkRingFrames, kHdmiMaxChannels, 256);
-  RingBuffer lineout(kSinkRingFrames, kLineoutChannels, 256);
+  RingBuffer ring(kBlockRingFrames, st::channels().total(), 2 * kPeriod);
+  RingBuffer hdmi(kSinkRingFrames, kMaxSinkWidth, 256);
+  RingBuffer lineout(kSinkRingFrames, kMaxSinkWidth, 256);
   ManualClock clock;
   AudioEngine engine(ctl, ring, sim_options(rate), clock);
-  CHECK(engine.set_hdmi_ring(&hdmi));
-  CHECK(engine.set_lineout_ring(&lineout));
+  CHECK(engine.set_sink_ring(0, &hdmi));
+  CHECK(engine.set_sink_ring(1, &lineout));
   const uint64_t block_ns = sim_block_ns(rate);
 
   // Something different on every output that loops back, two of them passing the loopback itself
@@ -1071,7 +1072,7 @@ void test_simulator_steps_on_a_manual_clock(unsigned rate) {
 
   const uint64_t end = kBlocks * kPeriod;
   CHECK_EQ(ring.counter(), end);
-  std::vector<float> x(end * kTotalInputs);
+  std::vector<float> x(end * st::channels().total());
   CHECK(ring.read_interleaved(0, end, x.data()));
   uint64_t seed = 0x9e3779b97f4a7c15ull;
   bool exact = true, net_silent = true;
@@ -1079,9 +1080,9 @@ void test_simulator_steps_on_a_manual_clock(unsigned rate) {
     for (unsigned c = 0; c < kInputs; ++c) {
       const uint64_t d = kPeriod + c * kStagger;
       const float looped = t >= d ? played[(t - d) * kOutputs + c] : 0.0f;
-      exact &= x[t * kTotalInputs + c] == looped + kSimNoise * xorshift_white(seed);
+      exact &= x[t * st::channels().total() + c] == looped + kSimNoise * xorshift_white(seed);
     }
-    for (unsigned c = kInputs; c < kTotalInputs; ++c) net_silent &= x[t * kTotalInputs + c] == 0.0f;
+    for (unsigned c = kInputs; c < st::channels().total(); ++c) net_silent &= x[t * st::channels().total() + c] == 0.0f;
   }
   CHECK(exact);
   CHECK(net_silent);
@@ -1129,59 +1130,58 @@ void test_the_card_decides_the_period(unsigned rate) {
   }
 }
 
-// A handoff ring the engine cannot write at the width it renders that sink at is refused rather
+// A handoff ring the engine cannot write at the width it renders every sink at is refused rather
 // than written: a wider one would have the audio thread copy past the end of its block, a narrower
 // one would hand the sink misframed audio. A refused ring is never written, the sink is left out as
 // if nothing had been wired in, and the block goes on as before. A ring of the right width is taken
-// in its place.
+// in its place, and counts with the capture ring from the block it is wired in.
 void test_a_sink_ring_of_another_width_is_refused(unsigned rate) {
   BlockRig r(rate);
-  r.ctl.hdmi.enabled.store(true);
-  r.ctl.lineout.enabled.store(true);
-  for (unsigned s = 0; s < kHdmiMaxChannels; ++s) r.ctl.hdmi_outputs[s].source.store(input_src(0));
-  for (unsigned s = 0; s < kLineoutChannels; ++s)
-    r.ctl.lineout_outputs[s].source.store(input_src(1));
+  r.ctl.sinks[0].enabled.store(true);
+  r.ctl.sinks[1].enabled.store(true);
+  for (unsigned s = 0; s < kMaxSinkWidth; ++s) r.ctl.sinks[0].outputs[s].source.store(input_src(0));
+  for (unsigned s = 0; s < 2; ++s) r.ctl.sinks[1].outputs[s].source.store(input_src(1));
 
-  RingBuffer wide(kSinkRingFrames, kHdmiMaxChannels + 2, 256);
+  RingBuffer wide(kSinkRingFrames, kMaxSinkWidth + 2, 256);
   RingBuffer six(kSinkRingFrames, 6, 256);
   RingBuffer mono(kSinkRingFrames, 1, 256);
-  RingBuffer eight(kSinkRingFrames, kHdmiMaxChannels, 256);
+  RingBuffer two(kSinkRingFrames, 2, 256);
   auto live = [](uint64_t t, unsigned c) { return c < kInputs ? code(t, c) : 0.0f; };
 
-  CHECK(!r.engine.set_hdmi_ring(&wide));
-  CHECK(!r.engine.set_lineout_ring(&eight));  // HDMI's width, on the line out
+  CHECK(!r.engine.set_sink_ring(0, &wide));
+  CHECK(!r.engine.set_sink_ring(1, &two));  // a stereo device's own width, which is not the ring's
   r.block(code);
-  CHECK(!r.engine.set_hdmi_ring(&six));
-  CHECK(!r.engine.set_lineout_ring(&mono));
+  CHECK(!r.engine.set_sink_ring(0, &six));
+  CHECK(!r.engine.set_sink_ring(1, &mono));
   uint64_t n = r.block(code);
   CHECK_EQ(wide.counter(), 0u);
   CHECK_EQ(six.counter(), 0u);
   CHECK_EQ(mono.counter(), 0u);
-  CHECK_EQ(eight.counter(), 0u);
+  CHECK_EQ(two.counter(), 0u);
   CHECK_EQ(r.ring.counter(), 2 * kPeriod);
   CHECK(ring_holds(r.ring, n, n + kPeriod, live));
 
   // No ring at all is always taken: the sink is simply not wired in.
-  CHECK(r.engine.set_hdmi_ring(nullptr));
-  CHECK(r.engine.set_lineout_ring(nullptr));
+  CHECK(r.engine.set_sink_ring(0, nullptr));
+  CHECK(r.engine.set_sink_ring(1, nullptr));
 
-  RingBuffer hdmi(kSinkRingFrames, kHdmiMaxChannels, 256);
-  RingBuffer lineout(kSinkRingFrames, kLineoutChannels, 256);
-  CHECK(r.engine.set_hdmi_ring(&hdmi));
-  CHECK(r.engine.set_lineout_ring(&lineout));
+  RingBuffer hdmi(kSinkRingFrames, kMaxSinkWidth, 256);
+  RingBuffer lineout(kSinkRingFrames, kMaxSinkWidth, 256);
+  CHECK(r.engine.set_sink_ring(0, &hdmi));
+  CHECK(r.engine.set_sink_ring(1, &lineout));
   n = r.block(code);
-  CHECK_EQ(hdmi.counter(), kPeriod);
-  CHECK_EQ(lineout.counter(), kPeriod);
-  const HdmiLayoutInfo& lay = hdmi_layout_info(soc_layout(r.ctl.hdmi, kHdmiMaxChannels));
+  CHECK_EQ(hdmi.counter(), r.ring.counter());
+  CHECK_EQ(lineout.counter(), r.ring.counter());
+  const SinkLayoutInfo& lay = sink_layout_info(sink_layout(r.ctl.sinks[0]));
   auto hdmi_want = [&](uint64_t t, unsigned slot) {
     for (unsigned s = 0; s < lay.speakers; ++s)
-      if (lay.slot[s] == slot) return code(n + t, 0);
+      if (lay.slot[s] == slot) return code(t, 0);
     return 0.0f;
   };
-  auto lineout_want = [&](uint64_t t, unsigned) { return code(n + t, 1); };
-  // Wired in two blocks late, so each ring's index 0 is the capture ring's n.
-  CHECK(ring_holds(hdmi, 0, kPeriod, hdmi_want));
-  CHECK(ring_holds(lineout, 0, kPeriod, lineout_want));
+  auto lineout_want = [&](uint64_t t, unsigned slot) { return slot < 2 ? code(t, 1) : 0.0f; };
+  // Wired in two blocks late, and written at the capture ring's n from the start.
+  CHECK(ring_holds(hdmi, n, n + kPeriod, hdmi_want));
+  CHECK(ring_holds(lineout, n, n + kPeriod, lineout_want));
 }
 
 // The simulator woken late does not notice it was. Every block it missed is already due, so the
@@ -1194,7 +1194,7 @@ void test_a_sink_ring_of_another_width_is_refused(unsigned rate) {
 // line of it.
 void test_simulator_catches_up_after_a_late_wakeup(unsigned rate) {
   Control ctl;
-  RingBuffer ring(kBlockRingFrames, kTotalInputs, 2 * kPeriod);
+  RingBuffer ring(kBlockRingFrames, st::channels().total(), 2 * kPeriod);
   ManualClock clock;
   AudioEngine engine(ctl, ring, sim_options(rate), clock);
   EngineTestAccess::prepare(engine);
@@ -1249,10 +1249,10 @@ void test_backends_report_the_shape_they_ask_for() {
   Control ctl;
   ManualClock clock;
   EngineOptions opt;
+  opt.rate = 96000;
   const BackendShape octo = AlsaLinkedBackend(ctl, opt, clock).shape();
-  CHECK_EQ(octo.rate, rpi3_octo_profile().clock.rate);
-  CHECK_EQ(octo.period, rpi3_octo_profile().clock.period);
-  CHECK_EQ(octo.capture_channels, rpi3_octo_profile().clock.capture_slots.front());
+  CHECK_EQ(octo.rate, 96000u);
+  CHECK_EQ(octo.period, 1024u);
   CHECK_EQ(octo.capture_channels, kTdmSlots);
   CHECK_EQ(octo.playback_channels, kOutputs);
   CHECK_EQ(std::string(octo.format), std::string("S32_LE"));

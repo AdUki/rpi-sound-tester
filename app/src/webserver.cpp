@@ -11,6 +11,7 @@
 #include <sstream>
 #include <vector>
 
+#include "channel_layout.h"
 #include "constants.h"
 #include "genie.h"
 #include "listen_encoder.h"
@@ -26,10 +27,12 @@ namespace st {
 
 namespace {
 
-// Input indices span the card's ADCs plus the network channels, so this bound is derived
-// rather than spelled out — the literal "0..5" was wrong the moment kTotalInputs stopped being 6.
-const std::string kChannelRangeMsg = "ch must be 0.." + std::to_string(kTotalInputs - 1);
-const std::string kSyncRangeMsg = "ch_a/ch_b must be 0.." + std::to_string(kTotalInputs - 1);
+// Input indices span the card's ADCs plus the network channels, so the bound is the run's own
+// rather than spelled out: how many there are depends on the board.
+std::string channel_range_msg() { return "ch must be 0.." + std::to_string(channels().total() - 1); }
+std::string sync_range_msg() {
+  return "ch_a/ch_b must be 0.." + std::to_string(channels().total() - 1);
+}
 
 constexpr int kThreadsMin = 8;
 constexpr int kThreadsMax = 64;
@@ -109,7 +112,7 @@ int effective_kbps(const BitrateOverride& b, const Control& ctl) {
   return b.fixed ? b.kbps : ctl.listen.bitrate_kbps.load();
 }
 
-// One output's state and its PUT body, shared by the Octo's outputs, HDMI and the line out so all
+// One output's state and its PUT body, shared by the engine card's outputs and every sink's so all
 // routes accept exactly the same sources and clamp exactly alike.
 json output_json(const OutputControl& oc, unsigned ch, const std::string& name) {
   const uint32_t packed = oc.source.load();
@@ -137,7 +140,7 @@ bool apply_output_put(OutputControl& oc, const json& j, httplib::Response& res) 
     if (type == "input") {
       const auto& iv = j["source"].at("index");
       const int i = iv.is_string() ? std::atoi(iv.get<std::string>().c_str()) : iv.get<int>();
-      if (i < 0 || i >= static_cast<int>(kTotalInputs)) {
+      if (i < 0 || i >= static_cast<int>(channels().total())) {
         send_error(res, 400, "bad input index");
         return false;
       }
@@ -164,16 +167,56 @@ bool apply_output_put(OutputControl& oc, const json& j, httplib::Response& res) 
   return true;
 }
 
-json soc_status_json(const SocStatus& h) {
-  return {{"enabled", h.enabled},
+json rates_json(const std::vector<unsigned>& rates) {
+  json a = json::array();
+  for (unsigned r : rates) a.push_back(r);
+  return a;
+}
+
+// "32000, 44100 or 48000", for the 400 a bad sample_rate gets.
+std::string rates_text(const std::vector<unsigned>& rates) {
+  std::string t;
+  for (size_t i = 0; i < rates.size(); ++i) {
+    if (i) t += i + 1 == rates.size() ? " or " : ", ";
+    t += std::to_string(rates[i]);
+  }
+  return t;
+}
+
+json layouts_json(const std::vector<SinkLayout>& layouts) {
+  json a = json::array();
+  for (SinkLayout l : layouts) a.push_back(sink_layout_name(l));
+  return a;
+}
+
+std::string layouts_text(const std::vector<SinkLayout>& layouts) {
+  std::string t;
+  for (size_t i = 0; i < layouts.size(); ++i) {
+    if (i) t += i + 1 == layouts.size() ? " or " : ", ";
+    t += sink_layout_name(layouts[i]);
+  }
+  return t;
+}
+
+// What a sink is, and how it is doing.
+json sink_status_json(const Devices::Sink& k, const SinkStatus& h) {
+  return {{"id", k.device.id},
+          {"label", k.device.label},
+          {"hdmi", k.device.hdmi},
+          {"usb", k.device.usb},
+          {"present", k.present},
+          {"layouts", layouts_json(k.device.layouts)},
+          {"rates", rates_json(k.device.rates)},
+          {"enabled", h.enabled},
           {"open", h.open},
           {"playing", h.playing},
           {"device", h.device},
           {"sample_rate", h.sample_rate},
           {"device_rate", h.device_rate},
-          {"layout", hdmi_layout_name(h.layout)},
+          {"layout", sink_layout_name(h.layout)},
           {"speakers", h.speakers},
           {"device_channels", h.device_channels},
+          {"format", h.format},
           {"period_frames", h.period_frames},
           {"buffer_frames", h.buffer_frames},
           {"latency_ms", h.latency_ms},
@@ -189,10 +232,12 @@ json soc_status_json(const SocStatus& h) {
 }
 
 // The compact form the 1 Hz WS system frame carries.
-json soc_brief_json(const SocStatus& h) {
-  return {{"enabled", h.enabled},
+json sink_brief_json(const Devices::Sink& k, const SinkStatus& h) {
+  return {{"id", k.device.id},
+          {"present", k.present},
+          {"enabled", h.enabled},
           {"playing", h.playing},
-          {"layout", hdmi_layout_name(h.layout)},
+          {"layout", sink_layout_name(h.layout)},
           {"latency_ms", h.latency_ms},
           {"trim_ppm", h.trim_ppm},
           {"xruns", h.xruns},
@@ -200,49 +245,80 @@ json soc_brief_json(const SocStatus& h) {
           {"error", h.error}};
 }
 
-// A sink's status plus the routing of its layout's speakers, each with its position and the PCM
-// slot it is sent in. HDMI's other speakers keep their routing and get it back when a layout that
+// A sink's status plus the routing of its layout's channels, each with its position and the PCM
+// slot it is sent in. The other channels keep their routing and get it back when a layout that
 // has them is chosen again, but they are not listed: nothing plays them.
-json soc_json(const SocStatus& h, const OutputControl* outs,
-              const std::vector<std::string>& names) {
-  json j = soc_status_json(h);
-  const HdmiLayoutInfo& lay = hdmi_layout_info(h.layout);
+json sink_json(Devices& devices, const Devices::Sink& k) {
+  const SinkStatus h = devices.output(k.slot).status();
+  json j = sink_status_json(k, h);
+  const SinkLayoutInfo& lay = sink_layout_info(h.layout);
+  const SinkControl& sc = devices.output(k.slot).control();
   j["outputs"] = json::array();
-  for (unsigned s = 0; s < lay.speakers; ++s) {
-    json o = output_json(outs[s], s, s < names.size() ? names[s] : "");
-    o["position"] = hdmi_speaker_name(h.layout, s);
-    o["slot"] = lay.slot[s];
+  for (unsigned c = 0; c < lay.speakers; ++c) {
+    json o = output_json(sc.outputs[c], c, devices.channel_name(k.slot, c));
+    o["position"] = sink_speaker_name(h.layout, c);
+    o["slot"] = lay.slot[c];
     j["outputs"].push_back(o);
   }
   return j;
 }
 
-json soc_rates_json() {
-  json a = json::array();
-  for (unsigned r : kSocRates) a.push_back(r);
-  return a;
+json device_json(const DeviceStatus& d) {
+  return {{"id", d.pcm.id},
+          {"alsa", d.pcm.alsa},
+          {"card", d.pcm.card_id},
+          {"card_name", d.pcm.card_name},
+          {"name", d.pcm.pcm_name},
+          {"label", d.label},
+          {"playback", d.pcm.playback},
+          {"capture", d.pcm.capture},
+          {"usb", d.pcm.usb},
+          {"engine", d.engine},
+          {"hidden", d.hidden},
+          {"sink", d.sink},
+          {"input", d.input},
+          {"input_channels", d.input_channels},
+          {"note", d.note}};
 }
 
-// "32000, 44100, ... or 192000", for the 400 a bad sample_rate gets.
-std::string soc_rates_text() {
-  std::string t;
-  const size_t n = sizeof(kSocRates) / sizeof(kSocRates[0]);
-  for (size_t i = 0; i < n; ++i) {
-    if (i) t += i + 1 == n ? " or " : ", ";
-    t += std::to_string(kSocRates[i]);
+// A device input's status: which columns it fills, and how the capture is doing.
+json source_json(const Devices::Source& s) {
+  const DeviceInputStatus& h = s.status;
+  return {{"id", s.id},
+          {"label", s.label},
+          {"first", s.first},
+          {"channels", s.channels},
+          {"present", s.present},
+          {"open", h.open},
+          {"capturing", h.capturing},
+          {"device", h.device},
+          {"device_rate", h.device_rate},
+          {"format", h.format},
+          {"trim_ppm", h.trim_ppm},
+          {"xruns", h.xruns},
+          {"resyncs", h.resyncs},
+          {"late", h.late},
+          {"error", h.error}};
+}
+
+// What the console calls ring column `c`: IN n for the engine card's, NET n for the network's, and
+// the device and its channel for a device input's.
+std::string input_label(const ChannelLayout& layout, const std::vector<Devices::Source>& sources,
+                        unsigned c) {
+  if (layout.is_net(c)) return "NET " + std::to_string(c - layout.net_base() + 1);
+  for (const Devices::Source& s : sources) {
+    if (c < s.first || c >= s.first + s.channels) continue;
+    const unsigned k = c - s.first;
+    if (s.channels == 1) return s.label;
+    if (s.channels == 2) return s.label + (k ? " R" : " L");
+    return s.label + " " + std::to_string(k + 1);
   }
-  return t;
-}
-
-json hdmi_layouts_json() {
-  json a = json::array();
-  for (const HdmiLayoutInfo& l : kHdmiLayouts) a.push_back(l.name);
-  return a;
+  return "IN " + std::to_string(c + 1);
 }
 
 json meters_json(const AnalysisSnapshot& s) {
   json rms = json::array(), peak = json::array();
-  for (unsigned c = 0; c < kTotalInputs; ++c) {
+  for (unsigned c = 0; c < channels().total(); ++c) {
     rms.push_back(s.meters[c].rms_db);
     peak.push_back(s.meters[c].peak_db);
   }
@@ -322,7 +398,8 @@ class WsReadPump {
 std::string envelope_frame(uint64_t first_col, unsigned col_frames,
                            const std::vector<EnvColumn>& cols) {
   std::string out;
-  out.resize(12 + cols.size() * kTotalInputs * 4);
+  const unsigned total = channels().total();
+  out.resize(12 + cols.size() * total * 4);
   char* p = out.data();
   *p++ = 2;
   const uint64_t sample = first_col * col_frames;
@@ -331,9 +408,9 @@ std::string envelope_frame(uint64_t first_col, unsigned col_frames,
   const uint16_t n = static_cast<uint16_t>(cols.size());
   std::memcpy(p, &n, 2);
   p += 2;
-  *p++ = static_cast<char>(kTotalInputs);
+  *p++ = static_cast<char>(total);
   for (const auto& c : cols) {
-    for (unsigned ch = 0; ch < kTotalInputs; ++ch) {
+    for (unsigned ch = 0; ch < total; ++ch) {
       std::memcpy(p, &c.min[ch], 2);
       p += 2;
       std::memcpy(p, &c.max[ch], 2);
@@ -355,6 +432,12 @@ void WebServer::install_routes() {
   httplib::Server& svr = *svr_;
 
   svr.set_mount_point("/", opt_.www_dir);
+  // The console is replaced on disk (deploy-www, a reflash) while browsers still hold the last
+  // copy, and a cached app.js against a newer index.html, or a newer daemon, breaks the page. With
+  // no-cache every load revalidates against the ETag httplib sends: a 304 when nothing changed.
+  svr.set_file_request_handler([](const httplib::Request&, httplib::Response& res) {
+    res.set_header("Cache-Control", "no-cache");
+  });
 
   // The API index: GET /api serves docs/api.md rendered to HTML (www/api.html, produced at build
   // time by the md2html tool). Read from disk per request, like the rest of www, so a deploy-www
@@ -380,16 +463,15 @@ void WebServer::install_routes() {
       si = sys_;
     }
     // Copies, because a concurrent /api/config/save may replace d_.config.
-    std::vector<std::string> in_names, out_names, hdmi_names, lineout_names;
+    std::vector<std::string> in_names, out_names;
     int64_t loopback_offset = 0;
     {
       std::lock_guard<std::mutex> lk(config_m_);
       in_names = d_.config.input_names;
       out_names = d_.config.output_names;
-      hdmi_names = d_.config.hdmi.names;
-      lineout_names = d_.config.lineout.names;
       loopback_offset = d_.config.loopback_offset_samples;
     }
+    const ChannelLayout& layout = channels();
 
     json sys_json = sysinfo_json(si);
     sys_json.update(json{{"sync_errors", d_.kmsg.sync_errors()},
@@ -401,7 +483,7 @@ void WebServer::install_routes() {
                          {"loopback_offset_samples", loopback_offset}});
 
     json outs = json::array();
-    for (unsigned i = 0; i < kOutputs; ++i)
+    for (unsigned i = 0; i < layout.outputs; ++i)
       outs.push_back(output_json(d_.ctl.outputs[i], i, out_names[i]));
 
 
@@ -410,8 +492,8 @@ void WebServer::install_routes() {
     // resolving the sender on this end.
     const std::vector<NetChannelStatus> net = d_.net.status();
     auto input_name = [&](unsigned i) -> std::string {
-      if (!in_names[i].empty() || !is_net_input(i)) return in_names[i];
-      const NetChannelStatus& c = net[i - kInputs];
+      if (!in_names[i].empty() || !layout.is_net(i)) return in_names[i];
+      const NetChannelStatus& c = net[i - layout.net_base()];
       const std::string who = c.device.empty() ? c.last_device : c.device;
       if (who.empty() || c.stream_count <= 1) return who;
       // A stereo sender puts the same name on two cards; say which half each one is.
@@ -419,18 +501,30 @@ void WebServer::install_routes() {
              ")";
     };
 
+    // A device input's columns are shown once a device is on them, and stay, like a network
+    // channel's: audio it captured before it was unplugged is still in the ring.
+    const std::vector<Devices::Source> sources = d_.devices.sources();
+    auto input_active = [&](unsigned i) {
+      if (layout.is_net(i)) return d_.net.channel_in_use(i - layout.net_base());
+      if (!layout.is_device(i)) return true;
+      for (const Devices::Source& s : sources)
+        if (i >= s.first && i < s.first + s.channels) return true;
+      return false;
+    };
     json ins = json::array();
-    for (unsigned i = 0; i < kTotalInputs; ++i) {
+    for (unsigned i = 0; i < layout.total(); ++i) {
+      const bool is_net = layout.is_net(i);
       ins.push_back({{"ch", i},
                      {"name", input_name(i)},
-                     {"kind", is_net_input(i) ? "net" : "local"},
-                     {"active", !is_net_input(i) || d_.net.channel_in_use(i - kInputs)},
+                     {"kind", is_net ? "net" : layout.is_device(i) ? "device" : "local"},
+                     {"label", input_label(layout, sources, i)},
+                     {"active", input_active(i)},
                      {"gain_db", d_.ctl.inputs[i].gain_db.load()},
                      {"mute", d_.ctl.inputs[i].mute.load()},
                      // The sender on this channel asked for its stream to be left alone: gain and
                      // mute are ignored here and in alsamixer until it disconnects.
                      {"bypass", d_.ctl.inputs[i].bypass.load()},
-                     {"gain_min_db", input_gain_min_db(i)},
+                     {"gain_min_db", layout.gain_min_db(i)},
                      {"rms_db", as.meters[i].rms_db},
                      {"peak_db", as.meters[i].peak_db},
                      {"tone", tone_json(as.tone[i])}});
@@ -443,11 +537,19 @@ void WebServer::install_routes() {
     json cap = capture_json(cs);
     cap["analyze_frames"] = d_.capture.analyze_frames();
 
+    json sinks = json::array();
+    for (const Devices::Sink& k : d_.devices.sinks()) sinks.push_back(sink_json(d_.devices, k));
+    json devs = json::array();
+    for (const DeviceStatus& d : d_.devices.devices()) devs.push_back(device_json(d));
+    json srcs = json::array();
+    for (const Devices::Source& s : sources) srcs.push_back(source_json(s));
+
     json j{
         {"inputs", ins},
         {"outputs", outs},
-        {"hdmi", soc_json(d_.hdmi.status(), d_.ctl.hdmi_outputs.data(), hdmi_names)},
-        {"lineout", soc_json(d_.lineout.status(), d_.ctl.lineout_outputs.data(), lineout_names)},
+        {"sinks", sinks},
+        {"sources", srcs},
+        {"devices", devs},
         {"generators",
          {{"sine", {{"freq_hz", d_.ctl.sine.freq_hz.load()}, {"level_db", d_.ctl.sine.level_db.load()}}},
           {"noise",
@@ -463,6 +565,7 @@ void WebServer::install_routes() {
         {"engine",
          {{"running", es.running},
           {"sim", es.sim},
+          {"backend", es.backend},
           {"device", es.device},
           {"rate", es.rate},
           {"period", es.period},
@@ -490,21 +593,22 @@ void WebServer::install_routes() {
           {"listen_bitrate_min_kbps", kListenBitrateMinKbps},
           {"listen_bitrate_max_kbps", kListenBitrateMaxKbps},
           {"opus_rate", kOpusRate},
-          {"inputs_total", kTotalInputs},
-          {"inputs_local", kInputs},
+          {"inputs_total", layout.total()},
+          {"inputs_local", layout.local},
+          {"inputs_device", layout.device},
+          {"outputs", layout.outputs},
+          // The TDM slot map and the I2S sync watch are the engine card's.
+          {"channel_map", layout.local > 0},
+          {"sync_watch", layout.local > 0},
+          {"sinks_max", kMaxSinks},
           {"net_inputs", kNetInputs},
           {"net_port", d_.net.port()},
           {"net_delay_ms", d_.ctl.net.delay_ms.load()},
           {"net_delay_min_ms", kNetDelayMinMs},
           {"net_delay_max_ms", kNetDelayMaxMs},
           {"net", true},
-          {"hdmi", true},
-          {"hdmi_rates", soc_rates_json()},
-          {"hdmi_layouts", hdmi_layouts_json()},
-          {"lineout", true},
-          {"lineout_rates", soc_rates_json()},
           {"pinned_mb", (d_.ring.pinned_bytes() + d_.capture.pinned_bytes() +
-                         d_.hdmi.pinned_bytes() + d_.lineout.pinned_bytes()) /
+                         d_.devices.pinned_bytes()) /
                             (1024 * 1024)}}},
     };
     send_json(res, j);
@@ -525,14 +629,14 @@ void WebServer::install_routes() {
   svr.Get("/api/spectrum", [this](const httplib::Request& req, httplib::Response& res) {
     int only = -1;
     if (req.has_param("ch")) {
-      only = static_cast<int>(query_u64(req, "ch", kTotalInputs));
-      if (only < 0 || only >= static_cast<int>(kTotalInputs)) {
-        return send_error(res, 400, kChannelRangeMsg);
+      only = static_cast<int>(query_u64(req, "ch", channels().total()));
+      if (only < 0 || only >= static_cast<int>(channels().total())) {
+        return send_error(res, 400, channel_range_msg());
       }
     }
     const AnalysisSnapshot s = d_.analysis.snapshot();
     json chans = json::array();
-    for (unsigned c = 0; c < kTotalInputs; ++c) {
+    for (unsigned c = 0; c < channels().total(); ++c) {
       if (only >= 0 && c != static_cast<unsigned>(only)) continue;
       chans.push_back({{"ch", c}, {"bins_db", s.spectrum[c]}, {"tone", tone_json(s.tone[c])}});
     }
@@ -541,11 +645,11 @@ void WebServer::install_routes() {
                         {"channels", chans}});
   });
 
-  svr.Put("/api/inputs/:ch", json_channel_route("ch", kTotalInputs, "no such input",
+  svr.Put("/api/inputs/:ch", json_channel_route("ch", channels().total(), "no such input",
       [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response&) {
     if (j.contains("gain_db")) {
       d_.ctl.inputs[ch].gain_db.store(
-          std::clamp(j["gain_db"].get<float>(), input_gain_min_db(ch), kInputGainMaxDb));
+          std::clamp(j["gain_db"].get<float>(), channels().gain_min_db(ch), kInputGainMaxDb));
     }
     if (j.contains("mute")) d_.ctl.inputs[ch].mute.store(j["mute"].get<bool>());
   }));
@@ -558,11 +662,12 @@ void WebServer::install_routes() {
   svr.Post("/api/telemetry/inputs", json_route([this](const json& j, const httplib::Request&,
                                                       httplib::Response& res) {
     const auto& en = j.at("enabled");
-    if (!en.is_array() || en.size() != kTotalInputs) {
-      return send_error(res, 400, "enabled must be an array of 6 booleans");
+    if (!en.is_array() || en.size() != channels().total()) {
+      return send_error(res, 400, "enabled must be an array of " +
+                                      std::to_string(channels().total()) + " booleans");
     }
     uint32_t mask = 0;
-    for (unsigned c = 0; c < kTotalInputs; ++c) {
+    for (unsigned c = 0; c < channels().total(); ++c) {
       if (en[c].get<bool>()) mask |= (1u << c);
     }
     telemetry_mask_.store(mask, std::memory_order_relaxed);
@@ -590,114 +695,142 @@ void WebServer::install_routes() {
                         {"bitrate_kbps", d_.ctl.listen.bitrate_kbps.load()}});
   }));
 
-  svr.Put("/api/outputs/:ch", json_channel_route("ch", kOutputs, "no such output",
+  svr.Put("/api/outputs/:ch", json_channel_route("ch", channels().outputs, "no such output",
       [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response& res) {
     apply_output_put(d_.ctl.outputs[ch], j, res);
   }));
 
   svr.Post("/api/outputs/:ch/identify", [this](const httplib::Request& req, httplib::Response& res) {
     unsigned ch = 0;
-    if (!parse_index(req, "ch", kOutputs, &ch)) return send_error(res, 404, "no such output");
+    if (!parse_index(req, "ch", channels().outputs, &ch))
+      return send_error(res, 404, "no such output");
     d_.ctl.outputs[ch].identify_until.store(d_.ring.counter() + d_.engine.identify_frames());
     send_json(res, json{{"ok", true}});
   });
 
-  // ---- The SoC's own outputs: HDMI and the line out ------------------------------------------
+  // ---- Sinks: every playback device other than the engine card ------------------------------
   //
-  // Every channel routes exactly like the Octo's outputs — same sources, same clamps, same
-  // Identify — and plays at the same n. Only the link itself (on/off, device, rate, and for HDMI
-  // how many channels) is configured here. One set of routes, installed once per sink.
-  auto install_soc = [this, &svr](const std::string& base, SocOutput* out, SocControl* sc,
-                                  OutputControl* outs, SocConfig Config::*cfg, bool layouts,
-                                  const std::string& label) {
-    const unsigned width = out->sink().width;
-    auto names = [this, cfg] {
-      std::lock_guard<std::mutex> lk(config_m_);
-      return (d_.config.*cfg).names;
-    };
-    svr.Get(base, [out, outs, names](const httplib::Request&, httplib::Response& res) {
-      send_json(res, soc_json(out->status(), outs, names()));
-    });
-
-    // Body: {"enabled": bool, "device": "hw:b1,0", "sample_rate": 48000, "layout": "5.1"}. A new
-    // device, rate or layout restarts the sink's thread; the Octo is not touched either way.
-    svr.Put(base, json_route([this, out, sc, outs, cfg, layouts, label, width, names](
-                                 const json& j, const httplib::Request&, httplib::Response& res) {
-      // Everything is checked before anything is applied, so a rejected body changes nothing.
-      std::string device = out->device();
-      unsigned sample_rate = out->sample_rate();
-      const HdmiLayout layout_was = soc_layout(*sc, width);
-      HdmiLayout layout = layout_was;
-      if (j.contains("device")) {
-        device = j["device"].get<std::string>();
-        if (device.empty()) return send_error(res, 400, "device must not be empty");
+  // Every channel routes exactly like the engine card's outputs — same sources, same clamps, same
+  // Identify — and plays at the same n. Only the link itself (on/off, rate, layout) is configured
+  // here. A sink is named by its device id ("b1,0", "Device,0"); GET /api/state lists them.
+  auto find_sink = [this](const httplib::Request& req, Devices::Sink* out) {
+    const auto it = req.path_params.find("id");
+    if (it == req.path_params.end()) return false;
+    for (const Devices::Sink& k : d_.devices.sinks()) {
+      if (k.device.id == it->second) {
+        *out = k;
+        return true;
       }
+    }
+    return false;
+  };
+  const std::string no_sink = "no such sink";
+
+  svr.Get("/api/sinks", [this](const httplib::Request&, httplib::Response& res) {
+    json a = json::array();
+    for (const Devices::Sink& k : d_.devices.sinks()) a.push_back(sink_json(d_.devices, k));
+    send_json(res, a);
+  });
+
+  svr.Get("/api/sinks/:id", [this, find_sink, no_sink](const httplib::Request& req,
+                                                       httplib::Response& res) {
+    Devices::Sink k;
+    if (!find_sink(req, &k)) return send_error(res, 404, no_sink);
+    send_json(res, sink_json(d_.devices, k));
+  });
+
+  // Body: {"enabled": bool, "sample_rate": 48000, "layout": "5.1"}. A new rate or layout restarts
+  // the sink's thread; the engine is not touched either way.
+  svr.Put("/api/sinks/:id", [this, find_sink, no_sink](const httplib::Request& req,
+                                                       httplib::Response& res) {
+    Devices::Sink k;
+    if (!find_sink(req, &k)) return send_error(res, 404, no_sink);
+    std::lock_guard<std::mutex> put_lk(sink_put_m_);
+    json_route([this, k](const json& j, const httplib::Request&, httplib::Response& res) {
+      SinkOutput& out = d_.devices.output(k.slot);
+      SinkControl& sc = out.control();
+      const SinkDevice& dev = k.device;
+      // Everything is checked before anything is applied, so a rejected body changes nothing.
+      unsigned sample_rate = out.sample_rate();
+      const SinkLayout layout_was = sink_layout(sc);
+      SinkLayout layout = layout_was;
       if (j.contains("sample_rate")) {
         sample_rate = j["sample_rate"].get<unsigned>();
-        if (!soc_rate_ok(sample_rate)) {
-          return send_error(res, 400, "sample_rate must be " + soc_rates_text());
-        }
+        if (!dev.offers_rate(sample_rate))
+          return send_error(res, 400, "sample_rate must be " + rates_text(dev.rates));
       }
       if (j.contains("layout")) {
-        const bool known = parse_hdmi_layout(j["layout"].get<std::string>(), &layout);
-        if (!layouts && (!known || layout != HdmiLayout::Stereo)) {
-          return send_error(res, 400, "the " + label + " is stereo only");
-        }
-        if (!known) return send_error(res, 400, "layout must be mono, stereo, 5.1 or 7.1");
+        if (!parse_sink_layout(j["layout"].get<std::string>(), &layout) || !dev.offers(layout))
+          return send_error(res, 400, "layout must be " + layouts_text(dev.layouts));
       }
-      if (!hdmi_layout_rate_ok(layout, sample_rate)) {
-        return send_error(res, 400, std::string(hdmi_layout_name(layout)) +
-                                        " needs a sample_rate of 48000 or less: the Pi carries "
-                                        "more than two HDMI channels only up to 48 kHz");
+      if (!surround_rate_ok(layout, sample_rate)) {
+        return send_error(res, 400, std::string(sink_layout_name(layout)) +
+                                        " needs a sample_rate of 48000 or less: HDMI carries "
+                                        "more than two channels only up to 48 kHz");
       }
 
       // Stored before any restart, so one reopen picks up everything in this request.
-      sc->layout.store(static_cast<uint8_t>(layout));
-      if (device != out->device() || sample_rate != out->sample_rate()) {
-        out->configure(device, sample_rate);
-        // Not live state, so it rides the config rather than Control; a later save keeps it.
-        std::lock_guard<std::mutex> lk(config_m_);
-        (d_.config.*cfg).device = device;
-        (d_.config.*cfg).sample_rate = sample_rate;
+      sc.layout.store(static_cast<uint8_t>(layout));
+      if (sample_rate != out.sample_rate()) {
+        out.set_sample_rate(sample_rate);
       } else if (layout != layout_was) {
-        out->restart();
+        out.restart();
       }
       if (j.contains("enabled")) {
         const bool on = j["enabled"].get<bool>();
         // The audio thread starts rendering the channels before the sink's thread goes looking
         // for them, and stops only after that thread is gone.
         if (on) {
-          sc->enabled.store(true);
-          out->start();
+          sc.enabled.store(true);
+          out.start();
         } else {
-          out->stop();
-          sc->enabled.store(false);
+          out.stop();
+          sc.enabled.store(false);
         }
       }
-      send_json(res, soc_json(out->status(), outs, names()));
-    }));
+      send_json(res, sink_json(d_.devices, k));
+    })(req, res);
+  });
 
-    // Indexed by speaker: HDMI's are 0 L, 1 R, 2 C, 3 LFE, 4 Ls, 5 Rs, 6 Lb, 7 Rb, the line out's
-    // 0 L and 1 R. Any of them takes a route, played or not, so a layout can be set up before it
-    // is switched on.
-    const std::string missing = "no such " + label + " channel";
-    svr.Put(base + "/:ch", json_channel_route("ch", width, missing,
-        [outs](unsigned ch, const json& j, const httplib::Request&, httplib::Response& res) {
-      apply_output_put(outs[ch], j, res);
-    }));
+  // Indexed by channel: an HDMI sink's speakers are 0 L, 1 R, 2 C, 3 LFE, 4 Ls, 5 Rs, 6 Lb, 7 Rb;
+  // any other device's channels are its own. Any of them takes a route, played or not, so a layout
+  // can be set up before it is switched on.
+  svr.Put("/api/sinks/:id/:ch", [this, find_sink, no_sink](const httplib::Request& req,
+                                                           httplib::Response& res) {
+    Devices::Sink k;
+    if (!find_sink(req, &k)) return send_error(res, 404, no_sink);
+    SinkControl& sc = d_.devices.output(k.slot).control();
+    json_channel_route("ch", kMaxSinkWidth, "no such sink channel",
+        [&sc](unsigned ch, const json& j, const httplib::Request&, httplib::Response& r) {
+      apply_output_put(sc.outputs[ch], j, r);
+    })(req, res);
+  });
 
-    svr.Post(base + "/:ch/identify",
-             [this, outs, width, missing](const httplib::Request& req, httplib::Response& res) {
-      unsigned ch = 0;
-      if (!parse_index(req, "ch", width, &ch)) return send_error(res, 404, missing);
-      outs[ch].identify_until.store(d_.ring.counter() + d_.engine.identify_frames());
-      send_json(res, json{{"ok", true}});
-    });
-  };
-  install_soc("/api/hdmi", &d_.hdmi, &d_.ctl.hdmi, d_.ctl.hdmi_outputs.data(), &Config::hdmi,
-              true, "HDMI");
-  install_soc("/api/lineout", &d_.lineout, &d_.ctl.lineout, d_.ctl.lineout_outputs.data(),
-              &Config::lineout, false, "line out");
+  svr.Post("/api/sinks/:id/:ch/identify", [this, find_sink, no_sink](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+    Devices::Sink k;
+    if (!find_sink(req, &k)) return send_error(res, 404, no_sink);
+    unsigned ch = 0;
+    if (!parse_index(req, "ch", kMaxSinkWidth, &ch))
+      return send_error(res, 404, "no such sink channel");
+    d_.devices.output(k.slot).control().outputs[ch].identify_until.store(
+        d_.ring.counter() + d_.engine.identify_frames());
+    send_json(res, json{{"ok", true}});
+  });
+
+  // Every PCM device ALSA has, as `aplay -l` and `arecord -l` would list them, and what the
+  // daemon does with each.
+  svr.Get("/api/devices", [this](const httplib::Request&, httplib::Response& res) {
+    json a = json::array();
+    for (const DeviceStatus& d : d_.devices.devices()) a.push_back(device_json(d));
+    send_json(res, a);
+  });
+
+  svr.Get("/api/sources", [this](const httplib::Request&, httplib::Response& res) {
+    json a = json::array();
+    for (const Devices::Source& s : d_.devices.sources()) a.push_back(source_json(s));
+    send_json(res, a);
+  });
 
   svr.Put("/api/generators/sine", json_route([this](const json& j, const httplib::Request&,
                                                     httplib::Response&) {
@@ -752,6 +885,7 @@ void WebServer::install_routes() {
 
   svr.Put("/api/channel-map", json_route([this](const json& j, const httplib::Request&,
                                                 httplib::Response& res) {
+    if (!channels().local) return send_error(res, 404, "no engine card, so no TDM slots to map");
     const auto imap = j.at("input_map").get<std::vector<int>>();
     const auto omap = j.at("output_map").get<std::vector<int>>();
     if (imap.size() != kInputs || omap.size() != kOutputs) {
@@ -778,7 +912,7 @@ void WebServer::install_routes() {
     json chans = json::array();
     for (const NetChannelStatus& c : d_.net.status()) {
       chans.push_back({{"channel", c.channel},
-                       {"input", kInputs + c.channel},
+                       {"input", channels().net_base() + c.channel},
                        {"connected", c.connected},
                        {"peer", c.peer},
                        {"name", c.name},
@@ -909,8 +1043,8 @@ void WebServer::install_routes() {
   });
 
   svr.Get("/api/capture/window", [this](const httplib::Request& req, httplib::Response& res) {
-    const unsigned ch = static_cast<unsigned>(query_u64(req, "ch", kTotalInputs));
-    if (ch >= kTotalInputs) return send_error(res, 400, kChannelRangeMsg);
+    const unsigned ch = static_cast<unsigned>(query_u64(req, "ch", channels().total()));
+    if (ch >= channels().total()) return send_error(res, 400, channel_range_msg());
     const uint64_t now = d_.ring.counter();
     const uint64_t len = query_u64(req, "len", 96000);
     const uint64_t start = query_u64(req, "start", now > len ? now - len : 0);
@@ -967,15 +1101,15 @@ void WebServer::install_routes() {
   svr.Get("/api/genie/sound", [this](const httplib::Request& req, httplib::Response& res) {
     int only = -1;
     if (req.has_param("ch")) {
-      only = static_cast<int>(query_u64(req, "ch", kTotalInputs));
-      if (only < 0 || only >= static_cast<int>(kTotalInputs)) {
-        return send_error(res, 400, kChannelRangeMsg);
+      only = static_cast<int>(query_u64(req, "ch", channels().total()));
+      if (only < 0 || only >= static_cast<int>(channels().total())) {
+        return send_error(res, 400, channel_range_msg());
       }
     }
     const double threshold = query_f64(req, "threshold_db", kGenieSoundThresholdDb);
     const AnalysisSnapshot s = d_.analysis.snapshot();
     json chans = json::array();
-    for (unsigned c = 0; c < kTotalInputs; ++c) {
+    for (unsigned c = 0; c < channels().total(); ++c) {
       if (only >= 0 && c != static_cast<unsigned>(only)) continue;
       chans.push_back({{"ch", c},
                        {"sound", s.meters[c].peak_db > threshold},
@@ -997,14 +1131,15 @@ void WebServer::install_routes() {
   svr.Get("/api/genie/sync", [this](const httplib::Request& req, httplib::Response& res) {
     const AnalysisSnapshot as = d_.analysis.snapshot();
     std::vector<unsigned> sounding;
-    for (unsigned ch = 0; ch < kTotalInputs; ++ch) {
+    for (unsigned ch = 0; ch < channels().total(); ++ch) {
       if (as.meters[ch].peak_db > kGenieSoundThresholdDb) sounding.push_back(ch);
     }
     // Each channel: the query value if given, else the first sounding input that isn't `exclude`.
+    const std::string range_msg = sync_range_msg();
     auto pick = [&](const char* key, int exclude, int* out) -> const char* {
       if (req.has_param(key)) {
         const long v = std::strtol(req.get_param_value(key).c_str(), nullptr, 10);
-        if (v < 0 || v >= static_cast<long>(kTotalInputs)) return kSyncRangeMsg.c_str();
+        if (v < 0 || v >= static_cast<long>(channels().total())) return range_msg.c_str();
         *out = static_cast<int>(v);
         return nullptr;
       }
@@ -1127,7 +1262,8 @@ void WebServer::install_routes() {
       std::lock_guard<std::mutex> lk(config_m_);
       base = d_.config;
     }
-    const Config cfg = Config::from_control(d_.ctl, base);
+    Config cfg = Config::from_control(d_.ctl, base);
+    cfg.sinks = d_.devices.sink_configs();
     std::string err;
     if (!d_.store.save(cfg, &err)) return send_error(res, 500, err);
     {
@@ -1184,7 +1320,7 @@ void WebServer::install_routes() {
 
   svr.WebSocket("/api/listen/:ch", [this](const httplib::Request& req, httplib::ws::WebSocket& ws) {
     unsigned ch = 0;
-    if (!parse_index(req, "ch", kTotalInputs, &ch)) {
+    if (!parse_index(req, "ch", channels().total(), &ch)) {
       ws.close(httplib::ws::CloseStatus::PolicyViolation, "bad channel");
       return;
     }
@@ -1253,7 +1389,7 @@ void WebServer::install_routes() {
 
   svr.Get("/api/inputs/:ch/stream.wav", [this](const httplib::Request& req, httplib::Response& res) {
     unsigned ch = 0;
-    if (!parse_index(req, "ch", kTotalInputs, &ch)) return send_error(res, 404, "no such input");
+    if (!parse_index(req, "ch", channels().total(), &ch)) return send_error(res, 404, "no such input");
 
     auto slot = std::make_shared<StreamSlot>(listen_streams_);
     if (!slot->acquired()) return send_error(res, 503, "too many listeners");
@@ -1311,7 +1447,7 @@ void WebServer::install_routes() {
     auto pacer = std::make_shared<MultiListenPacer>(d_.ring, enc->in_frames());
     auto sent_header = std::make_shared<bool>(false);
 
-    LOG_DEBUG("ogg stream opened ({} ch)", kTotalInputs);
+    LOG_DEBUG("ogg stream opened ({} ch)", channels().total());
     res.set_chunked_content_provider(
         "audio/ogg",
         [this, enc, pacer, sent_header, slot, ogg_slot, br](size_t, httplib::DataSink& sink) {
@@ -1419,8 +1555,16 @@ void WebServer::run_publisher() {
                {"sync_errors", d_.kmsg.sync_errors()},
                {"listen_streams", listen_streams_.load()},
                {"engine_running", es.running}};
-        j["hdmi"] = soc_brief_json(d_.hdmi.status());
-        j["lineout"] = soc_brief_json(d_.lineout.status());
+        json sinks = json::array();
+        for (const Devices::Sink& k : d_.devices.sinks())
+          sinks.push_back(sink_brief_json(k, d_.devices.output(k.slot).status()));
+        j["sinks"] = sinks;
+        json srcs = json::array();
+        for (const Devices::Source& s : d_.devices.sources())
+          srcs.push_back({{"id", s.id}, {"first", s.first}, {"channels", s.channels},
+                          {"present", s.present}, {"capturing", s.status.capturing},
+                          {"error", s.status.error}});
+        j["sources"] = srcs;
         j.update(sysinfo_json(si));
         hub_.publish(std::make_shared<WsMessage>(WsMessage{j.dump(), false}));
       }
@@ -1442,7 +1586,7 @@ void WebServer::run_publisher() {
       const AnalysisSnapshot s = d_.analysis.snapshot();
       const uint32_t mask = telemetry_mask_.load(std::memory_order_relaxed);
       json chans = json::array();
-      for (unsigned c = 0; c < kTotalInputs; ++c) {
+      for (unsigned c = 0; c < channels().total(); ++c) {
         if (!(mask & (1u << c))) continue;   // console is not watching this input — skip its bins
         // Quantised to 0.1 dB, which is far finer than the display can resolve and far coarser
         // than a float's shortest round-trip decimal. Raw floats serialise every bin in full

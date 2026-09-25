@@ -1,4 +1,5 @@
 #include "listen_stream.h"
+#include "channel_layout.h"
 
 #include <time.h>
 
@@ -81,7 +82,7 @@ bool ListenPacer::next_float(const std::atomic<bool>& running, const float** out
 }
 
 MultiListenPacer::MultiListenPacer(const RingBuffer& ring, unsigned chunk_frames)
-    : ring_(ring), chunk_(chunk_frames), cursor_(ring.counter()), buf_(chunk_frames * kTotalInputs) {}
+    : ring_(ring), chunk_(chunk_frames), cursor_(ring.counter()), buf_(chunk_frames * st::channels().total()) {}
 
 bool MultiListenPacer::next_float(const std::atomic<bool>& running, const float** out,
                                   uint64_t* start, bool* skipped) {

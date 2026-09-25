@@ -16,7 +16,7 @@
 #include "kmsg_watch.h"
 #include "net_audio.h"
 #include "ring_buffer.h"
-#include "soc_out.h"
+#include "devices.h"
 #include "ws_hub.h"
 
 namespace httplib {
@@ -35,8 +35,7 @@ struct WebOptions {
 struct Deps {
   Control& ctl;
   NetAudioServer& net;
-  SocOutput& hdmi;
-  SocOutput& lineout;
+  Devices& devices;
   RingBuffer& ring;
   AudioEngine& engine;
   Analysis& analysis;
@@ -88,6 +87,9 @@ class WebServer {
   // Guards d_.config: the save handler replaces it while /api/state handlers on other worker
   // threads read the channel names and loopback offset out of it.
   mutable std::mutex config_m_;
+  // Serialises PUT /api/sinks/{id}: two at once could each start or stop the sink's thread between
+  // the other's check and its store, leaving the thread and `enabled` disagreeing.
+  std::mutex sink_put_m_;
 };
 
 }  // namespace st

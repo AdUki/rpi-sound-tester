@@ -20,6 +20,7 @@ class NetAudioServer;
 struct EngineStats {
   bool running = false;
   bool sim = false;
+  const char* backend = "";  // "card" (the engine card), "timer" (none) or "simulator"
   std::string device;
   unsigned rate = 0;
   unsigned period = 0;
@@ -36,7 +37,7 @@ struct EngineStats {
 // EngineCore, which does everything else with it.
 class AudioEngine {
  public:
-  // Opens the card `opt` names, or the simulator when opt.sim is set. `clock` stamps the anchor
+  // Opens the card `opt` names, or the timer when it names none or opt.sim is set. `clock` stamps the anchor
   // each block publishes and paces the simulator and the retries; it is the host's CLOCK_MONOTONIC
   // unless a test runs the engine on time of its own.
   AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt,
@@ -54,12 +55,14 @@ class AudioEngine {
 
   // Wired in by main() before start(): the engine reads its network channels each block.
   void set_net(NetAudioServer* net) { core_.set_net(net); }
-  // Also before start(): the rings the HDMI speakers and the line out's pair are handed over
-  // through. Each is written every block, its sink on or off, so its counter stays equal to the
-  // capture ring's and an index in it means the same sample as everywhere else. False, and the
-  // sink left without audio, for a ring the engine cannot write: see EngineCore.
-  bool set_hdmi_ring(RingBuffer* ring) { return core_.set_hdmi_ring(ring); }
-  bool set_lineout_ring(RingBuffer* ring) { return core_.set_lineout_ring(ring); }
+  // The ring a sink slot's channels are handed over through, wired in when a device is found for
+  // the slot, before or after start(). False, and the sink left without audio, for a ring the
+  // engine cannot write: see EngineCore.
+  bool set_sink_ring(unsigned slot, RingBuffer* ring) { return core_.set_sink_ring(slot, ring); }
+  // Likewise the timeline a device-input column is read from.
+  void set_input_timeline(unsigned column, NetTimeline* timeline) {
+    core_.set_input_timeline(column, timeline);
+  }
   double rate() const { return static_cast<double>(opt_.rate); }
   unsigned period() const { return period_.load(std::memory_order_relaxed); }
   uint64_t identify_frames() const { return core_.identify_frames(); }
@@ -82,7 +85,7 @@ class AudioEngine {
   // The card: opened by the audio thread, and opened again after anything that ends the stream,
   // forever.
   void run_card();
-  // The simulator: opened once, and it cannot fail.
+  // The timer (or the simulator): opened once, and it cannot fail.
   void run_sim();
   // Streams until the engine stops or the stream fails past recovering.
   void run_stream();

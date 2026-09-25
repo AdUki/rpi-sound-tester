@@ -38,7 +38,7 @@ class ListenPacer {
 
 // Like ListenPacer but reads every input channel at one cursor, so all channels share a single
 // sample clock — the property the multichannel Ogg/Opus stream needs to stay sample-aligned.
-// Hands back kTotalInputs-interleaved float frames.
+// Hands back channels().total()-interleaved float frames.
 class MultiListenPacer {
  public:
   explicit MultiListenPacer(const RingBuffer& ring, unsigned chunk_frames = kListenChunkFrames);

@@ -122,19 +122,22 @@ target_include_directories(third_party SYSTEM INTERFACE
 target_compile_definitions(third_party INTERFACE SPDLOG_HEADER_ONLY)
 
 add_library(soundtester_core STATIC
+  src/alsa_devices.cpp
   src/analysis.cpp
   src/audio_backend.cpp
   src/audio_engine.cpp
-  src/board_profile.cpp
+  src/board.cpp
   src/capture.cpp
   src/config.cpp
+  src/device_input.cpp
+  src/devices.cpp
   src/engine_core.cpp
   src/generators.cpp
-  src/soc_out.cpp
   src/kmsg_watch.cpp
   src/listen_encoder.cpp
   src/listen_stream.cpp
   src/net_audio.cpp
+  src/sink_out.cpp
   src/util/log.cpp
   src/util/sysinfo.cpp
   src/webserver.cpp
@@ -153,6 +156,13 @@ install(TARGETS soundtesterd RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY www/ DESTINATION ${CMAKE_INSTALL_DATADIR}/soundtester/www)
 install(FILES config/default-config.json DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/soundtester
         RENAME config.json)
+# What the image says about the board it runs on: see src/board.h. One file per board, chosen by
+# the image recipe; a build without it installs none, and the daemon runs as a desktop.
+set(ST_BOARD "" CACHE STRING "board file to install as board.json (config/boards/<ST_BOARD>.json)")
+if(ST_BOARD)
+  install(FILES config/boards/${ST_BOARD}.json DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/soundtester
+          RENAME board.json)
+endif()
 
 enable_testing()
 add_subdirectory(tests)

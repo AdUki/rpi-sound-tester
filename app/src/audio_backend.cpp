@@ -1,5 +1,7 @@
 #include "audio_backend.h"
 
+#include "channel_layout.h"
+
 #include <alsa/asoundlib.h>
 
 #include <algorithm>
@@ -38,10 +40,11 @@ SlotMaps snapshot_slot_maps(const Control& ctl, unsigned capture_channels) {
 
 void s32_to_inputs(const int32_t* raw, size_t frames, unsigned channels, const SlotMaps& maps,
                    float* in_all) {
+  const unsigned stride = st::channels().total();
   for (unsigned c = 0; c < kInputs; ++c) {
     const int32_t* src = raw + maps.in[c];
     float* dst = in_all + c;
-    for (size_t i = 0; i < frames; ++i) dst[i * kTotalInputs] = s32_to_float(src[i * channels]);
+    for (size_t i = 0; i < frames; ++i) dst[i * stride] = s32_to_float(src[i * channels]);
   }
 }
 
@@ -379,8 +382,13 @@ TimerBackend::TimerBackend(const EngineOptions& opt, Clock& clock)
 }
 
 bool TimerBackend::open() {
-  LOG_INFO("simulator: {} Hz, period {}, virtual loopback OUT->IN (stagger {} frames/ch)",
-           opt_.rate, opt_.period, opt_.sim_stagger);
+  if (opt_.sim) {
+    LOG_INFO("simulator: {} Hz, period {}, virtual loopback OUT->IN (stagger {} frames/ch)",
+             opt_.rate, opt_.period, opt_.sim_stagger);
+  } else {
+    LOG_INFO("no engine card: a timer paces the engine at {} Hz, period {}", opt_.rate,
+             opt_.period);
+  }
   return true;
 }
 
@@ -391,11 +399,14 @@ bool TimerBackend::start() {
 }
 
 BackendShape TimerBackend::shape() const {
+  if (!opt_.sim) return {opt_.rate, opt_.period, 0, 0, "none (timer)"};
   return {opt_.rate, opt_.period, kInputs, kOutputs, "float32 (simulated)"};
 }
 
 long TimerBackend::read_block(uint64_t n, float* in_all) {
   const size_t period = opt_.period;
+  if (!opt_.sim) return static_cast<long>(period);  // no card, so nothing captured
+  const unsigned stride = st::channels().total();
   uint64_t seed = seed_;
   auto noise = [&seed] { return xorshift_white(seed); };
 
@@ -405,7 +416,7 @@ long TimerBackend::read_block(uint64_t n, float* in_all) {
     for (unsigned c = 0; c < kInputs; ++c) {
       const size_t delay = period + static_cast<size_t>(c) * opt_.sim_stagger;
       const size_t pos = (n + i + sim_delay_len_ - delay) % sim_delay_len_;
-      in_all[i * kTotalInputs + c] = sim_delay_[pos * kInputs + c] + 3e-5f * noise();
+      in_all[i * stride + c] = sim_delay_[pos * kInputs + c] + 3e-5f * noise();
     }
   }
   seed_ = seed;
@@ -413,7 +424,7 @@ long TimerBackend::read_block(uint64_t n, float* in_all) {
 }
 
 long TimerBackend::write_block(uint64_t n, const float* out8, size_t frames) {
-  for (size_t i = 0; i < frames; ++i) {
+  for (size_t i = 0; opt_.sim && i < frames; ++i) {
     const size_t pos = (n + i) % sim_delay_len_;
     for (unsigned c = 0; c < kInputs; ++c) sim_delay_[pos * kInputs + c] = out8[i * kOutputs + c];
   }

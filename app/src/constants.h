@@ -26,12 +26,11 @@ inline constexpr unsigned kOutputs = 8;  // CS42448 DAC channels
 // note it lowers the longest Analyze buffer that will still fit.
 inline constexpr unsigned kNetInputs = 6;
 
-// Ring width, and what every consumer of captured audio iterates: analysis, meters, spectrum,
-// the scope envelope, listen/Ogg, capture snapshots and xcorr. Channels [0, kInputs) are the
-// card's ADCs; [kInputs, kTotalInputs) are network inputs.
-inline constexpr unsigned kTotalInputs = kInputs + kNetInputs;
-
-inline constexpr bool is_net_input(unsigned ch) { return ch >= kInputs && ch < kTotalInputs; }
+// The most columns the ring can have: what every per-channel array is sized for. How many a run
+// actually has is channels().total() (channel_layout.h), decided once at startup. The telemetry
+// mask is one bit per column in a u32, so this may not pass 32.
+inline constexpr unsigned kMaxInputs = 24;
+static_assert(kInputs + kNetInputs <= kMaxInputs, "the Octo's layout must fit");
 
 // The Octo machine driver raises capture channels_max to 8 while a stream runs
 // (TDM frames carry 8 slots); slots 6..7 hold no ADC data.
@@ -48,12 +47,6 @@ inline constexpr float kInputGainMaxDb = 40.0f;
 // network channel has no ADC. It is also what gives an ALSA mixer on the sending machine a
 // playback volume worth the name, since a control that cannot go below unity is not one.
 inline constexpr float kNetGainMinDb = -60.0f;
-
-// The gain range depends on where the channel's audio comes from; there is one answer and both
-// the config-apply path and the live PUT handler ask for it here.
-inline constexpr float input_gain_min_db(unsigned ch) {
-  return is_net_input(ch) ? kNetGainMinDb : kInputGainMinDb;
-}
 
 // Shared clamp ranges, enforced both when a config file is applied (config.cpp) and on the
 // live PUT handlers (webserver.cpp) so the two paths cannot drift.
@@ -154,6 +147,11 @@ inline constexpr unsigned kNetDelayDefaultMs = 1000;
 inline constexpr unsigned kNetDelayMinMs = 0;
 inline constexpr unsigned kNetDelayMaxMs = 2000;
 
+// The block the network write guard is counted in: two of these ahead of the reader (see
+// NetAudioServer::guard_frames), whatever period the engine runs. A guard that grew with the
+// period would drop every packet of a short net.delay_ms (21 to 43 ms) as late.
+inline constexpr unsigned kNetGuardPeriod = 1024;
+
 // Per-channel timeline depth. Two readers sit in it at once — the playout read at n and the
 // trailing ring read at n - delay — while the sender writes a delay ahead of playout, so the
 // live span is about twice the delay. This has to clear 2 * kNetDelayMaxMs with room over.
@@ -169,7 +167,7 @@ inline constexpr double kNetResyncS = 0.25;
 // How quickly a converter's ratio trim closes a residual offset, and how far it may stray from
 // nominal. 0.2% is far more than two crystals can differ by, and small enough that the audio does
 // not audibly change pitch while it is being applied. Shared by every clock this device has to
-// follow: a network sender's, and the HDMI and line outputs'.
+// follow: a network sender's, and every sink's.
 inline constexpr double kAsrcTauS = 5.0;
 inline constexpr double kAsrcTrimMax = 0.002;
 
@@ -178,60 +176,74 @@ inline constexpr double kAsrcTrimMax = 0.002;
 inline constexpr unsigned kNetPacketFrames = ST_PACKET_FRAMES;
 inline constexpr unsigned kNetMaxPacketFrames = 4096;
 
-// ---- The SoC's own outputs: HDMI and the line out -------------------------------------------
+// ---- Sinks: every playback device other than the engine card ------------------------------
 //
-// Two more sinks on the Pi's own audio (the firmware snd_bcm2835 driver): its HDMI port and its
-// 3.5 mm jack. Each plays the same buses and routed inputs as the Octo's DACs, rendered by the
-// audio thread at the same n and handed to a thread of its own through a ring. Both run on the
-// Pi's clock, not the Octo's FPGA, so that thread follows the card with a trimmed sample-rate
-// converter, as a network input does. Everything below is shared by the two.
+// HDMI, a Pi's 3.5 mm jack, a USB interface: each plays the same buses and routed inputs as the
+// engine card's outputs, rendered by the audio thread at the same n and handed to a thread of its
+// own through a ring. None of them runs on the engine's clock, so that thread follows it with a
+// trimmed sample-rate converter, as a network input does.
 //
-// HDMI takes up to 8 channels, in the speaker layouts of hdmi_layout.h. Eight is a hard ceiling
-// twice over: it is all HDMI carries as plain PCM (7.1), and it is the firmware driver's
-// channels_max. Its ring and routing are always 8 wide, so a change of layout only reopens the
-// HDMI PCM; the audio thread renders the speakers in play into their PCM slots and zeroes the rest.
-inline constexpr unsigned kHdmiMaxChannels = 8;
-// The jack is stereo and nothing else.
-inline constexpr unsigned kLineoutChannels = 2;
+// A sink has up to 8 channels: all HDMI carries as plain PCM (7.1). Its ring and routing are always
+// that wide, so a change of layout only reopens its PCM; the audio thread renders the channels in
+// play into their PCM slots and zeroes the rest. There are up to kMaxSinks of them, each made when
+// a device is found for it and kept for the life of the process.
+inline constexpr unsigned kMaxSinkWidth = 8;
+inline constexpr unsigned kMaxSinks = 8;
 
-// The rate each PCM is opened at. 48 kHz by default because every HDMI sink must accept it: the
-// firmware driver advertises anything up to 192 kHz whatever the TV can actually play, so asking
-// for more "succeeds" even when the sink then resamples or drops it out of sight. The choices are
-// HDMI's own audio rates; the converter takes the engine's rate to any of them.
-inline constexpr unsigned kSocRateDefault = 48000;
-inline constexpr unsigned kSocRates[] = {32000, 44100, 48000, 88200, 96000, 176400, 192000};
-inline constexpr bool soc_rate_ok(unsigned r) {
-  for (unsigned x : kSocRates)
+// The rate a PCM is opened at unless its config says otherwise. 48 kHz because every HDMI sink and
+// nearly every USB device accepts it: HDMI drivers advertise anything up to 192 kHz whatever the
+// TV can actually play, so asking for more "succeeds" even when the sink then resamples or drops it
+// out of sight. The choices are HDMI's own audio rates; the converter takes the engine's rate to
+// any of them, and a device is offered those of them it accepts.
+inline constexpr unsigned kSinkRateDefault = 48000;
+inline constexpr unsigned kSinkRates[] = {32000, 44100, 48000, 88200, 96000, 176400, 192000};
+inline constexpr bool sink_rate_ok(unsigned r) {
+  for (unsigned x : kSinkRates)
     if (x == r) return true;
   return false;
 }
 
-// Handoff ring, in engine frames: 2^16 is 0.68 s at 96 kHz, 2 MB pinned at HDMI's 8 channels. The
-// reader sits a few periods behind the writer, so this only has to outlast a stall of its thread.
-inline constexpr size_t kSocRingFrames = 1u << 16;
+// Handoff ring, in engine frames: 2^16 is 0.68 s at 96 kHz, 2 MB pinned at 8 channels. The reader
+// sits a few periods behind the writer, so this only has to outlast a stall of its thread.
+inline constexpr size_t kSinkRingFrames = 1u << 16;
 
-// The PCM's own buffering. The firmware driver reports its position in coarse steps, so generous
-// periods are worth more than a few milliseconds of latency: what a delay measurement needs is for
+// The PCM's own buffering. The Pi's firmware driver reports its position in coarse steps, so
+// generous periods are worth more than a few milliseconds of latency: what a delay measurement needs is for
 // the latency to be constant, not small.
-inline constexpr unsigned kSocPeriodMs = 20;
-inline constexpr unsigned kSocPeriods = 4;
+inline constexpr unsigned kSinkPeriodMs = 20;
+inline constexpr unsigned kSinkPeriods = 4;
 
 // How far behind the card's current sample the reader aims, in engine periods, on top of the
 // PCM's buffer itself. The engine publishes a whole period at a time, so the reader needs at least
 // one period of slack to never find its next chunk not yet written; three leaves room for
 // scheduling jitter.
-inline constexpr unsigned kSocRingLagPeriods = 3;
+inline constexpr unsigned kSinkRingLagPeriods = 3;
 
 // Past this much latency error the output is re-anchored rather than walked back by the trim.
-inline constexpr double kSocResyncS = 0.05;
+inline constexpr double kSinkResyncS = 0.05;
 
 // How long after an anchor the latency readings are ignored. A driver that has just started
 // reports its queue in a transient way for the first few periods — measured under PipeWire at
 // 70 ms short — and letting that prime the filter trips a resync against nothing.
-inline constexpr double kSocSettleS = 0.5;
+inline constexpr double kSinkSettleS = 0.5;
 
-// Below the audio thread (80): a hiccup on either must never cost the Octo a block.
-inline constexpr int kSocRtPriority = 60;
+// Below the audio thread (80): a hiccup on a sink must never cost the engine a block.
+inline constexpr int kSinkRtPriority = 60;
+
+// ---- Device inputs: every capture device other than the engine card ----------------------------
+//
+// A USB interface's inputs, the VIM3L's HDMI loopback: captured on the device's own thread and
+// clock, and placed on the engine's axis through a trimmed converter, into ring columns reserved for
+// them at startup (board.json's device_inputs).
+//
+// While any is bound the capture axis is held back at least this much, so a frame captured now has
+// arrived before the ring reads it: the driver's period and queue, the converter's chunk and the
+// timeline's guard of two engine blocks all fit in it.
+inline constexpr unsigned kDeviceInputDelayMs = 150;
+// The capture PCM's own buffering: short periods, so a frame waits in the driver as little as
+// possible, and enough of them to ride out a stall of its thread.
+inline constexpr unsigned kInputPeriodMs = 10;
+inline constexpr unsigned kInputPeriods = 8;
 
 // "Genie" convenience helpers (GET /api/genie/sound, GET /api/genie/sync).
 inline constexpr float kGenieSoundThresholdDb = -60.0f;  // peak_db above this reads as "sound"

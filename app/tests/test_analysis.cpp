@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "channel_layout.h"
 #include "check.h"
 #include "constants.h"
 #include "rates.h"
@@ -30,14 +31,14 @@ void test_columns_are_a_two_hundredth_of_a_second(unsigned rate) {
 
   // Longer than the analysis thread's warm-up, which is its widest window.
   const uint64_t total = 48000;
-  RingBuffer ring(1u << 16, kTotalInputs, 2 * kTestPeriod);
-  std::vector<float> block(static_cast<size_t>(kTestPeriod) * kTotalInputs);
+  RingBuffer ring(1u << 16, st::channels().total(), 2 * kTestPeriod);
+  std::vector<float> block(static_cast<size_t>(kTestPeriod) * st::channels().total());
   for (uint64_t n = 0; n < total; n += kTestPeriod) {
     std::fill(block.begin(), block.end(), 0.0f);
     for (unsigned i = 0; i < kTestPeriod; ++i) {
       const uint64_t t = n + i;
-      if (t % frames == 0) block[i * kTotalInputs] = -spike(t / frames);
-      if (t % frames == frames - 1) block[i * kTotalInputs] = spike(t / frames);
+      if (t % frames == 0) block[i * st::channels().total()] = -spike(t / frames);
+      if (t % frames == frames - 1) block[i * st::channels().total()] = spike(t / frames);
     }
     ring.write(block.data(), kTestPeriod);
   }
