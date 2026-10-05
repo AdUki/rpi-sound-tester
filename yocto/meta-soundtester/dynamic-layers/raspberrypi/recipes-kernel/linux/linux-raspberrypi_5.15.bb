@@ -38,9 +38,10 @@ SRC_URI = " \
     file://gcc13-compat.cfg \
     file://0001-ASoC-audioinjector-octo-set-the-card-owner.patch \
     file://0002-ASoC-bcm2835-i2s-only-report-SYNC-error-when-clock-master.patch \
+    file://0003-ASoC-cs42xx8-defer-probe-while-the-codec-is-held-in-reset.patch \
 "
 
-# Two kernel fixes, both to keep false alarms out of the kernel log.
+# Three kernel fixes: two keep false alarms out of the kernel log, one keeps the card.
 #
 # 0001: the Octo machine driver forgets .owner on its snd_soc_card, so every boot trips
 #       WARN_ON(!module) in snd_card_new() and taints the kernel with a backtrace through the
@@ -54,6 +55,11 @@ SRC_URI = " \
 #       impossible — so the error is reported only when we own the clock. "I2S SYNC error!" is
 #       also the symptom of the card's real TDM slot-rotation fault, which this daemon raises a
 #       UI banner on; a false one on every boot teaches the operator to ignore the real one.
+#
+# 0003: the Octo's machine driver pulses the codec's reset for 1.5 s in its probe, and a CS42448
+#       probe that lands inside the pulse is NACKed and gives up for good: no sound card. Load order
+#       decides it; with the Bluetooth modules loading alongside it lost on every boot tried. The
+#       codec now defers instead, and is probed again once the pulse is over.
 
 require recipes-kernel/linux/linux-raspberrypi.inc
 

@@ -384,6 +384,72 @@ void test_the_pi_config_file_still_loads() {
   rmdir(dir.c_str());
 }
 
+void test_bluetooth_round_trip() {
+  Config a;
+  a.bluetooth.enabled = false;
+  a.bluetooth.name = "bench-tester";
+  a.bluetooth.pairable = false;
+  a.bluetooth.discoverable_timeout_s = 60;
+  a.bluetooth.input = true;
+  a.bluetooth.output_device = "bluealsa:DEV=F8:DF:15:0A:11:3C,PROFILE=a2dp";
+  // The output's routing is a sink's like any other.
+  a.sinks[kBtSinkId].enabled = true;
+  a.sinks[kBtSinkId].outputs[1].source_type = "gen";
+  a.sinks[kBtSinkId].outputs[1].source_index = "ping";
+
+  const std::string text = a.to_json();
+  Config b;
+  std::string err;
+  CHECK(Config::from_json(text, &b, &err));
+  CHECK(!b.bluetooth.enabled);
+  CHECK_EQ(b.bluetooth.name, std::string("bench-tester"));
+  CHECK(!b.bluetooth.pairable);
+  CHECK_EQ(b.bluetooth.discoverable_timeout_s, 60u);
+  CHECK(b.bluetooth.input);
+  CHECK_EQ(b.bluetooth.output_device, a.bluetooth.output_device);
+  CHECK(b.sinks.count(kBtSinkId) == 1 && b.sinks[kBtSinkId].enabled);
+  CHECK_EQ(b.sinks[kBtSinkId].outputs[1].source_index, std::string("ping"));
+
+  Control ctl;
+  b.apply_to(ctl, 96000);
+  CHECK(ctl.net.bt_input.load());
+
+  // Live state comes back from Control; the adapter's settings, which Control does not hold, from
+  // the base the web server keeps current.
+  ctl.net.bt_input.store(false);
+  const Config c = Config::from_control(ctl, b);
+  CHECK(!c.bluetooth.input);
+  CHECK_EQ(c.bluetooth.name, std::string("bench-tester"));
+  CHECK_EQ(c.bluetooth.output_device, a.bluetooth.output_device);
+
+  // A hand-edited timeout of days is clamped; defaults are a powered, pairable radio with the
+  // input off, playing to whichever speaker connected last.
+  Config odd;
+  CHECK(Config::from_json(R"({"bluetooth": {"discoverable_timeout_s": 999999}})", &odd, &err));
+  CHECK_EQ(odd.bluetooth.discoverable_timeout_s, kBtDiscoverableMaxS);
+  CHECK(Config{}.bluetooth.enabled);
+  CHECK(Config{}.bluetooth.pairable);
+  CHECK(!Config{}.bluetooth.input);
+  CHECK_EQ(Config{}.bluetooth.output_device, std::string(kBtDefaultDevice));
+}
+
+// The Bluetooth input lands on network channels too, so it needs the alignment delay as much as a
+// network sender does — and with both off the device must stay exactly as it was without either.
+void test_capture_delay_follows_the_bluetooth_input_too() {
+  Control ctl;
+  Config c;
+  c.net_delay_ms = 500;
+  c.net_enabled = false;
+  c.bluetooth.input = true;
+  c.apply_to(ctl, 96000);
+  CHECK_EQ(ctl.net.delay_frames.load(), 48000u);
+  c.bluetooth.input = false;
+  c.apply_to(ctl, 96000);
+  CHECK_EQ(ctl.net.delay_frames.load(), 0u);
+  ctl.net.enabled.store(true);
+  CHECK_EQ(net_delay_frames(ctl.net, 96000), 48000u);
+}
+
 void test_garbage_is_rejected() {
   Config c;
   std::string err;
@@ -405,5 +471,7 @@ int main() {
   test_sink_round_trip();
   test_old_sink_keys_are_read();
   test_the_pi_config_file_still_loads();
+  test_bluetooth_round_trip();
+  test_capture_delay_follows_the_bluetooth_input_too();
   return report("config");
 }

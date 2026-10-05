@@ -245,6 +245,46 @@ inline constexpr unsigned kDeviceInputDelayMs = 150;
 inline constexpr unsigned kInputPeriodMs = 10;
 inline constexpr unsigned kInputPeriods = 8;
 
+// ---- Bluetooth --------------------------------------------------------------------------------
+//
+// The Pi's own radio in both A2DP roles, with BlueZ running it and bluez-alsa carrying the audio.
+// A speaker is a sink (sink_out.h) on bluez-alsa's playback PCM; a phone playing to the device is a
+// sender on the network channels, read from bluez-alsa's capture PCM. A2DP is
+// stereo both ways.
+inline constexpr unsigned kBtChannels = 2;
+
+// The bluez-alsa PCM for "the most recently connected device" of whichever direction it is opened
+// in. An output pointed at a particular speaker names its address instead.
+inline constexpr const char* kBtDefaultDevice = "bluealsa:DEV=00:00:00:00:00:00,PROFILE=a2dp";
+
+// The Bluetooth output is a sink like any other, under this id: in /api/sinks, in config.json's
+// "sinks", and in the console. It is not a hardware device the scan finds, so it is added by name.
+inline constexpr const char* kBtSinkId = "bluetooth";
+
+// How long the device stays visible to a phone's scan once made discoverable. 0 means until it is
+// turned off, which BlueZ allows; the ceiling only keeps a typo from leaving it visible for days.
+inline constexpr unsigned kBtDiscoverableDefaultS = 180;
+inline constexpr unsigned kBtDiscoverableMaxS = 3600;
+
+// A scan stops by itself after this long. Inquiry shares the radio with any running A2DP link, and
+// on a Pi 3 with Wi-Fi as well, so one left running by a forgotten browser tab would cost audio.
+inline constexpr unsigned kBtScanS = 60;
+
+// BlueZ gives an agent about a minute to answer before it gives up on the pairing itself. Ours
+// expires a little sooner, so the console never offers an answer nobody is waiting for.
+inline constexpr unsigned kBtRequestTimeoutS = 55;
+
+// How long a pairing or a connection may take before it is reported as failed. Pairing includes
+// the time the other side's user takes to tap "Pair".
+inline constexpr unsigned kBtPairTimeoutS = 60;
+inline constexpr unsigned kBtConnectTimeoutS = 30;
+
+// The bluez-alsa capture PCM's own buffering, for a phone's audio coming in. The input thread reads
+// it as soon as anything arrives, so this only has to outlast that thread being late; the radio's
+// jitter is absorbed downstream, by the alignment delay.
+inline constexpr unsigned kBtInputPeriodMs = 20;
+inline constexpr unsigned kBtInputPeriods = 10;
+
 // "Genie" convenience helpers (GET /api/genie/sound, GET /api/genie/sync).
 inline constexpr float kGenieSoundThresholdDb = -60.0f;  // peak_db above this reads as "sound"
 

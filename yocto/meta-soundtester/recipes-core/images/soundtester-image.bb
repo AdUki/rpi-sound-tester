@@ -14,6 +14,7 @@ IMAGE_INSTALL = " \
     alsa-lib \
     avahi-daemon \
     ${SOUNDTESTER_WIFI_FIRMWARE} \
+    ${SOUNDTESTER_BT_FIRMWARE} \
     ${CORE_IMAGE_EXTRA_INSTALL} \
 "
 
@@ -31,6 +32,12 @@ IMAGE_INSTALL = " \
 # on a Pi 3, 43455/43456 on a Pi 4) and install it outright, but only when Wi-Fi was
 # actually configured.
 SOUNDTESTER_WIFI_FIRMWARE = "${@' '.join(p for p in (d.getVar('MACHINE_EXTRA_RRECOMMENDS') or '').split() if p.startswith('linux-firmware')) if d.getVar('SOUNDTESTER_WIFI_SSID') else ''}"
+
+# The Bluetooth half of the same chip has the same problem: its patch file (BCM43430A1.hcd on a
+# Pi 3B, BCM4345C0.hcd on a 3B+) is in the same list and goes missing the same quiet way. Without
+# it the kernel driver logs "Patch not found" and runs the chip on its ROM firmware, without the
+# fixes the patch carries.
+SOUNDTESTER_BT_FIRMWARE = "${@' '.join(p for p in (d.getVar('MACHINE_EXTRA_RRECOMMENDS') or '').split() if p.startswith('bluez-firmware')) if d.getVar('SOUNDTESTER_BLUETOOTH') == '1' else ''}"
 
 # Under read-only-rootfs every pkg_postinst must run at rootfs time; the build fails
 # otherwise.

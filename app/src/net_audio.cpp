@@ -169,6 +169,7 @@ struct NetAudioServer::Channel {
   std::string peer;
   std::string name;
   std::string host;
+  std::string transport = "net";
   // Survives the disconnect on purpose: it is what makes a returning sender land back here, and
   // what lets the console still say whose channel this is while the machine is switched off.
   std::string last_ip;
@@ -363,6 +364,22 @@ void NetAudioServer::release_channels(unsigned base, unsigned count) {
   }
 }
 
+void NetAudioServer::label_channels(unsigned base, unsigned count, const std::string& peer,
+                                    const std::string& name, const std::string& transport) {
+  for (unsigned i = 0; i < count && base + i < kNetInputs; ++i) {
+    Channel& c = *chans_[base + i];
+    {
+      std::lock_guard<std::mutex> lock(c.m);
+      c.peer = peer;
+      c.name = name;
+      c.host.clear();
+      c.transport = transport;
+    }
+    c.timeline.reset();
+    ctl_.inputs[st::channels().net_base() + base + i].bypass.store(false);
+  }
+}
+
 void NetAudioServer::accept_loop() {
   while (running_.load()) {
     std::vector<pollfd> pfds;
@@ -462,6 +479,7 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
           c.peer = peer;
           c.name = name;
           c.host.clear();
+          c.transport = "net";
         }
         c.timeline.reset();
         // Mixable until this stream's FORMAT says otherwise; the last holder may have declared
@@ -516,13 +534,11 @@ bool NetAudioServer::Session::format(const uint8_t* p, uint32_t len) {
       // A rate or format change restarts the stream: the converter's history is of the old rate
       // and the output position no longer means anything.
       std::string aerr;
-      if (!asrc.configure(channels, src_rate, srv.rate_, &aerr)) {
+      if (!feed.configure(base, channels, src_rate, &aerr)) {
         LOG_WARN("net: {} cannot be resampled ({} Hz -> {} Hz): {}", peer, r, srv.rate_, aerr);
         return false;
       }
-      out_next = 0;
       expect_pos = 0;
-      lead.reset();
 
       // In FORMAT rather than the HELLO: it is a property of the stream, and one machine may
       // offer a volume-controlled PCM and an un-mixable one.
@@ -572,13 +588,11 @@ bool NetAudioServer::Session::codec_init(const uint8_t* p, uint32_t len) {
       // the converter has to be told about.
       src_rate = static_cast<unsigned>(vorbis.rate());
       std::string aerr;
-      if (!asrc.configure(channels, src_rate, srv.rate_, &aerr)) {
+      if (!feed.configure(base, channels, src_rate, &aerr)) {
         LOG_WARN("net: {} cannot be resampled from {} Hz: {}", peer, src_rate, aerr);
         return false;
       }
-      out_next = 0;
       expect_pos = 0;
-      lead.reset();
       LOG_INFO("net: {} vorbis {} Hz x{}ch", peer, src_rate, vorbis.channels());
       return true;
 }
@@ -596,8 +610,6 @@ bool NetAudioServer::Session::audio(const uint8_t* p, uint32_t len) {
         return false;
       }
 
-      const uint64_t reader = srv.reader_n_.load();
-      const uint64_t max_lead = static_cast<uint64_t>(srv.rate_ * kNetTimelineMs / 2000.0);
       const uint8_t* samples = p + ST_AUDIO_FIXED;
 
       // Into interleaved float, which is what the converter wants and what the rest of the path
@@ -625,65 +637,13 @@ bool NetAudioServer::Session::audio(const uint8_t* p, uint32_t len) {
       }
       const size_t in_frames = in_il.size() / channels;
 
-      // Where this audio is heard is decided HERE, not by the sender. The stream is anchored the
-      // moment its first packet arrives — at the reader's position plus the alignment delay — and
-      // everything after it follows on contiguously. The sender never learns the card's clock.
-      const uint64_t delay = srv.ctl_.net.delay_frames.load();
-
-      // An INTERPOLATED reader position, not the raw one. srv.reader_n_ only moves when the audio
-      // thread finishes a block, so measuring against it quantises the error by up to a whole
-      // period — noise worth half the trim's authority, and none of it drift.
-      const uint64_t reader_now = srv.ctl_.anchor.estimate(srv.clock_.now_ns(), srv.rate_);
-      const uint64_t reader_pos = reader_now ? reader_now : reader;
-
       const bool sender_jumped = expect_pos != 0 && pos != expect_pos;
-      // Too far out to walk back: at the trim's authority a quarter second would take two
-      // minutes, and being wrong for two minutes is worse than one discontinuity now. Judged on
-      // the filtered value, so a moment's jitter cannot trigger it.
-      const bool adrift = out_next != 0 && lead.primed &&
-                          std::fabs(lead.avg - static_cast<double>(delay)) > srv.resync_frames();
-
-      if (out_next == 0 || sender_jumped || adrift) {
-        if (sender_jumped) {
-          LOG_WARN("net: {} skipped {} frames — re-anchoring", peer,
-                   static_cast<int64_t>(pos) - static_cast<int64_t>(expect_pos));
-        } else if (adrift) {
-          LOG_WARN("net: {} drifted {:.0f} ms past what the ratio can pull back — re-anchoring",
-                   peer, 1000.0 * (lead.avg - static_cast<double>(delay)) / srv.rate_);
-          for (unsigned c = 0; c < channels; ++c)
-            srv.chans_[base + c]->resyncs.fetch_add(1, std::memory_order_relaxed);
-        }
-        asrc.reset();
-        lead.reset();
-        out_next = reader_pos + delay;
+      if (sender_jumped) {
+        LOG_WARN("net: {} skipped {} frames — re-anchoring", peer,
+                 static_cast<int64_t>(pos) - static_cast<int64_t>(expect_pos));
       }
       expect_pos = pos + frames;
-
-      // Measured only now, and never before the anchor above: until out_next means something,
-      // "lead" is out_next minus the reader with out_next still zero, which is not a small error
-      // but a nonsensical one — and priming the filter with it costs a spurious resync on every
-      // stream that starts.
-      const double lead_now = static_cast<double>(static_cast<int64_t>(out_next) -
-                                                  static_cast<int64_t>(reader_pos));
-
-      // The one control loop. out_next runs ahead of the reader by the alignment delay when the
-      // two machines agree; every way in which they do not — a crystal a hundred ppm out, a rate
-      // the card does not run at — shows up here, and is taken out by nudging the converter's
-      // ratio rather than by a correction applied anywhere as a step.
-      const double dt_s = src_rate ? static_cast<double>(frames) / src_rate : 0.0;
-      const double lead_avg = lead.update(lead_now, dt_s, kNetLeadFilterTauS);
-      const double trim = asrc_trim(lead_avg, static_cast<double>(delay), srv.rate_, kAsrcTauS,
-                                    kAsrcTrimMax);
-
-      out_il.clear();
-      std::string aerr;
-      const size_t out_frames = asrc.process(in_il.data(), in_frames, trim, &out_il, &aerr);
-      if (out_frames == 0) return true;  // the converter is still priming
-      const float* src = out_il.data();
-      const uint64_t write_at = out_next;
-      out_next += out_frames;
-
-      distribute(src, out_frames, write_at, reader, max_lead);
+      feed.push(in_il.data(), in_frames, sender_jumped);
 
       // Report on a fixed cadence. Audio packets arrive every few milliseconds, so hanging the
       // timer off them is both simple and reliable — no extra thread, and it stops on its own the
@@ -696,27 +656,105 @@ bool NetAudioServer::Session::audio(const uint8_t* p, uint32_t len) {
       return true;
 }
 
-// What the device knows and the sender cannot: where its audio actually landed relative to
-// playout. Nothing on the far end steers anything with it — the device disciplines its own
-// converter — but snd_pcm_delay() needs it to tell an application the truth.
-void NetAudioServer::Session::distribute(const float* src, size_t frames, uint64_t at,
-                                         uint64_t reader, uint64_t max_lead) {
-  chan.resize(frames);
-  for (unsigned c = 0; c < channels; ++c) {
-    NetAudioServer::Channel& ch = *srv.chans_[base + c];
+// ---- Feed: a sender's anchor, servo and converter -------------------------------------------
+
+bool NetAudioServer::Feed::configure(int base, unsigned channels, unsigned src_rate,
+                                     std::string* err) {
+  if (!asrc_.configure(channels, src_rate, srv_.rate_, err)) return false;
+  base_ = base;
+  channels_ = channels;
+  src_rate_ = src_rate;
+  restart();
+  return true;
+}
+
+void NetAudioServer::Feed::restart() {
+  out_next_ = 0;
+  lead_.reset();
+}
+
+bool NetAudioServer::Feed::behind() const {
+  if (out_next_ == 0) return false;
+  const uint64_t reader = srv_.ctl_.anchor.estimate(srv_.clock_.now_ns(), srv_.rate_);
+  return reader != 0 && out_next_ < reader + srv_.guard_frames_;
+}
+
+void NetAudioServer::Feed::push(const float* il, size_t frames, bool jumped) {
+  if (base_ < 0 || channels_ == 0 || frames == 0) return;
+
+  const uint64_t reader = srv_.reader_n_.load();
+  const uint64_t max_lead = static_cast<uint64_t>(srv_.rate_ * kNetTimelineMs / 2000.0);
+  const uint64_t delay = srv_.ctl_.net.delay_frames.load();
+
+  // An INTERPOLATED reader position, not the raw one. reader_n_ only moves when the audio thread
+  // finishes a block, so measuring against it quantises the error by up to a whole period — noise
+  // worth half the trim's authority, and none of it drift.
+  const uint64_t reader_now = srv_.ctl_.anchor.estimate(srv_.clock_.now_ns(), srv_.rate_);
+  const uint64_t reader_pos = reader_now ? reader_now : reader;
+
+  // Too far out to walk back: at the trim's authority a quarter second would take two minutes,
+  // and being wrong for two minutes is worse than one discontinuity now. Judged on the filtered
+  // value, so a moment's jitter cannot trigger it.
+  const bool adrift = out_next_ != 0 && lead_.primed &&
+                      std::fabs(lead_.avg - static_cast<double>(delay)) > srv_.resync_frames();
+
+  if (out_next_ == 0 || jumped || adrift) {
+    if (adrift) {
+      LOG_WARN("{} drifted {:.0f} ms past what the ratio can pull back — re-anchoring", who_,
+               1000.0 * (lead_.avg - static_cast<double>(delay)) / srv_.rate_);
+      for (unsigned c = 0; c < channels_; ++c)
+        srv_.chans_[base_ + c]->resyncs.fetch_add(1, std::memory_order_relaxed);
+    }
+    asrc_.reset();
+    lead_.reset();
+    out_next_ = reader_pos + delay;
+  }
+
+  // Measured only now, and never before the anchor above: until out_next_ means something,
+  // "lead" is out_next_ minus the reader with out_next_ still zero, which is not a small error but
+  // a nonsensical one — and priming the filter with it costs a spurious resync on every stream
+  // that starts.
+  const double lead_now = static_cast<double>(static_cast<int64_t>(out_next_) -
+                                              static_cast<int64_t>(reader_pos));
+
+  // The one control loop. out_next_ runs ahead of the reader by the alignment delay when the two
+  // clocks agree; every way in which they do not — a crystal a hundred ppm out, a rate the card
+  // does not run at — shows up here, and is taken out by nudging the converter's ratio rather than
+  // by a correction applied anywhere as a step.
+  const double dt_s = src_rate_ ? static_cast<double>(frames) / src_rate_ : 0.0;
+  const double lead_avg = lead_.update(lead_now, dt_s, kNetLeadFilterTauS);
+  const double trim =
+      asrc_trim(lead_avg, static_cast<double>(delay), srv_.rate_, kAsrcTauS, kAsrcTrimMax);
+
+  out_il_.clear();
+  std::string aerr;
+  const size_t out_frames = asrc_.process(il, frames, trim, &out_il_, &aerr);
+  if (out_frames == 0) return;  // the converter is still priming
+  const uint64_t write_at = out_next_;
+  out_next_ += out_frames;
+  distribute(out_il_.data(), out_frames, write_at, reader, max_lead);
+}
+
+// Splits converted interleaved audio across the run's timelines and keeps each channel's counters.
+// Separate from push() because it is the only part that touches the channels the audio thread
+// reads, and it reads better without the control loop above it.
+void NetAudioServer::Feed::distribute(const float* src, size_t frames, uint64_t at,
+                                      uint64_t reader, uint64_t max_lead) {
+  chan_.resize(frames);
+  for (unsigned c = 0; c < channels_; ++c) {
+    NetAudioServer::Channel& ch = *srv_.chans_[base_ + c];
     float peak = 0.0f;
     for (size_t i = 0; i < frames; ++i) {
-      const float v = src[i * channels + c];
-      chan[i] = v;
+      const float v = src[i * channels_ + c];
+      chan_[i] = v;
       peak = std::max(peak, std::fabs(v));
     }
 
-    switch (ch.timeline.write(at, chan.data(), frames, reader, srv.guard_frames_,
-                              max_lead)) {
+    switch (ch.timeline.write(at, chan_.data(), frames, reader, srv_.guard_frames_, max_lead)) {
       case NetTimeline::Write::Ok: {
         ch.frames_received.fetch_add(frames, std::memory_order_relaxed);
         ch.last_target.store(at, std::memory_order_relaxed);
-        ch.lead_avg.store(static_cast<int64_t>(lead.avg), std::memory_order_relaxed);
+        ch.lead_avg.store(static_cast<int64_t>(lead_.avg), std::memory_order_relaxed);
         ch.lead_valid.store(true, std::memory_order_relaxed);
         {
           // Peak HOLD, not the last packet's peak: a tick train is mostly silence, so a
@@ -739,6 +777,9 @@ void NetAudioServer::Session::distribute(const float* src, size_t frames, uint64
   }
 }
 
+// What the device knows and the sender cannot: where its audio actually landed relative to
+// playout. Nothing on the far end steers anything with it — the device disciplines its own
+// converter — but snd_pcm_delay() needs it to tell an application the truth.
 bool NetAudioServer::Session::status() {
   if (base < 0) return true;
   NetAudioServer::Channel& c = *srv.chans_[base];
@@ -771,6 +812,7 @@ void NetAudioServer::serve(int fd, sockaddr_in addr, int port_channel) {
   s.ip = ipbuf;
   s.peer = s.ip + ":" + std::to_string(ntohs(addr.sin_port));
   s.port_channel = port_channel;
+  s.feed.set_who("net: " + s.peer);
 
   std::vector<uint8_t> payload;
   while (running_.load()) {
@@ -1025,6 +1067,7 @@ std::vector<NetChannelStatus> NetAudioServer::status() const {
       s.stream_index = ch.stream_index;
       s.stream_count = ch.stream_count;
       s.last_device = ch.last_device;
+      s.transport = ch.transport;
     }
     out.push_back(std::move(s));
   }

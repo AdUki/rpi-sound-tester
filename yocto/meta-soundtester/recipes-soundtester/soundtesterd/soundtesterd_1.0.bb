@@ -9,8 +9,13 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 # stream. RDEPENDS puts the shared libraries into the read-only image, mirroring alsa-lib.
 # md2html-native is the build-time tool that renders docs/api.md to www/api.html for GET /api; it
 # is native-only, so it appears in DEPENDS but not RDEPENDS (nothing of it ships to the device).
-DEPENDS = "alsa-lib libopus libogg libsamplerate0 libvorbis md2html-native"
-RDEPENDS:${PN} = "alsa-lib libopus libogg libsamplerate0 libvorbis"
+#
+# systemd for sd-bus: the daemon pairs, connects and answers BlueZ's pairing agent calls over the
+# system D-Bus itself. libsystemd is already on every image (systemd is the init), so this adds a
+# header to the build and nothing to the device. The Bluetooth audio needs no link at all: it is
+# bluez-alsa's ALSA plugin, opened by name like any other PCM.
+DEPENDS = "alsa-lib libopus libogg libsamplerate0 libvorbis md2html-native systemd"
+RDEPENDS:${PN} = "alsa-lib libopus libogg libsamplerate0 libvorbis libsystemd"
 
 # The daemon is built from app/ in this repository: the layer sits at yocto/meta-soundtester,
 # so four levels up from this recipe is the repo root. Swap this for a git:// SRC_URI if the
@@ -73,6 +78,9 @@ do_install:append() {
         bbfatal "board.json has no \"rate\"/\"period\" to set to ${SOUNDTESTER_RATE}/${SOUNDTESTER_PERIOD}"
     sed -i -e 's|"rate": *[0-9]*|"rate": ${SOUNDTESTER_RATE}|' \
            -e 's|"period": *[0-9]*|"period": ${SOUNDTESTER_PERIOD}|' $board
+    # A board that has a radio still has none in an image built without BlueZ: the daemon would
+    # only report it missing.
+    sed -i -e 's|"bluetooth": *[a-z]*|"bluetooth": ${@'true' if d.getVar('SOUNDTESTER_BLUETOOTH') == '1' else 'false'}|' $board
 }
 
 FILES:${PN} += " \
@@ -81,5 +89,6 @@ FILES:${PN} += " \
     ${systemd_system_unitdir} \
 "
 
-do_install[vardeps] += "SOUNDTESTER_HTTP_PORT SOUNDTESTER_NET_PORT SOUNDTESTER_RATE SOUNDTESTER_PERIOD"
+do_install[vardeps] += "SOUNDTESTER_HTTP_PORT SOUNDTESTER_NET_PORT SOUNDTESTER_RATE SOUNDTESTER_PERIOD \
+                        SOUNDTESTER_BLUETOOTH"
 do_configure[vardeps] += "SOUNDTESTER_BOARD"

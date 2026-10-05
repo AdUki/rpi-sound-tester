@@ -1,4 +1,16 @@
 {
+  "bluetooth": {
+    "discoverable_timeout_s": 180,
+    "enabled": true,
+    "input": {
+      "enabled": false
+    },
+    "name": "",
+    "output": {
+      "device": "bluealsa:DEV=00:00:00:00:00:00,PROFILE=a2dp"
+    },
+    "pairable": true
+  },
   "generators": {
     "music": {
       "level_db": -20.0

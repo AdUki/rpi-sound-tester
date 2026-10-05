@@ -13,6 +13,9 @@ Plug a device into the sound card, open `http://soundtester.local`, and you get:
   tick/bing/bong pings, and a short looping melody. The Pi's own HDMI audio (mono up to 7.1) and
   its 3.5 mm jack are outputs too, on the same sample axis, so a TV or AV receiver's latency can
   be measured like a DAC's.
+- **Bluetooth (A2DP, both ways):** scan, pair and connect from the browser, with nothing to
+  confirm. A paired speaker is one more output (its buttons pick the test signal), and a phone
+  playing to the tester lands on a pair of inputs on the same sample axis. Pairings survive reboots.
 - **Multiroom sync measurement:** freeze the capture, bracket a ping, and get the delay
   between two inputs **to the sample** — with a confidence number that tells you when not to
   trust it.
@@ -36,11 +39,12 @@ entire chain — generators, routing, ring buffer, scope, cross-correlation, lis
 on a laptop.
 
 ```sh
-sudo apt install libopus-dev libogg-dev   # the daemon links these (plus libasound2-dev)
+sudo apt install libopus-dev libogg-dev libsystemd-dev   # the daemon links these (plus libasound2-dev)
 git clone --recurse-submodules <url>   # the header-only libraries are submodules; --init works after the fact
 make            # list every target
 make test       # generators, ring buffer, xcorr, wav, config, opus, dsp
 make run        # http://localhost:8080, simulated card
+make run BT=fake   # ...with a scripted fake BlueZ, to try pairing without a radio
 ```
 
 Then: route the ping generator to OUT 1/2/3, go to **Scope & sync**, press **Analyze**,

@@ -34,7 +34,7 @@ struct NetTestAccess {
   }
   static void distribute(Session& s, const float* src, size_t frames, uint64_t at, uint64_t reader,
                          uint64_t max_lead) {
-    s.distribute(src, frames, at, reader, max_lead);
+    s.feed.distribute(src, frames, at, reader, max_lead);
   }
 };
 
@@ -150,6 +150,70 @@ void test_a_returning_sender_gets_its_old_channel() {
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.8", 1), 0);
   // The original machine still comes back to 3, not to the next free channel.
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2), 3);
+}
+
+// ---- a sender that lives in this process: the Bluetooth input --------------------------------
+
+// The Bluetooth input claims and names a run the way a HELLO would, and the console can tell it
+// from a network sender.
+void test_an_in_process_sender_is_labelled_as_such() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  CHECK_EQ(net.claim_channels(2, "bt:5C:E9:1E:22:40:01", 2), 2);
+  net.label_channels(2, 2, "5C:E9:1E:22:40:01", "Pixel 7", "bluetooth");
+  const auto st = net.status();
+  CHECK_EQ(st[2].transport, std::string("bluetooth"));
+  CHECK_EQ(st[3].transport, std::string("bluetooth"));
+  CHECK_EQ(st[0].transport, std::string("net"));
+  CHECK_EQ(st[2].device, std::string("Pixel 7"));
+  CHECK_EQ(st[3].stream_index, 2u);
+  net.release_channels(2, 2);
+  CHECK_EQ(net.status()[2].last_device, std::string("Pixel 7"));
+  // Something else takes the lowest free channel meanwhile; the phone still comes back to its
+  // pair, keyed on its address like any sender, so routing set up against it keeps meaning it.
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", 1), 0);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "bt:5C:E9:1E:22:40:01", 2), 2);
+}
+
+// The Feed is the whole of "where does a sender's audio land": anchored the alignment delay ahead
+// of playout, in every channel of its run alike, and recognisably behind once playout has passed
+// it. This is the property an xcorr between a Bluetooth channel and an ADC channel depends on.
+void test_a_feed_lands_the_delay_ahead_of_playout() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  constexpr uint64_t kNow = 1000000;
+  constexpr uint32_t kDelay = 96000;
+  ctl.net.delay_frames.store(kDelay);
+  ctl.anchor.publish(kNow, mono_ns());
+  std::vector<float> live(1024 * channels().total()), ring(1024 * channels().total());
+  net.read_block(kNow, 1024, kDelay, live.data(), ring.data());
+
+  const int base = net.claim_channels(ST_HELLO_ANY_CHANNEL, "bt:F8:DF:15:0A:11:3C", 2);
+  CHECK_EQ(base, 0);
+  NetAudioServer::Feed feed(net);
+  std::string err;
+  CHECK(feed.configure(base, 2, static_cast<unsigned>(kRate), &err));
+  CHECK(!feed.behind());
+
+  std::vector<float> il(4096 * 2, 0.25f);
+  for (int i = 0; i < 4; ++i) feed.push(il.data(), 4096, false);
+
+  const auto st = net.status();
+  CHECK(st[0].frames_received > 0);
+  CHECK_EQ(st[0].frames_received, st[1].frames_received);
+  CHECK_EQ(st[0].late_drops + st[0].range_drops, 0u);
+  // The first frame went in at the reader plus the delay (the reader may have moved on by a few
+  // microseconds' worth of frames since the anchor), and the end is that plus what came out.
+  CHECK(st[0].write_end >= kNow + kDelay + st[0].frames_received);
+  CHECK(st[0].write_end <= kNow + kDelay + st[0].frames_received + 2048);
+  CHECK(!feed.behind());
+
+  // Playout passes the stream, as when a phone has paused for longer than the delay: from here
+  // everything would be late, which is what behind() exists to say.
+  ctl.anchor.publish(kNow + 4 * kDelay, mono_ns());
+  CHECK(feed.behind());
+  feed.push(il.data(), 4096, true);  // re-anchored, ahead again
+  CHECK(!feed.behind());
 }
 
 // ---- which channels one mixer drives -----------------------------------------------------
@@ -471,6 +535,8 @@ int main() {
   test_a_run_that_does_not_fit_claims_nothing();
   test_an_explicit_channel_wins_and_can_be_refused();
   test_a_returning_sender_gets_its_old_channel();
+  test_an_in_process_sender_is_labelled_as_such();
+  test_a_feed_lands_the_delay_ahead_of_playout();
   test_a_channel_is_only_in_use_once_it_has_been();
   test_a_mixer_follows_its_sender_onto_the_whole_run();
   test_a_pinned_mixer_stays_on_its_channel();

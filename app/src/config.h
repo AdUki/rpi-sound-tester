@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -37,8 +38,21 @@ struct SinkConfig {
   std::array<std::string, kMaxSinkWidth> names{};
 };
 
-// The operator's settings: what "Save as boot defaults" writes. What belongs to the board — the
-// engine card, its rate and period — is board.json's (board.h) and is never saved.
+// Bluetooth. The adapter's settings belong to the Bluetooth manager rather than to Control, since
+// the audio thread reads none of them; a save takes them from here, where the PUT handler keeps
+// them current. `input` is the one live switch (NetControl::bt_input). The output is the sink
+// kBtSinkId, configured in `sinks` like any other; `output_device` is only which speaker it plays to,
+// a bluez-alsa PCM name. Pairings are not here at all: BlueZ keeps them, and they are mirrored to the
+// data partition as they change (ConfigStore::save_dir).
+struct BtConfig {
+  bool enabled = true;  // the radio is powered
+  std::string name;     // what other devices see it as; empty means the hostname
+  bool pairable = true;
+  unsigned discoverable_timeout_s = kBtDiscoverableDefaultS;
+  bool input = false;
+  std::string output_device = kBtDefaultDevice;
+};
+
 struct Config {
   std::array<InputConfig, kMaxInputs> inputs{};
   std::array<OutputConfig, kOutputs> outputs{};
@@ -76,8 +90,8 @@ struct Config {
   // interface gets its routing back when it returns.
   std::map<std::string, SinkConfig> sinks;
 
-  // Inputs and names are written for the columns channels() has, so a file saved on one board
-  // reads the same on another with the same layout.
+  BtConfig bluetooth;
+
   std::string to_json() const;
   static bool from_json(const std::string& text, Config* out, std::string* err);
 
@@ -102,6 +116,11 @@ class ConfigStore {
   bool save(const Config& cfg, std::string* err);
   bool reset(std::string* err);
 
+  // Replaces `<data dir>/<name>` with a copy of the directory `src`: how BlueZ's pairings, which it
+  // keeps on the RAM-backed /var/lib, survive a reboot. The same rules as save(): refused on a RAM
+  // fallback, and the partition is writable only for as long as the copy takes.
+  bool save_dir(const std::string& src, const std::string& name, std::string* err);
+
   const std::string& saved_path() const { return saved_path_; }
   bool has_saved() const;
 
@@ -119,6 +138,9 @@ class ConfigStore {
   std::string defaults_path_;
   std::string data_dir_;
   std::string saved_path_;
+  // Held from a remount read-write to the remount back: a save from the console and the pairings
+  // being copied from the Bluetooth thread must not remount the partition under each other.
+  mutable std::mutex write_m_;
 };
 
 }  // namespace st

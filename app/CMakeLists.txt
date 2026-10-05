@@ -53,6 +53,10 @@ pkg_check_modules(SAMPLERATE REQUIRED IMPORTED_TARGET samplerate)
 # opus this already carries; it is the ALSA plugin, installed on arbitrary machines, that loads it
 # dynamically so its absence costs nothing there.
 pkg_check_modules(VORBIS REQUIRED IMPORTED_TARGET vorbis)
+# sd-bus, for BlueZ's D-Bus API: pairing, the agent, scanning, and reading bluez-alsa's PCMs. The
+# image runs systemd anyway, so the library is already on the board. On a dev box:
+#   sudo apt install libsystemd-dev
+pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 find_package(Threads REQUIRED)
 
 # third_party/* are git submodules pinned at a tag (pocketfft: a commit — it has no tags). All
@@ -126,7 +130,10 @@ add_library(soundtester_core STATIC
   src/analysis.cpp
   src/audio_backend.cpp
   src/audio_engine.cpp
+  src/bluetooth.cpp
   src/board.cpp
+  src/bt_input.cpp
+  src/bt_player.cpp
   src/capture.cpp
   src/config.cpp
   src/device_input.cpp
@@ -145,7 +152,8 @@ add_library(soundtester_core STATIC
 )
 target_include_directories(soundtester_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(soundtester_core PUBLIC third_party
-  PkgConfig::ALSA PkgConfig::OPUS PkgConfig::OGG PkgConfig::SAMPLERATE PkgConfig::VORBIS Threads::Threads)
+  PkgConfig::ALSA PkgConfig::OPUS PkgConfig::OGG PkgConfig::SAMPLERATE PkgConfig::VORBIS
+  PkgConfig::SYSTEMD Threads::Threads)
 target_compile_options(soundtester_core PRIVATE -Wall -Wextra)
 
 add_executable(soundtesterd src/main.cpp)

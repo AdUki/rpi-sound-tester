@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000003 Mon Sep 17 00:00:00 2001
+From: Sound Tester <soundtester@invalid>
+Date: Fri, 2 Oct 2026 00:00:00 +0000
+Subject: [PATCH] ASoC: cs42xx8: defer the probe while the codec is held in
+ reset
+
+The Audio Injector Octo's machine driver pulses the CS42448's reset line in
+its own probe: low, high, low, high, 500 ms each. The codec is a separate
+I2C device that probes on its own schedule, and when that lands inside the
+pulse the chip does not acknowledge its address: "failed to get device ID,
+ret = -121". cs42xx8 then fails for good, and the card defers forever
+waiting for a codec that will never register -- no sound card at all.
+
+Which of the two probes first is down to module load order. It had been
+winning by luck; with the Bluetooth stack loading alongside (hci_uart,
+btbcm, bluetooth) it lost on every boot tried, and a manual rebind of the
+codec brought the card straight back.
+
+Treat a bus error reading the chip ID as "not ready yet" and defer. The
+deferred probe runs again once another driver binds, by which time the
+pulse is over; a codec that is genuinely absent stays deferred and quiet.
+
+Upstream-Status: Inappropriate [works around the out-of-tree Octo driver]
+---
+--- a/sound/soc/codecs/cs42xx8.c
++++ b/sound/soc/codecs/cs42xx8.c
+@@ -590,6 +590,13 @@
+ 	ret = regmap_read(cs42xx8->regmap, CS42XX8_CHIPID, &val);
+ 	if (ret < 0) {
+ 		dev_err(dev, "failed to get device ID, ret = %d", ret);
++		/*
++		 * A codec that does not answer on the bus may only be held in
++		 * reset by its machine driver for the moment: try again later
++		 * rather than give up on it for good.
++		 */
++		if (ret == -EREMOTEIO || ret == -ENXIO || ret == -EIO)
++			ret = -EPROBE_DEFER;
+ 		goto err_enable;
+ 	}
+ 

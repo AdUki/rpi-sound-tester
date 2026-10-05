@@ -171,19 +171,33 @@ class TimeAnchor {
 
 // Network audio input. `delay_frames` is the one the audio thread reads: local capture is held
 // back by exactly this much before entering the ring, so that ring index n means the same real
-// instant on a network channel as on an ADC channel. It is derived from enabled/delay_ms by the
-// API layer rather than recomputed per block, and is 0 whenever network input is off — which is
-// what keeps a local-only device bit-identical to how it behaved before any of this existed.
+// instant on a network channel as on an ADC channel. It is derived from the switches and delay_ms
+// by net_delay_frames() rather than recomputed per block, and is 0 while nothing that lands on a
+// network channel is switched on — which is what keeps a local-only device bit-identical to how it
+// behaved before any of this existed.
 //
 // `port` is the configured base port, whether or not anything is bound to it: the server reads it
 // when it starts, the API writes it, and a save takes it from here like every other setting. The
 // audio thread never reads it.
+//
+// `bt_input` is the Bluetooth input: a phone playing to the device lands on network channels too,
+// read at the same two positions, so it needs the same delay. Either switch turns the delay on.
 struct NetControl {
   std::atomic<bool> enabled{false};
+  std::atomic<bool> bt_input{false};
   std::atomic<uint32_t> delay_ms{kNetDelayDefaultMs};
   std::atomic<uint32_t> delay_frames{0};
   std::atomic<uint16_t> port{kNetPort};
 };
+
+// The delay_frames that the switches and delay_ms above imply. There is one expression for it, here,
+// so the config-apply path and every PUT that touches a switch cannot come to disagree about when the
+// delay is on.
+inline uint32_t net_delay_frames(const NetControl& n, double rate) {
+  const bool on = n.enabled.load() || n.bt_input.load();
+  return on ? static_cast<uint32_t>(1ull * n.delay_ms.load() * static_cast<uint64_t>(rate) / 1000)
+            : 0u;
+}
 
 // One sink slot: a playback device other than the engine card (HDMI, a USB interface). The audio
 // thread reads all of it: while `enabled` is off the slot's channels are neither rendered nor keep

@@ -8,12 +8,16 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "analysis.h"
 #include "audio_engine.h"
+#include "bluetooth.h"
+#include "bt_input.h"
+#include "bt_player.h"
 #include "board.h"
 #include "capture.h"
 #include "channel_layout.h"
@@ -71,6 +75,7 @@ int main(int argc, char** argv) {
   CLI::App app{"soundtesterd — multichannel audio test appliance"};
 
   bool sim = false;
+  bool bluetooth = false;
   bool verbose = false;
   unsigned sim_stagger = 0;
   std::string board_path = "/etc/soundtester/board.json";
@@ -100,6 +105,10 @@ int main(int argc, char** argv) {
   app.add_option("--sink", extra_sinks,
                  "Also offer this ALSA device as a sink, e.g. default to hear it through a "
                  "desktop's speakers (repeatable; hardware devices are found without it)");
+  app.add_flag("--bluetooth", bluetooth,
+               "Run the Bluetooth manager even where board.json says there is no radio, or under "
+               "--sim. It takes over the adapter of the machine it runs on, so on a desktop point "
+               "it at tools/fake-bluez instead (make run BT=fake)");
   app.add_option("--www", www, "Directory of static web files");
   app.add_option("--config", config_path, "Path to the default config");
   app.add_option("--data-dir", data_dir, "Where saved settings live (the writable partition)");
@@ -159,6 +168,10 @@ int main(int argc, char** argv) {
   }
 
   if (net_port > 0) cfg.net_port = net_port;
+  // Bluetooth is the board's own radio. A simulated run leaves the workstation's alone unless
+  // asked, and with it the audio paths that would go looking for bluez-alsa.
+  const bool run_bt = bluetooth || (!sim && board.bluetooth);
+  if (!run_bt) cfg.bluetooth.input = false;
 
   st::Control ctl;
   cfg.apply_to(ctl, eopt.rate);
@@ -175,6 +188,38 @@ int main(int argc, char** argv) {
 
   // Sinks are found at runtime, and each hands the engine its ring when it is: see Devices.
   st::Devices devices(ctl, engine, board, sim ? std::string() : eopt.device, extra_sinks);
+  // The Bluetooth output: a sink on bluez-alsa's playback PCM, which no scan finds. Stereo, as A2DP
+  // is, at whichever of SBC's rates the speaker agreed to.
+  if (run_bt) {
+    st::SinkDevice d;
+    d.id = st::kBtSinkId;
+    d.alsa = cfg.bluetooth.output_device;
+    d.label = "Bluetooth";
+    d.layouts = {st::SinkLayout::Stereo};
+    d.rates = {44100, 48000};
+    d.probed = true;
+    d.local_queue = true;
+    devices.add_fixed_sink(d);
+  }
+
+  st::BtSettings bt_settings;
+  bt_settings.enabled = cfg.bluetooth.enabled;
+  bt_settings.name = cfg.bluetooth.name;
+  bt_settings.pairable = cfg.bluetooth.pairable;
+  bt_settings.discoverable_timeout_s = cfg.bluetooth.discoverable_timeout_s;
+  st::BtManager bt(bt_settings);
+  // BlueZ keeps its pairing keys in /var/lib/bluetooth, which on the read-only image is RAM. They
+  // are copied to the data partition whenever the set of paired devices changes, and the boot
+  // script (soundtester-bluetooth) puts them back before bluetoothd starts. Not in a simulated run:
+  // those keys are the workstation's, or the fake's.
+  if (!sim) {
+    bt.on_bonds_changed([&store] {
+      std::string err;
+      if (!store.save_dir("/var/lib/bluetooth", "bluetooth", &err))
+        LOG_WARN("bluetooth: pairings not saved: {}", err);
+    });
+  }
+  st::BtInput bt_in(ctl, net, bt);
 
   // A card that will not open is never fatal: the audio thread keeps retrying and the web
   // console comes up regardless, reporting the failure in /api/state. Only a thread that
@@ -185,6 +230,34 @@ int main(int argc, char** argv) {
   }
 
   devices.start(cfg.sinks);
+
+  // What a speaker the output plays to is told it is playing, and what its buttons do: the same
+  // switch, mutes and routing as the console's (bt_player.h). The sink is bound by the first scan,
+  // which start() has just run.
+  std::unique_ptr<st::BtTesterPlayer> bt_player;
+  if (const int slot = devices.slot_of(st::kBtSinkId); slot >= 0) {
+    st::SinkOutput& out = devices.output(static_cast<unsigned>(slot));
+    bt_player = std::make_unique<st::BtTesterPlayer>(ctl, out.control(), [&out](bool on) {
+      if (on) {
+        out.control().enabled.store(true);
+        out.start();
+      } else {
+        out.stop();
+        out.control().enabled.store(false);
+      }
+    });
+    bt.set_local_player({[p = bt_player.get()](uint64_t now_ns) { return p->poll(now_ns); },
+                         [p = bt_player.get()](const std::string& cmd) { return p->command(cmd); }});
+  }
+  if (run_bt) {
+    bt.start();
+  } else {
+    bt.set_not_running_reason(
+        sim ? "the simulator leaves this machine's Bluetooth alone — run it with --bluetooth, or "
+              "make run BT=fake"
+            : "this board has no Bluetooth (board.json)");
+  }
+  if (ctl.net.bt_input.load()) bt_in.start();
 
   st::Analysis analysis(ring, engine.rate());
   analysis.start();
@@ -202,7 +275,7 @@ int main(int argc, char** argv) {
   // systemctl the host.
   wopt.allow_reboot = !sim;
 
-  st::Deps deps{ctl, net, devices, ring, engine, analysis, capture, kmsg, store, cfg};
+  st::Deps deps{ctl, net, devices, bt, bt_in, ring, engine, analysis, capture, kmsg, store, cfg};
   st::WebServer server(deps, wopt);
   g_server = &server;
 
@@ -216,6 +289,8 @@ int main(int argc, char** argv) {
   LOG_INFO("shutting down");
   kmsg.stop();
   analysis.stop();
+  bt_in.stop();
+  bt.stop();  // before the sinks: a speaker's play button would start the output again
   devices.stop();
   engine.stop();
   g_server = nullptr;

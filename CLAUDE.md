@@ -88,6 +88,37 @@ daemon capabilities via `limits.*` in `/api/state` and builds one section per en
 console and daemon API renames must ship together (static files go out with `Cache-Control:
 no-cache`, so a browser picks up a deploy on the next load).
 
+## Bluetooth
+
+BlueZ runs the radio, bluez-alsa (meta-multimedia, 4.0.0) carries the audio, and the daemon does the
+rest over sd-bus (`bluetooth.cpp`, `BtManager`: one thread owns the bus; it is also the pairing agent,
+and says yes to everything by request — `bt_agent_policy`). Only where board.json has
+`"bluetooth": true` (the recipe sets it from `SOUNDTESTER_BLUETOOTH`), or with `--bluetooth`; on a
+desktop use `make run BT=fake` (tools/fake-bluez, a private bus) — **never `--bluetooth` on the
+laptop's real bus**, it takes over its adapter and default agent.
+- **Output** = the sink `bluetooth` (`kBtSinkId`), added with `Devices::add_fixed_sink` since no
+  scan finds a bluez-alsa PCM; `PUT /api/bluetooth/output` retargets it to a speaker. It sets
+  `SinkDevice::local_queue`: bluez-alsa's `snd_pcm_delay` includes the speaker-reported codec/radio
+  delay (150-900 ms, and it changes), which the servo must not hold.
+- **Input** (`bt_input.cpp`) is an in-process *network sender*: `claim_channels("bt:"+addr)`, the
+  shared `NetAudioServer::Feed`, so it needs the net alignment delay (`net_delay_frames()`, on with
+  `net.enabled || net.bt_input`). Re-anchors on `Feed::behind()` (a paused phone).
+- **AVRCP**: a phone's `MediaPlayer1` is carried forward (Position only arrives on change). The
+  tester is a target too (`bt_player.cpp`): an MPRIS player `Media1.RegisterPlayer`ed, title = the
+  BT sink's signal, artist "Sound Tester"; play/pause = unmute/mute, stop = sink off, next/prev
+  cycle Silence/Sine/Noise/Ping/Music. A speaker subscribes when it *connects*, so after a daemon
+  restart it hears nothing until it reconnects. Verify over the air with `btmon` on the board.
+- **Pi 3 B**: needs `dtparam=krnbt=on` (5.15 DT ships the node disabled), and
+  `krnbt_baudrate=921600` under `[board-type=0x8]` (no RTS/CTS: 3 Mbaud overruns, `0x0c14 tx
+  timeout`) — both in `yocto/conf/boards/rpi3.conf`. Every 3 B boots as 43:43:A1:12:1F:AC;
+  `soundtester-bluetooth` sets `B8:27:EB:`+serial^0xAA with `btmgmt public-addr` before bluetoothd
+  (only a cold boot exercises it; `btmgmt info` never exits without a tty). Pairings live on a
+  tmpfs and are mirrored to `/data/bluetooth` (`ConfigStore::save_dir`).
+- Loading the BT modules made the Octo lose a latent probe race on every boot (the machine driver
+  pulses the codec reset for 1.5 s; a cs42xx8 probe inside it got -121 for good): kernel patch 0003
+  defers instead. A manual sysfs `bind` does not exercise the deferred list — test via a module load.
+- Device names are attacker-controlled text from anyone in radio range: `esc()` them in app.js.
+
 ## Boards (Yocto)
 
 `BOARD=` (default `rpi3`) selects `yocto/boards/<board>.mk` (MACHINE, BSP layer, daemon profile

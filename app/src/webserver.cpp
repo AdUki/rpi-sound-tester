@@ -263,6 +263,81 @@ json sink_json(Devices& devices, const Devices::Sink& k) {
   return j;
 }
 
+// The Bluetooth output: the sink kBtSinkId as /api/sinks shows it, plus which device it is playing
+// to. Its PCM name may say "the most recently connected", in which case bluez-alsa's own choice is
+// looked up, so the console can name the speaker rather than print a row of zeros. Null while
+// there is no such sink: Bluetooth is not running.
+json bt_output_json(Devices& devices, const BtManager& bt) {
+  for (const Devices::Sink& k : devices.sinks()) {
+    if (k.device.id != kBtSinkId) continue;
+    json j = sink_json(devices, k);
+    std::string address = bt_pcm_address(k.device.alsa);
+    if (address.empty()) address = bt.latest_sink();
+    j["address"] = address;
+    j["name"] = address.empty() ? std::string{} : bt.device_name(address);
+    const BtPcmInfo p = bt.playback_of(address);
+    j["device_delay_ms"] = p.present ? json(p.delay_ms) : json(nullptr);
+    return j;
+  }
+  return nullptr;
+}
+
+json bt_pcm_json(const BtPcmInfo& p) {
+  if (!p.present) return nullptr;
+  return {{"codec", p.codec}, {"rate", p.rate}, {"channels", p.channels}, {"delay_ms", p.delay_ms}};
+}
+
+json bt_device_json(const BtDeviceInfo& d) {
+  return {{"address", d.address},
+          {"name", d.name},
+          {"icon", d.icon},
+          {"paired", d.paired},
+          {"connected", d.connected},
+          {"rssi", d.has_rssi ? json(d.rssi) : json(nullptr)},
+          {"sink", d.roles.sink},
+          {"source", d.roles.source},
+          {"busy", d.busy},
+          {"error", d.error},
+          {"playback", bt_pcm_json(d.playback)},
+          {"capture", bt_pcm_json(d.capture)},
+          {"volume", d.volume >= 0 ? json(d.volume) : json(nullptr)},
+          {"player", d.player.present ? json{{"status", d.player.status},
+                                             {"title", d.player.title},
+                                             {"artist", d.player.artist},
+                                             {"album", d.player.album},
+                                             {"duration_ms", d.player.duration_ms},
+                                             {"position_ms", d.player.position_ms},
+                                             {"local", d.player.local}}
+                                      : json(nullptr)}};
+}
+
+// A pairing question waiting for the operator, or null. Shared by GET /api/bluetooth and the 1 Hz
+// system frame, which is how a console on any tab learns to show it.
+json bt_request_json(const BtStatus& s) {
+  if (!s.has_request) return nullptr;
+  const BtRequest& r = s.request;
+  return {{"id", r.id},
+          {"kind", r.kind},
+          {"address", r.address},
+          {"name", r.name},
+          {"passkey", r.passkey},
+          {"expires_s", r.expires_s}};
+}
+
+json bt_input_json(const BtInputStatus& i) {
+  return {{"enabled", i.enabled},
+          {"state", i.state},
+          {"address", i.address},
+          {"name", i.name},
+          {"rate", i.rate},
+          {"channels", i.channels},
+          {"input", i.input},
+          {"frames", i.frames},
+          {"overruns", i.overruns},
+          {"restarts", i.restarts},
+          {"error", i.error}};
+}
+
 json device_json(const DeviceStatus& d) {
   return {{"id", d.pcm.id},
           {"alsa", d.pcm.alsa},
@@ -607,6 +682,7 @@ void WebServer::install_routes() {
           {"net_delay_min_ms", kNetDelayMinMs},
           {"net_delay_max_ms", kNetDelayMaxMs},
           {"net", true},
+          {"bluetooth", d_.bt.status().running},
           {"pinned_mb", (d_.ring.pinned_bytes() + d_.capture.pinned_bytes() +
                          d_.devices.pinned_bytes()) /
                             (1024 * 1024)}}},
@@ -832,6 +908,213 @@ void WebServer::install_routes() {
     send_json(res, a);
   });
 
+  // ---- Bluetooth: the adapter, pairing, and the input ----------------------------------------
+  //
+  // The output is the sink kBtSinkId, routed through /api/sinks like any other. Everything here
+  // returns at once: the manager's own thread does the D-Bus work, and anything slow (a pairing can
+  // wait a minute for someone to tap their phone) reports its outcome on the device in the next GET.
+  auto bt_state = [this] {
+    const BtStatus b = d_.bt.status();
+    json devices = json::array();
+    for (const BtDeviceInfo& d : b.devices) devices.push_back(bt_device_json(d));
+    return json{{"available", b.available},
+                {"error", b.error},
+                {"audio", b.audio},
+                {"adapter",
+                 {{"address", b.adapter.address},
+                  {"name", b.adapter.name},
+                  {"powered", b.adapter.powered},
+                  {"discoverable", b.adapter.discoverable},
+                  {"discoverable_timeout_s", b.adapter.discoverable_timeout_s},
+                  {"pairable", b.adapter.pairable},
+                  {"discovering", b.adapter.discovering}}},
+                {"settings",
+                 {{"enabled", b.settings.enabled},
+                  {"name", b.settings.name},
+                  {"pairable", b.settings.pairable},
+                  {"discoverable_timeout_s", b.settings.discoverable_timeout_s}}},
+                {"devices", devices},
+                {"request", bt_request_json(b)},
+                {"input", bt_input_json(d_.bt_in.status())},
+                {"output", bt_output_json(d_.devices, d_.bt)}};
+  };
+
+  svr.Get("/api/bluetooth", [bt_state](const httplib::Request&, httplib::Response& res) {
+    send_json(res, bt_state());
+  });
+
+  // Body: {"enabled", "name", "pairable", "discoverable", "discoverable_timeout_s"}, every field
+  // optional. All but `discoverable` are settings a save keeps.
+  svr.Put("/api/bluetooth", json_route([this, bt_state](const json& j, const httplib::Request&,
+                                                        httplib::Response& res) {
+    BtSettings s = d_.bt.settings();
+    // Every field is read before anything is applied, so a rejected body changes nothing.
+    const bool set_disc = j.contains("discoverable");
+    const bool disc = set_disc && j["discoverable"].get<bool>();
+    if (j.contains("name")) {
+      s.name = j["name"].get<std::string>();
+      // BlueZ refuses a longer alias, and an empty one means "the hostname" here.
+      if (s.name.size() > 248) return send_error(res, 400, "name is at most 248 bytes");
+    }
+    if (j.contains("enabled")) s.enabled = j["enabled"].get<bool>();
+    if (j.contains("pairable")) s.pairable = j["pairable"].get<bool>();
+    if (j.contains("discoverable_timeout_s")) {
+      s.discoverable_timeout_s = static_cast<unsigned>(std::clamp<long long>(
+          j["discoverable_timeout_s"].get<long long>(), 0, kBtDiscoverableMaxS));
+    }
+    d_.bt.apply(s);
+    {
+      std::lock_guard<std::mutex> lk(config_m_);
+      BtConfig& c = d_.config.bluetooth;
+      c.enabled = s.enabled;
+      c.name = s.name;
+      c.pairable = s.pairable;
+      c.discoverable_timeout_s = s.discoverable_timeout_s;
+    }
+    if (set_disc) d_.bt.set_discoverable(disc);
+    send_json(res, bt_state());
+  }));
+
+  svr.Post("/api/bluetooth/scan", json_route([this](const json& j, const httplib::Request&,
+                                                    httplib::Response&) {
+    d_.bt.scan(j.at("on").get<bool>());
+  }));
+
+  // Pair, connect, disconnect, forget and trust, by address. A 404 for an address that is not
+  // well-formed or not known, so a typo reads as what it is.
+  auto bt_device_route = [this](BtManager::Action action) {
+    return [this, action](const httplib::Request& req, httplib::Response& res) {
+      const auto it = req.path_params.find("addr");
+      if (it == req.path_params.end() || !bt_address_ok(it->second)) {
+        return send_error(res, 404, "no such device");
+      }
+      std::string pin;
+      if (action == BtManager::Action::Pair && !req.body.empty()) {
+        try {
+          const json j = json::parse(req.body);
+          pin = j.value("pin", std::string{});
+        } catch (const std::exception& e) {
+          return send_error(res, 400, e.what());
+        }
+        if (pin.size() > 16) return send_error(res, 400, "a PIN is at most 16 characters");
+      }
+      std::string err;
+      if (!d_.bt.device_action(it->second, action, pin, &err)) {
+        return send_error(res, err == "no such device" ? 404 : 503, err);
+      }
+      send_ok(res);
+    };
+  };
+  svr.Post("/api/bluetooth/devices/:addr/pair", bt_device_route(BtManager::Action::Pair));
+  svr.Post("/api/bluetooth/devices/:addr/connect", bt_device_route(BtManager::Action::Connect));
+  svr.Post("/api/bluetooth/devices/:addr/disconnect",
+           bt_device_route(BtManager::Action::Disconnect));
+  svr.Delete("/api/bluetooth/devices/:addr", bt_device_route(BtManager::Action::Remove));
+
+  svr.Put("/api/bluetooth/devices/:addr", [this](const httplib::Request& req,
+                                                 httplib::Response& res) {
+    const auto it = req.path_params.find("addr");
+    if (it == req.path_params.end() || !bt_address_ok(it->second)) {
+      return send_error(res, 404, "no such device");
+    }
+    json_route([this, addr = it->second](const json& j, const httplib::Request&,
+                                         httplib::Response& r) {
+      std::string err;
+      if (j.contains("volume") && !d_.bt.set_volume(addr, j["volume"].get<int>(), &err)) {
+        send_error(r, err == "no such device" ? 404 : 409, err);
+      }
+    })(req, res);
+  });
+
+  // Body: {"command": "play" | "pause" | "stop" | "next" | "previous"}, to the device's AVRCP
+  // media player: the remote control for a phone that is playing to this one.
+  svr.Post("/api/bluetooth/devices/:addr/player", [this](const httplib::Request& req,
+                                                         httplib::Response& res) {
+    const auto it = req.path_params.find("addr");
+    if (it == req.path_params.end() || !bt_address_ok(it->second)) {
+      return send_error(res, 404, "no such device");
+    }
+    json_route([this, addr = it->second](const json& j, const httplib::Request&,
+                                         httplib::Response& r) {
+      std::string err;
+      if (!d_.bt.player_command(addr, j.at("command").get<std::string>(), &err)) {
+        send_error(r, err == "no such device" ? 404 : 409, err);
+      }
+    })(req, res);
+  });
+
+  // Body: {"id": N, "accept": bool} plus "pin" or "passkey" for those kinds of request.
+  svr.Post("/api/bluetooth/request", json_route([this](const json& j, const httplib::Request&,
+                                                       httplib::Response& res) {
+    std::string value;
+    if (j.contains("pin")) value = j["pin"].get<std::string>();
+    if (j.contains("passkey")) {
+      const json& p = j["passkey"];
+      value = p.is_string() ? p.get<std::string>() : std::to_string(p.get<long long>());
+    }
+    std::string err;
+    if (!d_.bt.answer(j.at("id").get<uint64_t>(), j.value("accept", false), value, &err)) {
+      send_error(res, 409, err);
+    }
+  }));
+
+  // Body: {"device": "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp", "enabled": bool}, both
+  // optional: which speaker the Bluetooth sink plays to, and a switch for it in the same request, so
+  // "Play here" is one call. Its routing, rate and the rest are /api/sinks/bluetooth's.
+  svr.Put("/api/bluetooth/output", json_route([this](const json& j, const httplib::Request&,
+                                                     httplib::Response& res) {
+    const int slot = d_.devices.slot_of(kBtSinkId);
+    if (slot < 0) return send_error(res, 503, d_.bt.status().error);
+    std::string device;
+    if (j.contains("device")) {
+      device = j["device"].get<std::string>();
+      if (device.rfind("bluealsa:", 0) != 0)
+        return send_error(res, 400, "device must be a bluez-alsa PCM (bluealsa:DEV=...)");
+    }
+    std::lock_guard<std::mutex> put_lk(sink_put_m_);
+    if (!device.empty()) {
+      d_.devices.retarget(kBtSinkId, device);
+      // Not live state, so it rides the config rather than Control; a later save keeps it.
+      std::lock_guard<std::mutex> lk(config_m_);
+      d_.config.bluetooth.output_device = device;
+    }
+    if (j.contains("enabled")) {
+      SinkOutput& out = d_.devices.output(static_cast<unsigned>(slot));
+      // As PUT /api/sinks/{id}: rendering starts before the sink's thread, and stops after it.
+      if (j["enabled"].get<bool>()) {
+        out.control().enabled.store(true);
+        out.start();
+      } else {
+        out.stop();
+        out.control().enabled.store(false);
+      }
+    }
+    send_json(res, bt_output_json(d_.devices, d_.bt));
+  }));
+
+  // Body: {"enabled": bool}. Turning it on also turns on the alignment delay, as network input
+  // does: a phone is a sender on the network channels in every way but the transport.
+  svr.Put("/api/bluetooth/input", json_route([this](const json& j, const httplib::Request&,
+                                                    httplib::Response& res) {
+    if (j.contains("enabled")) {
+      const bool on = j["enabled"].get<bool>();
+      if (on && !d_.bt.status().running) return send_error(res, 503, d_.bt.status().error);
+      std::lock_guard<std::mutex> lk(delay_m_);
+      // The delay is on before the reader starts and off only after it has stopped, so the
+      // input never writes against a playout position with no room in front of it.
+      if (on) {
+        d_.ctl.net.bt_input.store(true);
+        d_.ctl.net.delay_frames.store(net_delay_frames(d_.ctl.net, d_.engine.rate()));
+        d_.bt_in.start();
+      } else {
+        d_.bt_in.stop();
+        d_.ctl.net.bt_input.store(false);
+        d_.ctl.net.delay_frames.store(net_delay_frames(d_.ctl.net, d_.engine.rate()));
+      }
+    }
+    send_json(res, bt_input_json(d_.bt_in.status()));
+  }));
+
   svr.Put("/api/generators/sine", json_route([this](const json& j, const httplib::Request&,
                                                     httplib::Response&) {
     if (j.contains("freq_hz")) {
@@ -919,6 +1202,7 @@ void WebServer::install_routes() {
                        {"host", c.host},
                        {"device", c.device},
                        {"last_device", c.last_device},
+                       {"transport", c.transport},
                        {"stream_index", c.stream_index},
                        {"stream_count", c.stream_count},
                        {"frames_received", c.frames_received},
@@ -971,13 +1255,13 @@ void WebServer::install_routes() {
           static_cast<int>(kNetDelayMaxMs)));
       d_.ctl.net.delay_ms.store(ms);
     }
+    std::lock_guard<std::mutex> lk(delay_m_);
     if (j.contains("enabled")) d_.ctl.net.enabled.store(j["enabled"].get<bool>());
 
-    // Derived in exactly one expression, matching Config::apply_to, so the two paths cannot
-    // drift: zero unless network input is actually on.
+    // Derived in exactly one expression, shared with Config::apply_to and the Bluetooth input, so
+    // the paths cannot drift: zero unless something that lands on a network channel is on.
     const bool on = d_.ctl.net.enabled.load();
-    const unsigned ms = d_.ctl.net.delay_ms.load();
-    d_.ctl.net.delay_frames.store(on ? static_cast<uint32_t>(1ull * ms * rate / 1000) : 0);
+    d_.ctl.net.delay_frames.store(net_delay_frames(d_.ctl.net, rate));
 
     if (!on) {
       d_.net.stop();
@@ -991,7 +1275,7 @@ void WebServer::install_routes() {
     send_json(res, json{{"enabled", on},
                         {"listening", d_.net.listening()},
                         {"port", d_.net.port()},
-                        {"delay_ms", ms},
+                        {"delay_ms", d_.ctl.net.delay_ms.load()},
                         {"delay_frames", d_.ctl.net.delay_frames.load()},
                         {"error", d_.net.last_error()}});
   }));
@@ -1565,6 +1849,7 @@ void WebServer::run_publisher() {
                           {"present", s.present}, {"capturing", s.status.capturing},
                           {"error", s.status.error}});
         j["sources"] = srcs;
+        j["bt_request"] = bt_request_json(d_.bt.status());
         j.update(sysinfo_json(si));
         hub_.publish(std::make_shared<WsMessage>(WsMessage{j.dump(), false}));
       }

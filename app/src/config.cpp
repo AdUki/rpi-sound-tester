@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -142,6 +143,12 @@ std::string Config::to_json() const {
   j["net"] = {{"enabled", net_enabled}, {"port", net_port}, {"delay_ms", net_delay_ms}};
   j["sinks"] = json::object();
   for (const auto& [id, sc] : sinks) j["sinks"][id] = sink_to_json(sc);
+  j["bluetooth"] = {{"enabled", bluetooth.enabled},
+                    {"name", bluetooth.name},
+                    {"pairable", bluetooth.pairable},
+                    {"discoverable_timeout_s", bluetooth.discoverable_timeout_s},
+                    {"input", {{"enabled", bluetooth.input}}},
+                    {"output", {{"device", bluetooth.output_device}}}};
   return j.dump(2);
 }
 
@@ -213,6 +220,16 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
       if (id.empty() || c.sinks.count(id)) continue;
       sink_from_json(sj, &c.sinks[id]);
     }
+    if (j.contains("bluetooth")) {
+      const json& b = j.at("bluetooth");
+      BtConfig& bt = c.bluetooth;
+      bt.enabled = b.value("enabled", bt.enabled);
+      bt.name = b.value("name", bt.name);
+      bt.pairable = b.value("pairable", bt.pairable);
+      bt.discoverable_timeout_s = b.value("discoverable_timeout_s", bt.discoverable_timeout_s);
+      if (b.contains("input")) bt.input = b.at("input").value("enabled", bt.input);
+      if (b.contains("output")) bt.output_device = b.at("output").value("device", bt.output_device);
+    }
   } catch (const std::exception& e) {
     if (err) *err = e.what();
     return false;
@@ -220,6 +237,8 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
 
   c.input_names.resize(kMaxInputs);
   c.output_names.resize(kOutputs);
+  c.bluetooth.discoverable_timeout_s =
+      std::min(c.bluetooth.discoverable_timeout_s, kBtDiscoverableMaxS);
   *out = c;
   return true;
 }
@@ -255,15 +274,16 @@ void Config::apply_to(Control& ctl, unsigned rate) const {
   ctl.listen.bitrate_kbps.store(
       std::clamp(listen_bitrate_kbps, kListenBitrateMinKbps, kListenBitrateMaxKbps));
 
-  // The delay is derived once, here and in the live PUT handler, so the audio thread reads a
-  // frame count instead of recomputing one per block — and so it is unambiguously zero whenever
-  // network input is off.
+  // The delay is derived once, here and in the live PUT handlers, so the audio thread reads a
+  // frame count instead of recomputing one per block — and so it is unambiguously zero while
+  // neither network input nor the Bluetooth input is on.
   const unsigned dms = static_cast<unsigned>(std::clamp(
       net_delay_ms, static_cast<int>(kNetDelayMinMs), static_cast<int>(kNetDelayMaxMs)));
   ctl.net.enabled.store(net_enabled);
+  ctl.net.bt_input.store(bluetooth.input);
   ctl.net.port.store(static_cast<uint16_t>(std::clamp(net_port, kNetPortMin, kNetPortMax)));
   ctl.net.delay_ms.store(dms);
-  ctl.net.delay_frames.store(net_enabled ? static_cast<uint32_t>(1ull * dms * rate / 1000) : 0);
+  ctl.net.delay_frames.store(net_delay_frames(ctl.net, rate));
 
   // A saved map that is not a permutation (see is_slot_permutation) is rejected wholesale.
   if (is_slot_permutation(input_map, kTdmSlots)) {
@@ -289,6 +309,7 @@ Config Config::from_control(const Control& ctl, const Config& base) {
   }
 
   for (unsigned i = 0; i < kOutputs; ++i) c.outputs[i] = output_from_control(ctl.outputs[i]);
+  c.bluetooth.input = ctl.net.bt_input.load();
 
   c.sine_freq_hz = ctl.sine.freq_hz.load();
   c.sine_level_db = ctl.sine.level_db.load();
@@ -388,6 +409,7 @@ Config ConfigStore::load() {
 }
 
 bool ConfigStore::save(const Config& cfg, std::string* err) {
+  std::lock_guard<std::mutex> lk(write_m_);
   if (!is_persistent()) {
     if (err) {
       *err = "the data partition is not mounted (" + data_dir_ +
@@ -441,6 +463,7 @@ bool ConfigStore::save(const Config& cfg, std::string* err) {
 }
 
 bool ConfigStore::reset(std::string* err) {
+  std::lock_guard<std::mutex> lk(write_m_);
   if (!has_saved()) return true;
   if (!remount(true, err)) return false;
 
@@ -454,6 +477,85 @@ bool ConfigStore::reset(std::string* err) {
   if (!remount(false, &rerr)) LOG_ERROR("{} — data partition left writable!", rerr);
 
   if (ok) LOG_INFO("removed {} — next boot uses the image defaults", saved_path_);
+  return ok;
+}
+
+namespace {
+
+// fsync every file and directory under `root`, deepest first, so the rename that publishes the
+// tree cannot reach the medium ahead of what it publishes. False on the first failure.
+bool fsync_tree(const std::filesystem::path& root, std::string* err) {
+  namespace fs = std::filesystem;
+  std::vector<std::string> paths{root.string()};
+  std::error_code ec;
+  for (auto it = fs::recursive_directory_iterator(root, ec); !ec && it != fs::end(it);
+       it.increment(ec)) {
+    paths.push_back(it->path().string());
+  }
+  if (ec) {
+    if (err) *err = "walk " + root.string() + ": " + ec.message();
+    return false;
+  }
+  for (auto p = paths.rbegin(); p != paths.rend(); ++p) {
+    const int fd = open(p->c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || fsync(fd) != 0) {
+      if (err) *err = "fsync " + *p + ": " + strerror(errno);
+      if (fd >= 0) close(fd);
+      return false;
+    }
+    close(fd);
+  }
+  return true;
+}
+
+}  // namespace
+
+bool ConfigStore::save_dir(const std::string& src, const std::string& name, std::string* err) {
+  std::lock_guard<std::mutex> lk(write_m_);
+  namespace fs = std::filesystem;
+  if (!is_persistent()) {
+    if (err) *err = data_dir_ + " is a RAM fallback — " + name + " cannot be kept";
+    return false;
+  }
+  std::error_code ec;
+  if (!fs::is_directory(src, ec)) {
+    if (err) *err = src + " is not a directory";
+    return false;
+  }
+  if (!remount(true, err)) return false;
+
+  // Copied beside the old tree and swapped in by rename, so a power cut leaves either the old
+  // pairings or the new ones, never half of each. The .old step exists because a directory cannot
+  // be renamed over a non-empty one.
+  const fs::path dst = fs::path(data_dir_) / name;
+  const fs::path tmp = fs::path(data_dir_) / (name + ".new");
+  const fs::path old = fs::path(data_dir_) / (name + ".old");
+  bool ok = false;
+  fs::remove_all(tmp, ec);
+  fs::remove_all(old, ec);
+  fs::copy(src, tmp, fs::copy_options::recursive | fs::copy_options::copy_symlinks, ec);
+  if (ec) {
+    if (err) *err = "copy " + src + ": " + ec.message();
+  } else if (fsync_tree(tmp, err)) {
+    if (fs::exists(dst, ec)) fs::rename(dst, old, ec);
+    if (!ec) fs::rename(tmp, dst, ec);
+    if (ec) {
+      if (err) *err = "rename into " + dst.string() + ": " + ec.message();
+    } else {
+      fs::remove_all(old, ec);
+      const int dir = open(data_dir_.c_str(), O_RDONLY | O_DIRECTORY);
+      if (dir >= 0) {
+        fsync(dir);
+        close(dir);
+      }
+      ok = true;
+    }
+  }
+  if (!ok) fs::remove_all(tmp, ec);
+
+  std::string rerr;
+  if (!remount(false, &rerr)) LOG_ERROR("{} — data partition left writable!", rerr);
+  if (ok) LOG_INFO("saved {} to {}", src, dst.string());
   return ok;
 }
 

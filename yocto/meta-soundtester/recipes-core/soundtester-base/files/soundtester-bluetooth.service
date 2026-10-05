@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore Bluetooth pairings and give the radio its own address
+# /data holds the saved pairings. soundtester-sshkeys mounts a tmpfs there when the partition is
+# missing, so run after it either way and read whichever /data the boot ended up with.
+After=data.mount local-fs.target soundtester-sshkeys.service
+# Nothing pulls this in but bluetooth.service itself (see bluetooth.service.d/10-soundtester.conf):
+# it is only worth running when bluetoothd is about to.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/soundtester-bluetooth

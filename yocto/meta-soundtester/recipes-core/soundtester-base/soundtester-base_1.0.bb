@@ -1,4 +1,4 @@
-SUMMARY = "Sound Tester appliance base configuration: network, hostname, ssh, storage"
+SUMMARY = "Sound Tester appliance base configuration: network, hostname, ssh, storage, Bluetooth"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
@@ -13,6 +13,9 @@ SRC_URI = " \
     file://sshd-early.conf \
     file://sshd-at-early.conf \
     file://sshdgenkeys-early.conf \
+    file://soundtester-bluetooth.sh \
+    file://soundtester-bluetooth.service \
+    file://bluetooth-soundtester.conf \
 "
 
 S = "${WORKDIR}"
@@ -28,6 +31,11 @@ RDEPENDS:${PN} += "${@bb.utils.contains('SOUNDTESTER_ENABLE_SSH', '1', 'openssh-
 # has not accepted the flag installs no firmware and says nothing — Wi-Fi then fails at
 # runtime with no clue why. local.conf.sample accepts the flag; see the note there.
 RDEPENDS:${PN} += "${@'wpa-supplicant' if d.getVar('SOUNDTESTER_WIFI_SSID') else ''}"
+
+# Bluetooth: BlueZ runs the radio, bluez-alsa carries the audio, and btmgmt is what
+# soundtester-bluetooth gives the radio its address with. The firmware the chip needs is installed by
+# the image, which knows the machine. Pairing and device management are soundtesterd's own.
+RDEPENDS:${PN} += "${@'bluez5 bluez5-btmgmt bluealsa' if d.getVar('SOUNDTESTER_BLUETOOTH') == '1' else ''}"
 
 SYSTEMD_SERVICE:${PN} = "${@bb.utils.contains('SOUNDTESTER_ENABLE_SSH', '1', 'soundtester-sshkeys.service', '', d)}"
 SYSTEMD_AUTO_ENABLE = "enable"
@@ -82,6 +90,19 @@ do_install() {
         install -d ${D}${systemd_system_unitdir}/sshdgenkeys.service.d
         install -m 0644 ${WORKDIR}/sshdgenkeys-early.conf ${D}${systemd_system_unitdir}/sshdgenkeys.service.d/10-early.conf
     fi
+
+    # --- bluetooth --------------------------------------------------------------
+    # Not enabled on its own: the drop-in has bluetooth.service pull it in, so it runs exactly when
+    # bluetoothd is about to start, ahead of it.
+    if [ "${SOUNDTESTER_BLUETOOTH}" = "1" ]; then
+        install -d ${D}${bindir}
+        install -m 0755 ${WORKDIR}/soundtester-bluetooth.sh ${D}${bindir}/soundtester-bluetooth
+        install -d ${D}${systemd_system_unitdir}
+        install -m 0644 ${WORKDIR}/soundtester-bluetooth.service ${D}${systemd_system_unitdir}/
+        install -d ${D}${systemd_system_unitdir}/bluetooth.service.d
+        install -m 0644 ${WORKDIR}/bluetooth-soundtester.conf \
+            ${D}${systemd_system_unitdir}/bluetooth.service.d/10-soundtester.conf
+    fi
 }
 
 FILES:${PN} += " \
@@ -96,4 +117,5 @@ FILES:${PN} += " \
 # The hostname and Wi-Fi credentials are baked in, so the package must be rebuilt when
 # they change.
 do_install[vardeps] += "SOUNDTESTER_HOSTNAME SOUNDTESTER_WIFI_SSID SOUNDTESTER_WIFI_PSK \
-                        SOUNDTESTER_WIFI_COUNTRY SOUNDTESTER_ENABLE_SSH"
+                        SOUNDTESTER_WIFI_COUNTRY SOUNDTESTER_ENABLE_SSH \
+                        SOUNDTESTER_BLUETOOTH"

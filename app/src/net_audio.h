@@ -63,6 +63,9 @@ struct NetChannelStatus {
   std::string peer;   // ip:port of the live connection
   std::string name;   // what the sender called itself in its HELLO
   std::string host;   // reverse-resolved hostname, when the network can supply one
+  // "net" for a sender on the LAN, "bluetooth" for the Bluetooth input. Kept after a disconnect,
+  // with last_device, so the console can still say what kind of thing the channel was used by.
+  std::string transport = "net";
   // The one string worth showing: the sender's own name, else its hostname, else its address.
   std::string device;
   // Whose it was last, even after it disconnected — so an operator can see that NET 3 is "the
@@ -147,6 +150,57 @@ class NetAudioServer {
   };
   MixRun mixer_run(const std::string& ip, uint16_t want) const;
 
+  // Names a run claimed by a sender that lives in this process (the Bluetooth input), as a HELLO
+  // names a network one: `peer` is its address, `name` what it is called, `transport` what it came
+  // over. claim_channels() keys the run's stickiness on whatever it was given as `ip`.
+  void label_channels(unsigned base, unsigned count, const std::string& peer,
+                      const std::string& name, const std::string& transport);
+
+  // The part of a sender that does not care where its audio comes from: the anchor, the lead
+  // servo, the converter and the write into the run's timelines. A network session owns one, and
+  // so does the Bluetooth input, which is a sender that happens to live in this process.
+  //
+  // Where the audio is heard is decided here, not by the sender. The stream is anchored the moment
+  // its first audio arrives — at the reader's position plus the alignment delay — and everything
+  // after it follows on contiguously, so the sender never needs to know the card's clock.
+  class Feed {
+   public:
+    explicit Feed(NetAudioServer& srv) : srv_(srv) {}
+
+    // The run to write and the rate the audio arrives at. Always restarts the stream: the anchor
+    // belongs to the old one. The converter keeps its state when the shape is unchanged, so a
+    // repeated format is not a glitch.
+    bool configure(int base, unsigned channels, unsigned src_rate, std::string* err);
+    // The next push anchors afresh.
+    void restart();
+    // How the log names this sender.
+    void set_who(std::string who) { who_ = std::move(who); }
+    // Converts `frames` interleaved frames and writes them after the previous push. `jumped` says
+    // the source skipped, so the stream is re-anchored rather than continued.
+    void push(const float* il, size_t frames, bool jumped);
+    // True once the stream has fallen so far behind its own playout that what it writes next
+    // would land after its slot: the source paused, or stalled longer than the alignment delay.
+    // A source that can tell a pause from jitter re-anchors on this rather than wait for the lead
+    // filter to notice.
+    bool behind() const;
+    unsigned src_rate() const { return src_rate_; }
+
+   private:
+    friend struct NetTestAccess;
+    void distribute(const float* src, size_t frames, uint64_t at, uint64_t reader,
+                    uint64_t max_lead);
+
+    NetAudioServer& srv_;
+    std::string who_;
+    int base_ = -1;
+    unsigned channels_ = 0;
+    unsigned src_rate_ = 0;
+    Asrc asrc_;
+    LeadFilter lead_;
+    uint64_t out_next_ = 0;  // device index for the next converted frame; 0 = unanchored
+    std::vector<float> out_il_, chan_;
+  };
+
   // Whether a network channel is worth showing. Sticky for the session on purpose: a sender that
   // has been and gone leaves audio in the ring, and a freeze taken after it disconnected has to
   // stay analysable. A channel nobody has ever used stays out of the way entirely.
@@ -186,13 +240,11 @@ class NetAudioServer {
     unsigned src_rate = 0;   // the sender's own rate, once FORMAT has said
 
     VorbisDecoder vorbis;
-    Asrc asrc;
-    LeadFilter lead;
-    uint64_t out_next = 0;   // device index for the next converted frame; 0 = unanchored
+    Feed feed{srv};
     uint64_t expect_pos = 0; // where the sender's next packet should start, in its own frames
     uint64_t last_status_ns = 0;
 
-    std::vector<float> in_il, out_il, chan;
+    std::vector<float> in_il;
 
     // Each returns false to close the connection. The protocol is small enough that "this message
     // was wrong" and "hang up" are the same answer.
@@ -202,11 +254,6 @@ class NetAudioServer {
     bool audio(const uint8_t* p, uint32_t len);
     bool status();
     void reject(uint32_t code);
-    // Splits converted interleaved audio across the run's timelines and keeps each channel's
-    // counters. Separate from audio() because it is the only part that touches the channels the
-    // audio thread reads, and it reads better without the decode and the control loop above it.
-    void distribute(const float* src, size_t frames, uint64_t at, uint64_t reader,
-                    uint64_t max_lead);
   };
 
   // `port_channel` is the channel implied by the port the sender chose, or -1 for the base port,

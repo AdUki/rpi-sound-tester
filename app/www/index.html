@@ -47,12 +47,17 @@
   use a wired connection. The meters, THD+N and the scope read the device directly and are
   unaffected.
 </div>
+<!-- A device pairing with this one is waiting for an answer. On every tab, because the question
+     expires in about a minute and is usually asked while the operator is looking at something
+     else: the phone in their hand, mostly. Filled in by app.js. -->
+<div id="btbanner" class="banner bt" hidden></div>
 </div><!-- #banners: fixed overlay, out of flow -->
 
 <nav class="tabs">
   <button class="tab active" data-tab="dash">Dashboard</button>
   <button class="tab" data-tab="scope">Scope &amp; sync</button>
   <button class="tab" data-tab="net">Network</button>
+  <button class="tab" data-tab="bt" id="bttab" hidden>Bluetooth</button>
   <button class="tab" data-tab="config">Configuration</button>
   <button class="tab" data-tab="sys">System</button>
   <!-- A real link, not a panel: no data-tab, so app.js leaves its click alone and it navigates
@@ -126,9 +131,9 @@
   <div id="netsec" hidden>
     <h2>Network inputs</h2>
     <p class="muted small">Sent over the network by a machine running the
-      <span class="mono">soundtester</span> ALSA plugin. They sit on the same sample axis as the
-      inputs above, so a delay measured between a network channel and a real input is the true
-      path delay — the alignment buffer does not appear in it.
+      <span class="mono">soundtester</span> ALSA plugin, or played to the device over Bluetooth.
+      They sit on the same sample axis as the inputs above, so a delay measured between a network
+      channel and a real input is the true path delay — the alignment buffer does not appear in it.
       <a href="#" data-tab="net">Network settings ↗</a></p>
     <div id="netinputs" class="grid"></div>
   </div>
@@ -256,6 +261,66 @@
       exactly as <span class="mono">hw</span> does, so wrap it in <span class="mono">plug:</span>
       for arbitrary files.</p>
     <pre id="netsnippet" class="mono small"></pre>
+  </div>
+</section>
+
+<section id="bt" class="panel">
+  <div class="card wide">
+    <div class="chan-head">
+      <h3 class="chan-name">Bluetooth</h3>
+      <span id="btadapterstate" class="pill">—</span>
+    </div>
+    <p class="muted small">The Pi's own radio, both ways: a paired speaker or headphones become the
+      <a href="#" data-tab="dash">Bluetooth output</a>, and a phone or laptop that plays to this
+      device becomes a pair of network inputs. Both share the sample axis with every other input
+      and output.</p>
+    <div class="btrow">
+      <label class="en"><input type="checkbox" id="bten"> Radio on</label>
+      <label>Name <input type="text" id="btname" maxlength="248" placeholder="the hostname"></label>
+      <span id="btaddr" class="mono small muted"></span>
+    </div>
+    <div class="btrow">
+      <label class="en" title="Let phones and laptops find this device in their Bluetooth list">
+        <input type="checkbox" id="btdisc"> Discoverable</label>
+      <label>for <input type="number" id="btdisctime" min="0" max="3600" step="30"> s</label>
+      <span id="btdiscleft" class="muted small"></span>
+    </div>
+    <div class="btrow">
+      <label class="en" title="Let a device that finds this one pair with it. Every pairing is accepted.">
+        <input type="checkbox" id="btpairable"> Pairable</label>
+    </div>
+    <div id="btmsg" class="muted small"></div>
+  </div>
+
+  <div class="card wide">
+    <div class="chan-head">
+      <h3 class="chan-name">Devices</h3>
+      <button id="btscan">Scan</button>
+    </div>
+    <p class="muted small">Scanning lists devices that are in pairing mode nearby, for a minute.
+      A speaker usually needs its Bluetooth button held until it blinks. To pair a phone, make this
+      device discoverable instead and pick it on the phone; the tester accepts it.</p>
+    <div id="btdevices" class="grid btdevices"></div>
+  </div>
+
+  <div class="card wide">
+    <h3>Bluetooth input</h3>
+    <p class="muted small">Audio a phone or laptop plays to this device lands on two adjacent
+      network inputs, named after it, on the same sample axis as the ADCs. Like a network sender it
+      needs the <a href="#" data-tab="net">alignment delay</a>, which this turns on. Bluetooth's
+      jitter is large, so leave the delay at a second.</p>
+    <label class="en"><input type="checkbox" id="btinen"> Take audio from Bluetooth</label>
+    <div id="btinstate" class="small mono"></div>
+  </div>
+
+  <div class="card wide">
+    <h3>Bluetooth output</h3>
+    <p class="muted small">Plays what is routed to it on the
+      <a href="#" data-tab="dash">Dashboard</a>. Its latency is held constant up to the Bluetooth
+      stack; the codec and the radio add more, which the speaker reports and which is not constant,
+      so calibrate with a ping before trusting an absolute delay.</p>
+    <label>Play to <select id="btoutdev"></select></label>
+    <div id="btoutstate" class="small mono"></div>
   </div>
 </section>
 

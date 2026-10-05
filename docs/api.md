@@ -34,7 +34,7 @@ The whole device state in one object: `inputs`, `outputs`, `sinks`, `sources`, `
 `channel_map`, `capture`, `engine`, `system`, and `limits` (slider ranges and feature flags the
 console reads). `engine.backend` is `card` (the engine card), `timer` (a board without one) or
 `simulator`. `limits.channel_map` and `limits.sync_watch` are `false` without an engine card: the
-TDM slot map and the I2S sync watch are the Octo's.
+TDM slot map and the I2S sync watch are the Octo's. `limits.bluetooth` says Bluetooth is running.
 Each input and output has a `name`, set only in `config.json` — there is no API to change it.
 
 ## Inputs
@@ -92,6 +92,10 @@ A sink is named by its **device id**, `<card id>,<device>` as ALSA names them (`
 USB port, so the id, the routing saved under it and the sink's place in `sinks` stay the same
 across reboots and replugs. A device that is unplugged keeps its sink (`present: false`), and plays
 again with the same routing when it comes back.
+
+One sink is not a hardware device: `bluetooth`, the Bluetooth output (*Bluetooth*), on bluez-alsa's
+playback PCM. It is there whenever the board has Bluetooth (`limits.bluetooth`), is stereo, and
+picks its speaker through `PUT /api/bluetooth/output`.
 
 ### `GET /api/sinks` · `GET /api/sinks/{id}`
 ```json
@@ -171,6 +175,122 @@ Every PCM device ALSA has, as `aplay -l` and `arecord -l` list them, and what th
 `engine` marks the engine card's own; `hidden` one board.json says the board wires to nothing.
 `sink` is the sink slot its playback is on and `input` the first input its capture is on, -1 for
 none; `note` says why one it could be is not (`no free sink slot`, `no free input columns`).
+
+## Bluetooth
+
+The Pi's own Bluetooth radio, in both A2DP roles. A speaker or headphones paired here become a
+stereo **output** that works exactly like the line out. A phone or laptop that plays to the device
+becomes a stereo **input** on two adjacent network channels (see *Network inputs*). BlueZ runs the
+radio, and [bluez-alsa](https://github.com/arkq/bluez-alsa) carries the audio (SBC). The device
+manages pairing itself, so nothing needs a shell. It accepts every pairing and every connection,
+like a speaker with no screen, and trusts every device it has paired.
+
+Both directions run on a clock the card does not share. The output is the sink `bluetooth`
+(*Sinks*), whose converter holds its latency constant like any sink's. The input's converter holds it the alignment delay ahead of playout,
+like a network sender's. Pairings are written to `/data/bluetooth` whenever they change, so they
+survive a reboot without a `config/save`.
+
+### `GET /api/bluetooth`
+```json
+{"available": true, "error": "", "audio": true,
+ "adapter": {"address": "B8:27:EB:50:7B:22", "name": "soundtester", "powered": true,
+             "discoverable": false, "discoverable_timeout_s": 180, "pairable": true,
+             "discovering": false},
+ "settings": {"enabled": true, "name": "", "pairable": true, "discoverable_timeout_s": 180},
+ "devices": [{"address": "5C:E9:1E:22:40:01", "name": "Pixel 7", "icon": "phone",
+              "paired": true, "connected": true, "rssi": null,
+              "sink": false, "source": true, "busy": "", "error": "", "playback": null,
+              "capture": {"codec": "SBC", "rate": 44100, "channels": 2, "delay_ms": 15.0},
+              "volume": 96,
+              "player": {"status": "playing", "title": "Song", "artist": "Band", "album": "",
+                         "duration_ms": 215000, "position_ms": 41200, "local": false}}],
+ "request": null,
+ "input": {"enabled": false, "state": "off", "address": "", "name": "", "rate": 0,
+           "input": -1, "error": ""},
+ "output": {"enabled": false, "device": "bluealsa:DEV=00:00:00:00:00:00,PROFILE=a2dp", "...": "…"}}
+```
+`available` is false when there is no adapter or BlueZ is not running, and `error` says why.
+`audio` is false while bluez-alsa is not running. Pairing and scanning still work without it.
+`name` is empty in `settings` when the adapter takes the hostname.
+`sink` means the device can take audio (a speaker), `source` that it can send audio (a phone).
+`playback` and `capture` are the audio links bluez-alsa has open with it, or `null`.
+`delay_ms` is the codec and radio delay the device reports, which the output's `latency_ms` leaves out.
+`busy` is `pairing`, `connecting` or `disconnecting` while a request runs, and `error` holds the
+last one's failure. `rssi` is reported only while scanning.
+`player` is the device's AVRCP media player, present while a phone plays to this one, or `null`.
+`position_ms` is carried forward between BlueZ's reports while it plays. On a speaker this device
+plays to, `player` is this device's own player instead (`"local": true`, below). `volume` is the audio
+link's AVRCP absolute volume, 0–127, or `null` when the device has none.
+`request` is a pairing question waiting for an answer, described below.
+`input.state` is one of `off`, `waiting` (no device is streaming), `streaming` or `error`.
+`input.input` is the first of the input's two channel indexes, or -1.
+`output` is `GET /api/sinks/bluetooth` plus the fields below, or `null` while Bluetooth is not running.
+
+### `PUT /api/bluetooth`
+```json
+{"enabled": true, "name": "bench-tester", "pairable": true, "discoverable": true,
+ "discoverable_timeout_s": 180}
+```
+`enabled` powers the radio. `discoverable` makes the device visible in a phone's scan for
+`discoverable_timeout_s` seconds (0–3600, 0 means until turned off). `pairable` lets a device that
+finds it pair. `discoverable` always starts off; the rest are kept by `config/save`. Answers with the
+`GET` body.
+
+### `POST /api/bluetooth/scan`
+`{"on": true}` looks for devices (BR/EDR only, since A2DP needs it) and stops by itself after 60 s.
+Scanning shares the radio with any audio link, so expect dropouts on one while it runs.
+
+### `POST /api/bluetooth/devices/{address}/pair` · `/connect` · `/disconnect`
+Each starts the operation and answers `{"ok": true}` straight away; watch the device's `busy` and
+`error` fields for the outcome. Pairing a device also connects it. `pair` takes an optional
+`{"pin": "1234"}` for a device old enough to need one, and uses `0000` by default.
+
+### `POST /api/bluetooth/devices/{address}/player`
+`{"command": "play"}`, or `pause`, `stop`, `next` or `previous`: the remote control for a phone
+that is playing to this device. 409 when the device has no media player.
+
+**The tester's own player.** A speaker this device plays to is offered a media player over AVRCP,
+so a speaker's buttons, and the same buttons on its card, work the Bluetooth output. The track's
+title is the output's signal (`Silence`, `Sine`, `Noise`, `Ping`, `Music`, or an input such as
+`IN 3`), the artist is `Sound Tester`, and the album holds the signal's settings
+(`440 Hz · -20 dBFS`). The status is `stopped` while the output is off, `paused` while both its
+channels are muted, `playing` otherwise. `play` unmutes both channels, switching the output on if
+it is off; `pause` mutes them; `stop` switches the output off; `next` and `previous` step both
+channels through Silence, Sine, Noise, Ping and Music. The position counts the time the current
+signal has been playing.
+
+### `PUT /api/bluetooth/devices/{address}` · `DELETE /api/bluetooth/devices/{address}`
+`PUT` takes `{"volume": 0..127}`: the AVRCP absolute volume of the device's audio link, on a phone
+or a speaker. 409 when it has none. `DELETE` forgets the device: it unpairs it and removes its
+keys from `/data` too.
+
+### Pairing requests · `POST /api/bluetooth/request`
+Everything is accepted without asking, with one exception, which only keyboards raise. It appears
+as `request` in `GET /api/bluetooth` and in the 1 Hz WS `system` message (`bt_request`):
+```json
+{"id": 7, "kind": "passkey", "address": "C7:3B:52:10:9A:1E", "name": "MX Keys",
+ "passkey": "", "expires_s": 54}
+```
+`passkey` asks for the six digits the device shows: answer `{"id": 7, "accept": true,
+"passkey": 123456}`. `display` shows a `passkey` to type on the device, and clears itself.
+
+### `PUT /api/bluetooth/input`
+`{"enabled": true}` takes the audio of the most recently connected device that streams to this
+one. It lands on two adjacent network channels, named after the device. Enabling it turns on the
+alignment delay, exactly as enabling network input does.
+
+### `PUT /api/bluetooth/output`
+```json
+{"device": "bluealsa:DEV=F8:DF:15:0A:11:3C,PROFILE=a2dp", "enabled": true}
+```
+Which speaker the sink `bluetooth` plays to, and optionally switches it on or off in the same call.
+Routing, rate and Identify are the sink's own (`/api/sinks/bluetooth`). The default device,
+`DEV=00:00:00:00:00:00`, means the most recently connected speaker. The answer is the sink's status
+plus `address` and `name` for the speaker playing, and `device_delay_ms`, the delay it reports.
+The speaker sets the rate, which `device_rate` reports, so `sample_rate` is only a request.
+`latency_ms` runs from the engine to the Bluetooth stack and leaves out the codec and the radio.
+Those are what the speaker reports, and they are not constant, so calibrate with a ping before
+trusting an absolute delay. Off by default.
 
 ## Generators
 
@@ -348,7 +468,9 @@ a freeze taken after the sender disconnected still has to be analysable. What is
 whether the console shows it: `active` goes true when a sender first uses the channel and stays
 true for the rest of the session.
 
-Only playback into the device is supported; there is no capture direction yet.
+Only playback into the device is supported; there is no capture direction yet. A Bluetooth phone
+lands on these channels too, through `PUT /api/bluetooth/input`, and is reported here like a
+sender, with its Bluetooth address as `peer`.
 
 ### `GET /api/net`
 ```json
@@ -520,7 +642,7 @@ can threshold by frequency directly. `?ch=0..5` for one input; omit for all six.
 | 10 Hz | `{"type":"meters","sample":…,"rms_db":[6],"peak_db":[6]}` |
 | 5 Hz | `{"type":"spectrum","channels":[{"ch":0,"bins":[240],"tone":{…}}]}` |
 | 10 Hz | binary envelope frame (below) |
-| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"cpu_pct":…,"temp_c":…,"sinks":[{"id":…,"present":…,"enabled":…,"playing":…,"layout":…,"latency_ms":…,…}],"sources":[{"id":…,"first":…,"channels":…,"present":…,"capturing":…,"error":…}],…}` |
+| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"cpu_pct":…,"temp_c":…,"sinks":[{"id":…,"present":…,"enabled":…,"playing":…,"layout":…,"latency_ms":…,…}],"sources":[{"id":…,"first":…,"channels":…,"present":…,"capturing":…,"error":…}],"bt_request":…,…}` |
 
 Spectrum bins are quantised to 0.1 dB on the WS to save bandwidth; the GET gives full float precision.
 
@@ -537,7 +659,8 @@ frame). Global, last-writer-wins; resets to all-on at restart.
 ## System
 
 ### `POST /api/config/save`
-Writes routing (every sink's included, by device id), generators and channel map to `/data/config.json` — the only
+Writes routing (every sink's included, by device id), generators, channel map and Bluetooth
+settings to `/data/config.json` — the only
 state that survives a reboot. `/data` is remounted read-write for the write, then back. If `/data` did not mount the save
 is refused (`data_persistent: false` in `/api/state`).
 

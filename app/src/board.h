@@ -30,6 +30,9 @@ struct Board {
   // Ring columns kept for capture devices found at runtime (a USB interface's inputs), each costing
   // a ring's worth of pinned RAM whether or not anything is plugged in.
   unsigned device_inputs = 2;
+  // The board has a Bluetooth radio, and the image BlueZ and bluez-alsa to run it: the daemon then
+  // manages it and offers the Bluetooth sink and input.
+  bool bluetooth = false;
   std::map<std::string, DeviceHint> devices;  // by device id: "<card id>,<device>"
 
   // The hint for device `id`, or nullptr.

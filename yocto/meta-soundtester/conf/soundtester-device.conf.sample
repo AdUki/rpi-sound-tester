@@ -35,6 +35,12 @@ SOUNDTESTER_WIFI_SSID ?= ""
 SOUNDTESTER_WIFI_PSK ?= ""
 SOUNDTESTER_WIFI_COUNTRY ?= "SK"
 
+# --- Bluetooth ---------------------------------------------------------------
+# The onboard radio, as an A2DP sink and source: pair a speaker to play the tester's output on, or
+# a phone to feed it an input. Pairing is done from the web console. Set to "0" to leave out BlueZ
+# and bluez-alsa and switch the radio off in config.txt.
+SOUNDTESTER_BLUETOOTH ?= "1"
+
 # --- Web console -------------------------------------------------------------
 SOUNDTESTER_HTTP_PORT ?= "80"
 

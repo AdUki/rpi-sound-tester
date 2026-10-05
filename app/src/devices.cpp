@@ -37,6 +37,39 @@ Devices::Devices(Control& ctl, AudioEngine& engine, const Board& board,
 
 Devices::~Devices() { stop(); }
 
+void Devices::add_fixed_sink(SinkDevice d) {
+  std::lock_guard<std::mutex> lk(m_);
+  fixed_.push_back(std::move(d));
+}
+
+bool Devices::retarget(const std::string& id, const std::string& alsa) {
+  SinkOutput* out = nullptr;
+  SinkDevice d;
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    for (SinkDevice& f : fixed_)
+      if (f.id == id) f.alsa = alsa;
+    for (unsigned s = 0; s < kMaxSinks && !out; ++s) {
+      if (!used_[s] || bound_[s].device.id != id) continue;
+      bound_[s].device.alsa = alsa;
+      d = bound_[s].device;
+      out = outputs_[s].get();
+    }
+  }
+  if (!out) return false;
+  // Outside the lock: a running output stops and starts again, which can take a moment.
+  out->bind(d, out->sample_rate());
+  LOG_INFO("sink {}: now {}", id, alsa);
+  return true;
+}
+
+int Devices::slot_of(const std::string& id) const {
+  std::lock_guard<std::mutex> lk(m_);
+  for (unsigned s = 0; s < kMaxSinks; ++s)
+    if (used_[s] && bound_[s].device.id == id) return static_cast<int>(s);
+  return -1;
+}
+
 void Devices::start(const std::map<std::string, SinkConfig>& saved) {
   {
     std::lock_guard<std::mutex> lk(m_);
@@ -116,6 +149,24 @@ void Devices::scan() {
     d.playback = true;
     found.push_back(d);
   }
+  std::vector<SinkDevice> fixed;
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    fixed = fixed_;
+  }
+  for (const SinkDevice& f : fixed) {
+    PcmDevice d;
+    d.id = f.id;
+    d.alsa = f.alsa;
+    d.card_name = f.label;
+    d.playback = true;
+    found.push_back(d);
+  }
+  auto fixed_of = [&fixed](const std::string& id) -> const SinkDevice* {
+    for (const SinkDevice& f : fixed)
+      if (f.id == id) return &f;
+    return nullptr;
+  };
   std::map<std::string, unsigned> per_card;
   for (const PcmDevice& d : found) ++per_card[d.card_id];
 
@@ -149,8 +200,10 @@ void Devices::scan() {
   std::vector<std::pair<PcmDevice, PcmCaps>> fresh_inputs;
   for (const PcmDevice& d : found) {
     if (is_engine(d) || is_hidden(d)) continue;
-    if (d.playback && !known(sink_ids, d.id))
-      fresh_sinks.push_back(sink_device(d, per_card[d.card_id]));
+    if (d.playback && !known(sink_ids, d.id)) {
+      const SinkDevice* f = fixed_of(d.id);
+      fresh_sinks.push_back(f ? *f : sink_device(d, per_card[d.card_id]));
+    }
     if (d.capture && !known(input_ids, d.id)) fresh_inputs.emplace_back(d, probe_pcm(d.alsa, true));
   }
   std::vector<std::pair<unsigned, SinkDevice>> reprobed;

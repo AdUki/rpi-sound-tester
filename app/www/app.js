@@ -42,7 +42,7 @@ const isNetInput = ch => (inputKind[ch] ? inputKind[ch] === 'net' : ch >= NIN_LO
 
 // Text from the daemon that came from a device (an ALSA card name, a USB product string) goes into
 // markup: escape it.
-const esc = s => String(s).replace(/[&<>"']/g,
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
   c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 
 // A network channel's ring slot is permanent — it has to be, or a freeze taken after the sender
@@ -119,6 +119,7 @@ document.querySelectorAll('[data-tab]').forEach(el => {
     if (name === 'scope') drawScope();
     else if (name === 'dash') redrawSpectra();
     else if (name === 'net') refreshNet();
+    syncBtPoll(name);
   });
 });
 
@@ -864,6 +865,8 @@ function buildOutputs() {
 // is that latency holding still. One set of code for all of them: `k` prefixes a sink's element
 // ids, `path` is its REST collection. Devices come and go (a USB interface plugged in), so the
 // sections are rebuilt whenever the set of sinks changes.
+// The Bluetooth output's sink id: the one sink no scan finds (its speaker is picked on its tab).
+const BT_SINK_ID = 'bluetooth';
 const sinkKey = id => 'sk' + id.replace(/[^A-Za-z0-9]/g, '_');
 let sinks = [];        // descriptors, in slot order
 const sinkState = {};  // by key: the latest full status
@@ -872,7 +875,10 @@ function sinkDesc(h) {
   const k = sinkKey(h.id);
   return {id: h.id, k, path: '/sinks/' + encodeURIComponent(h.id), card: k + 'c',
           title: esc(h.label), hdmi: !!h.hdmi,
-          note: h.hdmi
+          note: h.id === BT_SINK_ID
+            ? 'Engine to the Bluetooth stack, held constant. The codec and the radio add more, which ' +
+              'the speaker reports and which is not constant — calibrate with a ping.'
+            : h.hdmi
             ? 'Engine to HDMI driver, held constant. The TV or receiver adds its own, also constant — ' +
               'calibrate it once with a ping through an HDMI audio extractor.'
             : 'Engine to the device\'s driver, held constant. The device adds its own, also ' +
@@ -1011,8 +1017,31 @@ function applySink(sink, h) {
   const hadN = was && was.outputs ? was.outputs.length : -1;
   sinkState[sink.k] = h;
   if (h.layout !== had || h.outputs.length !== hadN) buildSinkCards(sink, h);
+  else syncSinkCards(sink, h);
   syncSinkPickers(sink, h);
   renderSink(sink, h);
+}
+
+// Routing and mutes can change behind the console's back — a Bluetooth speaker's buttons do just
+// that — so the cards follow the status, except a control the operator is holding.
+function syncSinkCards(sink, h) {
+  const idle = x => x && document.activeElement !== x;
+  h.outputs.forEach(o => {
+    const src = $(sink.card + 'src' + o.ch), mute = $(sink.card + 'mute' + o.ch);
+    if (idle(src)) setAttr(src, 'value', sourceValue(o.source));
+    if (idle(mute)) setAttr(mute, 'checked', !!o.mute);
+  });
+}
+
+// Which device a sink is playing to, where that is not obvious: the Bluetooth output names its
+// speaker. The 1 Hz frame does not carry the name, so it falls back on the last full status.
+function sinkTarget(sink, h) {
+  if (sink.id !== BT_SINK_ID) return '';
+  const full = sinkState[sink.k] || {};
+  const name = h.name || full.name || h.address || full.address;
+  if (!name) return '';
+  const dly = h.device_delay_ms !== undefined ? h.device_delay_ms : full.device_delay_ms;
+  return `→ ${name}` + (dly != null ? ` (+${dly.toFixed(0)} ms reported)` : '') + ' · ';
 }
 
 // Takes either the full status (the sink's GET, /api/state) or the compact one in the 1 Hz system
@@ -1030,7 +1059,8 @@ function renderSink(sink, h) {
     setClass(pill, 'pill ' + (h.xruns || h.resyncs ? 'warn' : 'good'));
     const t = Math.round(h.trim_ppm);   // and never "-0"
     const trim = t > 0 ? '+' + t : t < 0 ? String(t) : '0';
-    setText(detail, `latency ${h.latency_ms.toFixed(1)} ms · clock trim ${trim} ppm` +
+    setText(detail, sinkTarget(sink, h) +
+      `latency ${h.latency_ms.toFixed(1)} ms · clock trim ${trim} ppm` +
       ` · xruns ${h.xruns} · resyncs ${h.resyncs}`);
     setAttr(detail, 'title', sink.note);
   } else {
@@ -1304,10 +1334,12 @@ function refreshNet() {
       // Who is on it, or — once they have gone — who was, since the channel is kept for them and
       // any routing set up against it still refers to that machine.
       const part = c.stream_count > 1 ? ` <span class="muted">${c.stream_index}/${c.stream_count}</span>` : '';
+      // A Bluetooth phone is a sender too; its peer is its Bluetooth address.
+      const via = c.transport === 'bluetooth' ? 'Bluetooth ' : '';
       const state_ = c.connected
-        ? `<strong>${c.device || 'unidentified'}</strong>${part} <span class="mono muted">${c.peer}</span>`
+        ? `<strong>${esc(c.device) || 'unidentified'}</strong>${part} <span class="mono muted">${via}${esc(c.peer)}</span>`
         : c.last_device
-          ? `<span class="muted">no sender — last used by ${c.last_device}</span>`
+          ? `<span class="muted">no sender — last used by ${esc(c.last_device)}</span>`
           : '<span class="muted">free</span>';
       // Drops are the number that matters: frames arriving after their slot has played cannot be
       // placed anywhere truthful, so they are discarded rather than shifted.
@@ -1327,6 +1359,360 @@ function refreshNet() {
       </div>`;
     }).join('');
   }).catch(() => { /* the poll retries */ });
+}
+
+// ---------------------------------------------------------------- Bluetooth
+//
+// The adapter, pairing, and the two audio directions. The daemon's manager does the D-Bus work on
+// a thread of its own, so everything here is a request followed by a read of GET /api/bluetooth,
+// once a second while the tab is open. A pairing question can come at any moment, usually while
+// someone is looking at their phone rather than this tab, so it also rides the 1 Hz system frame
+// and is shown on every tab (renderBtRequest).
+
+// The Bluetooth output's section on the Dashboard, when it has one: a full status from the
+// Bluetooth tab updates it there too.
+function btApplyOutput(o) {
+  const sink = sinks.find(k => k.id === BT_SINK_ID);
+  if (sink && o && Array.isArray(o.outputs)) applySink(sink, o);
+}
+const BT_DEFAULT_DEVICE = 'bluealsa:DEV=00:00:00:00:00:00,PROFILE=a2dp';
+const btPcmName = addr => `bluealsa:DEV=${addr},PROFILE=a2dp`;
+let btState = null;
+let btPoll = null;
+let btDiscSince = 0;          // when the adapter was last seen going discoverable, for a countdown
+const btAnswered = new Set();  // requests answered here: a frame already in flight must not re-show one
+const btForgetArmed = {};      // address -> timer: Forget takes a second click
+
+const btHave = () => !!(state && state.limits && state.limits.bluetooth);
+
+
+function buildBt() {
+  $('bttab').hidden = !btHave();
+  if (!btHave()) return;
+  const send = body => put('/bluetooth', body).then(renderBt).catch(err => { toast(err.message); refreshBt(); });
+  const timeout = () => Math.max(0, Math.min(3600, parseInt($('btdisctime').value, 10) || 0));
+  $('bten').onchange = e => send({enabled: e.target.checked});
+  $('btname').onchange = e => send({name: e.target.value.trim()});
+  $('btdisc').onchange = e => send({discoverable: e.target.checked, discoverable_timeout_s: timeout()});
+  $('btdisctime').onchange = () => send({discoverable_timeout_s: timeout()});
+  $('btpairable').onchange = e => send({pairable: e.target.checked});
+  $('btscan').onclick = () =>
+    post('/bluetooth/scan', {on: !(btState && btState.adapter.discovering)})
+      .then(() => setTimeout(refreshBt, 300)).catch(err => toast(err.message));
+  $('btinen').onchange = e => put('/bluetooth/input', {enabled: e.target.checked})
+    .then(refreshBt).catch(err => { toast(err.message); refreshBt(); });
+  $('btoutdev').onchange = e => btPlayTo(e.target.value, false);
+
+  // One listener for every device card, since the cards are rebuilt as devices come and go.
+  $('btdevices').onclick = e => {
+    const b = e.target.closest('button[data-act]');
+    if (b) btDeviceAction(b.dataset.addr, b.dataset.act);
+  };
+  // Volume over AVRCP: sent as the slider settles, not on every pixel of a drag.
+  $('btdevices').onchange = e => {
+    const v = e.target.closest('input.btvol');
+    if (!v) return;
+    put(`/bluetooth/devices/${v.dataset.addr}`, {volume: parseInt(v.value, 10)})
+      .then(refreshBt).catch(err => { toast(err.message); refreshBt(); });
+  };
+  refreshBt();
+}
+
+// Polled only while the tab is on screen, like the network panel: a background tab costs the
+// daemon nothing, and the pairing banner does not need this to work.
+function syncBtPoll(tab) {
+  clearInterval(btPoll);
+  btPoll = null;
+  if (tab === 'bt' && btHave() && !feedStopped) {
+    refreshBt();
+    btPoll = setInterval(refreshBt, 1000);
+  }
+}
+
+function refreshBt() {
+  if (!btHave()) return Promise.resolve();
+  return api('/bluetooth').then(renderBt).catch(() => { /* the poll retries */ });
+}
+
+function btPlayTo(device, enable) {
+  const body = {device};
+  if (enable) body.enabled = true;
+  return put('/bluetooth/output', body)
+    .then(r => { btApplyOutput(r); refreshBt(); })
+    .catch(err => { toast(err.message); refreshBt(); });
+}
+
+function btDeviceAction(addr, act) {
+  const path = `/bluetooth/devices/${addr}`;
+  let req;
+  if (act === 'pair') {
+    const pin = document.querySelector(`input.btpin[data-addr="${addr}"]`);
+    req = post(`${path}/pair`, pin && pin.value.trim() ? {pin: pin.value.trim()} : undefined);
+  } else if (act === 'connect' || act === 'disconnect') {
+    req = post(`${path}/${act}`);
+  } else if (act === 'play') {
+    req = btPlayTo(btPcmName(addr), true);
+  } else if (act.startsWith('player:')) {
+    req = post(`${path}/player`, {command: act.slice(7)});
+  } else if (act === 'forget') {
+    // Forgetting unpairs it on both ends' terms, and the other device has to be put back into
+    // pairing mode to undo it: worth a second click.
+    if (!btForgetArmed[addr]) {
+      btForgetArmed[addr] = setTimeout(() => { delete btForgetArmed[addr]; renderBt(btState); }, 3000);
+      renderBt(btState);
+      return;
+    }
+    clearTimeout(btForgetArmed[addr]);
+    delete btForgetArmed[addr];
+    req = api(path, {method: 'DELETE'});
+  }
+  if (req) req.then(() => setTimeout(refreshBt, 150)).catch(err => toast(err.message));
+}
+
+// What a device is, in one word, from BlueZ's icon name or else from what it can do.
+function btKind(d) {
+  const byIcon = {
+    'audio-card': 'speaker', 'audio-speakers': 'speaker', 'audio-headphones': 'headphones',
+    'audio-headset': 'headset', 'phone': 'phone', 'computer': 'computer',
+    'input-keyboard': 'keyboard', 'input-mouse': 'mouse', 'input-gaming': 'controller',
+  };
+  if (byIcon[d.icon]) return byIcon[d.icon];
+  if (d.sink && d.source) return 'audio';
+  if (d.sink) return 'speaker';
+  if (d.source) return 'audio source';
+  return '';
+}
+
+const btKhz = r => (r % 1000 ? (r / 1000).toFixed(1) : String(r / 1000)) + ' kHz';
+
+function btDeviceCard(d, target) {
+  const busy = !!d.busy;
+  const dis = busy ? ' disabled' : '';
+  const pills = [
+    d.paired ? '<span class="pill good">paired</span>' : '<span class="pill">not paired</span>',
+    d.connected ? '<span class="pill good">connected</span>' : '',
+    target ? '<span class="pill good">output</span>' : '',
+  ].join('');
+  const audio = [];
+  if (d.playback) {
+    audio.push(`playing to it · ${esc(d.playback.codec)} ${btKhz(d.playback.rate)} · ` +
+      `${d.playback.delay_ms.toFixed(0)} ms reported`);
+  }
+  if (d.capture) audio.push(`streaming here · ${esc(d.capture.codec)} ${btKhz(d.capture.rate)}`);
+
+  const acts = [];
+  if (!d.paired) {
+    acts.push(`<button data-act="pair" data-addr="${d.address}" class="primary"${dis}>Pair</button>`);
+    // A PIN only matters for a device old enough to want one, which says so by failing without it.
+    if (/PIN/.test(d.error)) {
+      acts.push(`<input type="text" class="btpin" data-addr="${d.address}" placeholder="PIN" maxlength="16">`);
+    }
+  } else if (d.connected) {
+    acts.push(`<button data-act="disconnect" data-addr="${d.address}"${dis}>Disconnect</button>`);
+  } else {
+    acts.push(`<button data-act="connect" data-addr="${d.address}"${dis}>Connect</button>`);
+  }
+  if (d.paired && d.sink && !target) {
+    acts.push(`<button data-act="play" data-addr="${d.address}"${dis} title="Make this the Bluetooth output and turn it on">Play here</button>`);
+  }
+  if (d.paired || d.connected) {
+    acts.push(`<button data-act="forget" data-addr="${d.address}" class="danger"${dis}>${btForgetArmed[d.address] ? 'Really forget?' : 'Forget'}</button>`);
+  }
+  const kind = btKind(d);
+  return `<div class="card btdev${target ? ' target' : ''}">
+    <div class="chan-head"><span class="chan-name" title="${esc(d.name)}">${esc(d.name || d.address)}</span>
+      <span class="muted small">${kind}</span></div>
+    <div class="btsub"><span class="mono small muted">${d.address}</span>
+      <span class="mono small muted">${d.rssi != null ? d.rssi + ' dBm' : ''}</span></div>
+    <div class="btmeta">${pills}</div>
+    ${audio.map(a => `<div class="small btaudio">${a}</div>`).join('')}
+    ${busy ? `<div class="small btbusy">${esc(d.busy)}…</div>` : ''}
+    ${d.error ? `<div class="small bterr">${esc(d.error)}</div>` : ''}
+    ${btPlayerBlock(d)}
+    <div class="btacts">${acts.join('')}</div>
+  </div>`;
+}
+
+const btTime = ms => {
+  const s = Math.floor((ms || 0) / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+// The device's AVRCP media player — what a phone playing here says it is playing, and its remote
+// control — and the volume of its audio link, where the device has absolute volume. On a speaker
+// we play to it is the tester's own player (`local`): the track is the Bluetooth output's signal,
+// and the buttons are the same ones the speaker's own buttons press.
+const BT_LOCAL_HINTS = {
+  previous: 'Previous signal', play: 'Unmute (switches the Bluetooth output on if it is off)',
+  pause: 'Mute', stop: 'Switch the Bluetooth output off', next: 'Next signal',
+};
+function btPlayerBlock(d) {
+  // A phone's player object can be empty too: shown only with a track or a transport state worth
+  // controlling. Ours always is.
+  const p = d.player && (d.player.local || d.player.title ||
+    ['playing', 'paused'].includes(d.player.status)) ? d.player : null;
+  const out = [];
+  if (p) {
+    const what = [p.title, p.artist].filter(Boolean).map(esc).join(' — ') || 'no track';
+    const len = p.duration_ms ? ` / ${btTime(p.duration_ms)}` : '';
+    out.push(`<div class="small btplayer"><span class="btstatus">${esc(p.status || 'stopped')}</span> ${what}` +
+      `<span class="mono muted"> ${btTime(p.position_ms)}${len}</span></div>`);
+    if (p.album) out.push(`<div class="small muted">${esc(p.album)}</div>`);
+    const b = (cmd, label, title) =>
+      `<button data-act="player:${cmd}" data-addr="${d.address}" title="${p.local ? BT_LOCAL_HINTS[cmd] : title}">${label}</button>`;
+    out.push(`<div class="btacts">${b('previous', '⏮', 'Previous')}${b('play', '▶', 'Play')}` +
+      `${b('pause', '⏸', 'Pause')}${b('stop', '⏹', 'Stop')}${b('next', '⏭', 'Next')}</div>`);
+  }
+  if (d.volume != null) {
+    out.push(`<label class="btvolrow">Volume <input type="range" class="btvol" data-addr="${d.address}"` +
+      ` min="0" max="127" step="1" value="${d.volume}"><span class="mono val">${Math.round(d.volume / 1.27)}%</span></label>`);
+  }
+  return out.join('');
+}
+
+function renderBt(b) {
+  if (!b) return;
+  const was = btState;
+  btState = b;
+  const idle = el => document.activeElement !== el;
+  const a = b.adapter, st = b.settings;
+
+  const pill = $('btadapterstate');
+  if (!b.available) {
+    pill.textContent = 'unavailable';
+    pill.className = 'pill bad';
+  } else if (!a.powered) {
+    pill.textContent = 'off';
+    pill.className = 'pill';
+  } else if (a.discovering) {
+    pill.textContent = 'scanning';
+    pill.className = 'pill warn';
+  } else {
+    pill.textContent = a.discoverable ? 'on · visible' : 'on';
+    pill.className = 'pill good';
+  }
+
+  if (idle($('bten'))) $('bten').checked = !!st.enabled;
+  if (idle($('btname'))) {
+    $('btname').value = st.name;
+    $('btname').placeholder = a.name && !st.name ? a.name : 'the hostname';
+  }
+  $('btaddr').textContent = a.address || '';
+  if (idle($('btdisc'))) $('btdisc').checked = !!a.discoverable;
+  if (idle($('btdisctime'))) $('btdisctime').value = st.discoverable_timeout_s;
+  if (idle($('btpairable'))) $('btpairable').checked = !!st.pairable;
+
+  // BlueZ does not say how long is left, so count from when it was seen to go visible.
+  if (a.discoverable && !(was && was.adapter.discoverable)) btDiscSince = Date.now();
+  const left = st.discoverable_timeout_s - Math.round((Date.now() - btDiscSince) / 1000);
+  $('btdiscleft').textContent = !a.discoverable ? ''
+    : st.discoverable_timeout_s === 0 ? 'visible until turned off'
+    : `visible for ${Math.max(0, left)} s more`;
+
+  const on = b.available && a.powered;
+  ['btdisc', 'btdisctime', 'btpairable', 'btname'].forEach(id => { $(id).disabled = !on; });
+  $('bten').disabled = !b.available;
+  $('btscan').disabled = !on;
+  $('btscan').textContent = a.discovering ? 'Stop scan' : 'Scan';
+  $('btmsg').textContent = b.error ? b.error
+    : b.available && !b.audio ? 'bluez-alsa is not running: pairing works, audio does not.' : '';
+
+  // Rebuilt only when something on them changed, and never under a PIN being typed or a volume
+  // being dragged.
+  const outDev = b.output ? b.output.device : '';
+  const outAddr = b.output && b.output.enabled ? b.output.address : '';
+  const typing = document.activeElement &&
+    (document.activeElement.classList.contains('btpin') || document.activeElement.classList.contains('btvol'));
+  const html = b.devices.length
+    ? b.devices.map(d => btDeviceCard(d, d.address === outAddr)).join('')
+    : `<div class="muted small btempty">${on ? 'No devices yet — press Scan.' : 'Bluetooth is off.'}</div>`;
+  if (!typing && html !== $('btdevices').dataset.html) {
+    const pins = {};
+    document.querySelectorAll('input.btpin').forEach(i => { pins[i.dataset.addr] = i.value; });
+    $('btdevices').innerHTML = html;
+    $('btdevices').dataset.html = html;
+    document.querySelectorAll('input.btpin').forEach(i => { i.value = pins[i.dataset.addr] || ''; });
+  }
+
+  // The input.
+  const inp = b.input;
+  if (idle($('btinen'))) $('btinen').checked = !!inp.enabled;
+  const nets = inp.input >= 0
+    ? ` → ${inputLabel(inp.input)}${inp.channels > 1 ? '+' + (inp.input - NIN_LOCAL + inp.channels) : ''}` : '';
+  $('btinstate').textContent = !inp.enabled ? 'off'
+    : inp.state === 'streaming' ? `streaming from ${inp.name}, ${btKhz(inp.rate)}${nets}`
+    : inp.state === 'error' ? inp.error
+    : inp.name ? `${inp.name} is connected but not playing${nets}`
+    : 'waiting for a device to play to this one';
+  $('btinstate').className = 'small mono ' + (inp.state === 'error' ? 'bterr' : inp.state === 'streaming' ? 'btaudio' : 'muted');
+
+  // The output: which speaker. Paired speakers are offered, plus whatever is configured.
+  const sel = $('btoutdev');
+  if (idle(sel)) {
+    const opts = [[BT_DEFAULT_DEVICE, 'the most recently connected speaker']];
+    b.devices.filter(d => d.paired && d.sink)
+      .forEach(d => opts.push([btPcmName(d.address), `${d.name} (${d.address})`]));
+    if (outDev && !opts.some(o => o[0] === outDev)) opts.push([outDev, outDev]);
+    sel.innerHTML = opts.map(o => `<option value="${esc(o[0])}">${esc(o[1])}</option>`).join('');
+    sel.value = outDev || BT_DEFAULT_DEVICE;
+  }
+  const o = b.output;
+  $('btoutstate').textContent = !o ? '' : !o.enabled ? 'off — turn it on on the Dashboard'
+    : o.playing ? `playing to ${o.name || o.address} · ${o.device_rate} Hz · latency ${o.latency_ms.toFixed(1)} ms`
+    : o.error ? o.error : 'starting';
+  $('btoutstate').className = 'small mono ' + (o && o.playing ? 'btaudio' : o && o.error ? 'bterr' : 'muted');
+  btApplyOutput(o);
+
+  renderBtRequest(b.request);
+}
+
+// A pairing question, on every tab. Built once per request and only its countdown updated after,
+// so a code half typed is not wiped by the next frame.
+function renderBtRequest(r) {
+  const el = $('btbanner');
+  if (!el) return;
+  if (!r || btAnswered.has(r.id)) {
+    el.hidden = true;
+    el.dataset.id = '';
+    return;
+  }
+  const left = `<span class="btleft muted small">${r.expires_s} s</span>`;
+  if (el.dataset.id === String(r.id)) {
+    const l = el.querySelector('.btleft');
+    if (l) l.textContent = `${r.expires_s} s`;
+    return;
+  }
+  el.dataset.id = String(r.id);
+  const who = `<strong>${esc(r.name)}</strong> <span class="mono small muted">${esc(r.address)}</span>`;
+  const code = r.passkey ? `<span class="btcode">${esc(r.passkey.replace(/(\d{3})(\d{3})/, '$1 $2'))}</span>` : '';
+  // Every pairing is accepted by itself; these two are the only questions left, and only
+  // keyboards ask them: a code to type here, or one to type on the device.
+  let q, acts;
+  if (r.kind === 'display') {
+    q = `Type this code on ${who}, then press Enter there.`;
+    acts = `${code}<button data-a="yes">Dismiss</button>`;
+  } else {
+    q = `${who} shows a six-digit code. Type it here:`;
+    acts = '<input type="text" id="btreqval" maxlength="6" inputmode="numeric" placeholder="123456">' +
+      '<button class="primary" data-a="yes">Pair</button><button data-a="no">Refuse</button>';
+  }
+  el.innerHTML = `<span class="btq">Bluetooth: ${q} ${left}</span><span class="btacts">${acts}</span>`;
+  el.hidden = false;
+  el.querySelectorAll('button[data-a]').forEach(btn => {
+    btn.onclick = () => {
+      const body = {id: r.id, accept: btn.dataset.a === 'yes'};
+      const v = $('btreqval');
+      if (body.accept && v) body.passkey = v.value.trim();
+      post('/bluetooth/request', body).then(() => {
+        btAnswered.add(r.id);
+        el.hidden = true;
+        el.dataset.id = '';
+        refreshBt();
+      }).catch(err => toast(err.message));
+    };
+  });
+  const v = $('btreqval');
+  if (v) v.focus();
 }
 
 // ---------------------------------------------------------------- channel map
@@ -2947,12 +3333,14 @@ function setFeedStopped(stop) {
     if (feedWs) { try { feedWs.close(); } catch (e) { /* already gone */ } }
     stopStatePoll();
     stopPingPoll();
+    syncBtPoll(null);
   } else {
     $('conn').textContent = 'connecting';
     $('conn').className = 'pill';
     connect();          // its onopen flips the pill to connected
     startStatePoll();
     startPingPoll();
+    syncBtPoll(tabActive('bt') ? 'bt' : null);
   }
 }
 
@@ -3037,6 +3425,7 @@ api('/state').then(s => {
   buildInputs();
   buildNet();
   buildOutputs();
+  buildBt();
   bindGenerators();
   buildMap();
   $('mapcard').hidden = s.limits.channel_map === false;   // the TDM slots are the engine card's

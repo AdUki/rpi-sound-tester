@@ -84,6 +84,11 @@ struct SinkDevice {
   // Whether layouts and rates are the device's own: false when it could not be opened to ask,
   // and they are guesses until it can.
   bool probed = false;
+  // Measure the driver's share of the latency as the frames queued in its buffer, not as
+  // snd_pcm_delay(). bluez-alsa's delay adds the codec and radio delay the speaker reports, which
+  // is neither this thread's to hold nor constant: the servo would chase every new report, and the
+  // first one, a hundred milliseconds or more, would read as an error it can never trim away.
+  bool local_queue = false;
 
   bool offers(SinkLayout l) const;
   bool offers_rate(unsigned r) const;
@@ -197,6 +202,7 @@ class SinkOutput {
 
   // Thread-owned.
   std::string name_;  // the device id, as the log prefixes its lines
+  bool local_queue_ = false;  // SinkDevice::local_queue, as of the open
   snd_pcm_t* pcm_ = nullptr;
   PcmFormat format_ = PcmFormat::S16_LE;
   Asrc asrc_;

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Drives the fake BlueZ started by tools/fake-bluez/run: plays the other side of the radio link.
+#
+#   ctl incoming-pair 5C:E9:1E:22:40:01   # the Pixel pairs with us (agent RequestConfirmation)
+#   ctl incoming-pair F8:DF:15:0A:11:3C   # the JBL pairs with us (agent RequestAuthorization)
+#   ctl incoming-pair 00:1A:7D:DA:71:13   # the old speaker (agent RequestPinCode; it wants 1234)
+#   ctl display C7:3B:52:10:9A:1E         # agent DisplayPasskey, as a keyboard pairing does
+#   ctl drop F8:DF:15:0A:11:3C            # the link drops: out of range for 15 s
+#   ctl start-stream 5C:E9:1E:22:40:01    # the phone starts / stops playing to us
+#   ctl stop-stream 5C:E9:1E:22:40:01
+#   ctl reset                             # back to the initial world
+#   ctl objects                           # GetManagedObjects of org.bluez
+#   ctl pcms                              # GetManagedObjects of org.bluealsa
+#   ctl busctl ...                        # anything else, on the private bus
+set -euo pipefail
+
+addr_file=${FAKE_BLUEZ_ADDR_FILE:-${XDG_RUNTIME_DIR:-/tmp}/fake-bluez.addr}
+[ -f "$addr_file" ] || { echo "no fake running ($addr_file missing): start tools/fake-bluez/run" >&2; exit 1; }
+addr=$(cat "$addr_file")
+
+bc() { busctl --address="$addr" "$@"; }
+hook() { bc --timeout=90 call org.bluez /org/soundtester/fake org.soundtester.Fake1 "$@"; }
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  incoming-pair) hook IncomingPair s "$1" ;;
+  display)       hook Display s "$1" ;;
+  drop)          hook DropLink s "$1" ;;
+  start-stream)  hook StartStream s "$1" ;;
+  stop-stream)   hook StopStream s "$1" ;;
+  reset)         hook Reset ;;
+  objects)       bc --json=pretty call org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects ;;
+  pcms)          bc --json=pretty call org.bluealsa /org/bluealsa org.freedesktop.DBus.ObjectManager GetManagedObjects ;;
+  busctl)        bc "$@" ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

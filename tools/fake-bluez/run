@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Starts a private D-Bus bus with a fake BlueZ and bluez-alsa on it, then runs a command against
+# it as though it were the system bus:
+#
+#   tools/fake-bluez/run                                  # just the fake; Ctrl-C to stop
+#   tools/fake-bluez/run ./app/build/soundtesterd --sim --bluetooth ...
+#
+# The command sees DBUS_SYSTEM_BUS_ADDRESS pointing at the private bus — sd-bus and libdbus both
+# honour it — so it never reaches the real system bus or this machine's own bluetoothd. Both the
+# bus and the fake are stopped when the command (or this script) exits. The address is also
+# written to $FAKE_BLUEZ_ADDR_FILE, which is where tools/fake-bluez/ctl finds it.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+addr_file=${FAKE_BLUEZ_ADDR_FILE:-${XDG_RUNTIME_DIR:-/tmp}/fake-bluez.addr}
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/fake-bluez.XXXXXX")
+bus_pid=""
+fake_pid=""
+
+cleanup() {
+  [ -n "$fake_pid" ] && kill "$fake_pid" 2>/dev/null || true
+  [ -n "$bus_pid" ] && kill "$bus_pid" 2>/dev/null || true
+  wait 2>/dev/null || true
+  # Only our own address: a second run's file must survive the first one ending.
+  if [ -f "$addr_file" ] && [ "$(cat "$addr_file" 2>/dev/null)" = "${addr:-}" ]; then
+    rm -f "$addr_file"
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+addr="unix:path=$tmp/bus"
+dbus-daemon --config-file="$here/bus.conf" --address="$addr" --nofork --nopidfile &
+bus_pid=$!
+
+# The fake connects as soon as the socket exists.
+for _ in $(seq 100); do [ -S "$tmp/bus" ] && break; sleep 0.05; done
+[ -S "$tmp/bus" ] || { echo "fake-bluez: the private bus did not start" >&2; exit 1; }
+
+python3 -u "$here/fake_bluez.py" --address "$addr" &
+fake_pid=$!
+
+# Ready once it owns both names; a client started earlier would find no BlueZ and give up.
+has_owner() {
+  dbus-send --bus="$addr" --print-reply=literal --dest=org.freedesktop.DBus / \
+    org.freedesktop.DBus.NameHasOwner "string:$1" 2>/dev/null | grep -q true
+}
+for _ in $(seq 100); do
+  has_owner org.bluez && has_owner org.bluealsa && break
+  kill -0 "$fake_pid" 2>/dev/null || { echo "fake-bluez: the fake exited" >&2; exit 1; }
+  sleep 0.05
+done
+has_owner org.bluealsa || { echo "fake-bluez: the fake did not come up" >&2; exit 1; }
+
+echo "$addr" > "$addr_file"
+echo "DBUS_SYSTEM_BUS_ADDRESS=$addr"
+
+if [ $# -eq 0 ]; then
+  wait "$fake_pid"
+else
+  status=0
+  DBUS_SYSTEM_BUS_ADDRESS="$addr" "$@" || status=$?
+  exit "$status"
+fi

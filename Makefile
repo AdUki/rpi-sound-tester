@@ -61,6 +61,11 @@ STAGGER ?= 137
 # through its sound server (switch it on in the console):
 #   make run SINK=default
 SINK    ?=
+# Bluetooth against a fake BlueZ and bluez-alsa on a private D-Bus bus (tools/fake-bluez/), so
+# pairing and the console can be driven from a desk without touching this machine's own radio.
+# Its devices are scripted; tools/fake-bluez/ctl plays the other side (a phone pairing with us).
+#   make run BT=fake
+BT      ?=
 DISK    ?=
 
 # What `make configure` writes. Neither is tracked by git.
@@ -84,6 +89,7 @@ DEF_SSH          := 1
 DEF_WIFI_SSID    :=
 DEF_WIFI_PSK     :=
 DEF_WIFI_COUNTRY := SK
+DEF_BLUETOOTH    := 1
 DEF_DL_DIR       := $(CURDIR)/$(YOCTO)/downloads
 DEF_SSTATE_DIR   := $(CURDIR)/$(YOCTO)/sstate-cache
 
@@ -114,16 +120,19 @@ check-submodules:
 test: build ## Run the test suite
 	@ctest --test-dir $(BUILD) --output-on-failure
 
+# Only BT=fake: a real system bus here is this machine's own bluetoothd, not the device's.
+FAKEBT = $(if $(filter fake,$(BT)),tools/fake-bluez/run )
+
 .PHONY: run
-run: build ## Run it: simulated card by default, or DEVICE=hw:... for a real one; SINK=dev adds an output (e.g. default)
+run: build ## Run it: simulated card by default, or DEVICE=hw:... for a real one; SINK=dev adds an output (e.g. default); BT=fake a fake Bluetooth
 	@mkdir -p /tmp/soundtester
 ifeq ($(DEVICE),)
 	@echo -e "$(BOLD)http://localhost:$(PORT)$(OFF)  $(DIM)simulated card, each channel delayed $(STAGGER) frames$(OFF)"
-	@$(BIN) --sim --sim-stagger $(STAGGER) --port $(PORT) --board $(APP)/config/boards/$(PROFILE).json \
+	@$(FAKEBT)$(BIN) --sim $(if $(FAKEBT),--bluetooth) --sim-stagger $(STAGGER) --port $(PORT) --board $(APP)/config/boards/$(PROFILE).json \
 	        $(foreach d,$(SINK),--sink $(d)) \
 	        --www $(APP)/www --config $(APP)/config/default-config.json --data-dir /tmp/soundtester
 else
-	@$(BIN) --device $(DEVICE) --port $(PORT) --board $(APP)/config/boards/$(PROFILE).json \
+	@$(FAKEBT)$(BIN) $(if $(FAKEBT),--bluetooth) --device $(DEVICE) --port $(PORT) --board $(APP)/config/boards/$(PROFILE).json \
 	        $(foreach d,$(SINK),--sink $(d)) \
 	        --www $(APP)/www --config $(APP)/config/default-config.json --data-dir /tmp/soundtester
 endif
@@ -221,7 +230,7 @@ deploy-daemon: $(BUILD_CONF) ## Copy the cross-compiled daemon, its /etc files a
 # Everything here can equally well be done by editing the two files by hand; this target just
 # means you do not have to know which setting lives in which of them.
 .PHONY: configure
-configure: ## Set hostname, ssh password, Wi-Fi and the Yocto cache dirs (interactive)
+configure: ## Set hostname, ssh password, Wi-Fi, Bluetooth and the Yocto cache dirs (interactive)
 	@set -e; \
 	[ -f $(DEVCONF) ] || cp $(DEVCONF).sample $(DEVCONF); \
 	get() { sed -n "s|^$$2 *?\?= *\"\(.*\)\"|\1|p" "$$1" 2>/dev/null | head -1; }; \
@@ -259,6 +268,8 @@ configure: ## Set hostname, ssh password, Wi-Fi and the Yocto cache dirs (intera
 	  ask "Wi-Fi password" "$(DEF_WIFI_PSK)" "$$(get $(DEVCONF) SOUNDTESTER_WIFI_PSK)"; psk="$$ANS"; \
 	  ask "Wi-Fi country (2-letter regulatory domain)" "$(DEF_WIFI_COUNTRY)" "$$country"; country="$$ANS"; \
 	fi; \
+	echo -e "\n$(BOLD)Bluetooth$(OFF) $(DIM)— the onboard radio as an A2DP sink and source, paired from the web console. 0 leaves out BlueZ and turns the radio off.$(OFF)"; \
+	ask "Bluetooth? (1/0)" "$(DEF_BLUETOOTH)" "$$(get $(DEVCONF) SOUNDTESTER_BLUETOOTH)"; bt="$$ANS"; \
 	echo -e "\n$(BOLD)Build host$(OFF) $(DIM)— caches. Repo-local by default; point them at a shared tree (e.g. ~/yocto/downloads) and every project reuses one.$(OFF)"; \
 	ask "Yocto download dir (DL_DIR)" "$(DEF_DL_DIR)" "$$(get $(SITECONF) DL_DIR)"; dl="$$ANS"; \
 	ask "Yocto sstate cache (SSTATE_DIR)" "$(DEF_SSTATE_DIR)" "$$(get $(SITECONF) SSTATE_DIR)"; ss="$$ANS"; \
@@ -268,6 +279,7 @@ configure: ## Set hostname, ssh password, Wi-Fi and the Yocto cache dirs (intera
 	setkey $(DEVCONF) SOUNDTESTER_WIFI_SSID     "$$ssid"; \
 	setkey $(DEVCONF) SOUNDTESTER_WIFI_PSK      "$$psk"; \
 	setkey $(DEVCONF) SOUNDTESTER_WIFI_COUNTRY  "$$country"; \
+	setkey $(DEVCONF) SOUNDTESTER_BLUETOOTH     "$$bt"; \
 	mkdir -p $$(dirname $(SITECONF)) "$$dl" "$$ss"; \
 	{ echo "# Written by 'make configure'. Per-machine, not tracked by git."; \
 	  echo "# bitbake parses conf/site.conf before conf/local.conf, so these win over the"; \
@@ -277,7 +289,7 @@ configure: ## Set hostname, ssh password, Wi-Fi and the Yocto cache dirs (intera
 	setkey $(SITECONF) SSTATE_DIR "$$ss"; \
 	echo -e "\n$(BOLD)Written$(OFF)"; \
 	echo "  $(DEVCONF)"; \
-	echo "      hostname=$$host  ssh=$$ssh  wifi=$${ssid:-<none>}"; \
+	echo "      hostname=$$host  ssh=$$ssh  wifi=$${ssid:-<none>}  bluetooth=$$bt"; \
 	echo "  $(SITECONF)"; \
 	echo "      DL_DIR=$$dl"; \
 	echo "      SSTATE_DIR=$$ss"; \

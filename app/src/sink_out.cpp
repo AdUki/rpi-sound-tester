@@ -208,6 +208,7 @@ bool SinkOutput::open_pcm() {
     std::lock_guard<std::mutex> lk(m_);
     dev = device_.alsa;
     want = sample_rate_;
+    local_queue_ = device_.local_queue;
   }
   if (dev.empty()) {
     set_error(name_ + ": no device");
@@ -466,7 +467,12 @@ bool SinkOutput::stream() {
     // taken against the card's position interpolated to now, not its last block boundary, and the
     // driver term moves opposite to it as a write goes in: the sum does not see either sawtooth.
     snd_pcm_sframes_t delay = 0;
-    if (snd_pcm_delay(pcm_, &delay) < 0) delay = 0;
+    if (local_queue_) {
+      const snd_pcm_sframes_t avail = snd_pcm_avail(pcm_);
+      delay = avail < 0 ? 0 : static_cast<snd_pcm_sframes_t>(dev_buffer_.load()) - avail;
+    } else if (snd_pcm_delay(pcm_, &delay) < 0) {
+      delay = 0;
+    }
     const uint64_t now_ns = clock_.now_ns();
     const uint64_t est = ctl_.anchor.estimate(now_ns, rate_);
     const double ring_part =

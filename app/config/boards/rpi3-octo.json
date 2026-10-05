@@ -6,6 +6,7 @@
   "rate": 96000,
   "period": 1024,
   "periods": 4,
+  "bluetooth": true,
   "devices": {
     "b1,0": { "label": "HDMI" },
     "Headphones,0": { "label": "Line out" }

@@ -498,3 +498,54 @@ td:first-child { color: var(--muted); width: 40%; }
   min-width: 6.5rem;
   text-align: right;
 }
+
+/* ---- Bluetooth --------------------------------------------------------------------------------- */
+.chan-head h3 { margin: 0; }
+.btrow { display: flex; flex-wrap: wrap; align-items: center; gap: 0.1rem 1.25rem; }
+.btrow label { display: inline-flex; align-items: center; margin: 0.3rem 0; }
+.btrow label.en { color: var(--fg); gap: 0.3rem; cursor: pointer; }
+.btrow label.en input { margin: 0; }
+#btname { width: 14em; }
+#btdisctime { width: 5.5em; }
+
+.btdevices { --cols: 1; }
+@media (min-width: 700px) { .btdevices { --cols: 2; } }
+.btdev .chan-head { margin-bottom: 0.2rem; }
+.btdev .btsub { display: flex; justify-content: space-between; gap: 0.5rem; }
+.btdev .btmeta { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.45rem 0 0.2rem; }
+.btdev .btmeta .pill { font-size: 0.72rem; padding: 0.05rem 0.45rem; }
+.btdev .btaudio { color: var(--good); }
+.btdev .bterr { color: var(--bad); overflow-wrap: anywhere; }
+.btdev .btbusy { color: var(--warn); }
+.btdev .btacts { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin-top: 0.55rem; }
+.btdev .btacts input[type="text"] { width: 6.5em; margin: 0; }
+.btdev .btacts label { margin: 0; display: inline-flex; align-items: center; gap: 0.3rem; }
+.btdev .btacts label input { margin: 0; }
+.btdev.target { border-color: var(--accent); }
+.btempty { padding: 0.5rem 0; }
+.btdev .btplayer { margin-top: 0.45rem; overflow-wrap: anywhere; }
+.btdev .btstatus { color: var(--accent); text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.05em; }
+.btdev .btvolrow { display: flex; align-items: center; gap: 0.4rem; margin: 0.45rem 0 0; }
+.btdev .btvolrow input { flex: 1; margin: 0; }
+
+/* A pairing question. Accent, like the connection banner, rather than a fault's amber: it is a
+   question for the operator, and the code is the one thing they have to compare. */
+.banner.bt {
+  background: rgba(77, 163, 255, 0.14);
+  border-top-color: var(--accent);
+  color: var(--fg);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+.banner.bt .btq { flex: 1 1 18rem; }
+.banner.bt .btcode {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 1.35rem;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.banner.bt .btacts { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.banner.bt input[type="text"] { width: 8em; margin: 0; }

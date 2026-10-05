@@ -64,6 +64,16 @@ class Devices {
   Devices(const Devices&) = delete;
   Devices& operator=(const Devices&) = delete;
 
+  // A sink no scan finds, under an id of its own and with what it offers already decided: the
+  // Bluetooth output, on a bluez-alsa PCM, which ALSA lists nowhere. It is bound by the first scan
+  // like any device, and is always present. Before start().
+  void add_fixed_sink(SinkDevice d);
+  // Points fixed sink `id` at another ALSA name: the Bluetooth output at another speaker. A running
+  // output reopens on it. False when there is no such sink.
+  bool retarget(const std::string& id, const std::string& alsa);
+  // The bound slot of the sink with device id `id`, or -1.
+  int slot_of(const std::string& id) const;
+
   // Takes the saved settings of every sink, binds every device present now, and keeps looking for
   // devices that come and go until stop().
   void start(const std::map<std::string, SinkConfig>& saved);
@@ -122,6 +132,7 @@ class Devices {
   const Board& board_;
   const std::string engine_card_;  // card id; "" for none
   std::vector<std::string> extra_;
+  std::vector<SinkDevice> fixed_;  // under m_ once started
 
   mutable std::mutex m_;  // guards everything below; outputs_[s] is written once, under it
   std::array<std::unique_ptr<SinkOutput>, kMaxSinks> outputs_;

@@ -10,6 +10,8 @@
 
 #include "analysis.h"
 #include "audio_engine.h"
+#include "bluetooth.h"
+#include "bt_input.h"
 #include "capture.h"
 #include "config.h"
 #include "control.h"
@@ -36,6 +38,8 @@ struct Deps {
   Control& ctl;
   NetAudioServer& net;
   Devices& devices;
+  BtManager& bt;   // the adapter, pairing and the agent; its output is the sink kBtSinkId
+  BtInput& bt_in;  // a phone playing to the device, onto network channels
   RingBuffer& ring;
   AudioEngine& engine;
   Analysis& analysis;
@@ -90,6 +94,11 @@ class WebServer {
   // Serialises PUT /api/sinks/{id}: two at once could each start or stop the sink's thread between
   // the other's check and its store, leaving the thread and `enabled` disagreeing.
   std::mutex sink_put_m_;
+
+  // Held from flipping a switch that the alignment delay depends on (network input, the Bluetooth
+  // input) to storing the delay it implies, so two such requests cannot interleave and leave the
+  // delay computed from a state that no longer holds.
+  std::mutex delay_m_;
 };
 
 }  // namespace st
