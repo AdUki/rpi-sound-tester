@@ -9,7 +9,7 @@
 #  Everything here is baked into the image at build time: the root filesystem is
 #  read-only, so none of it can be changed on the running device.
 #
-#  After editing, rebuild:  bitbake soundtester-image
+#  After editing, rebuild:  make image [BOARD=rpi3|vim3l]
 # =============================================================================
 
 # --- Identity ----------------------------------------------------------------
@@ -30,7 +30,8 @@ SOUNDTESTER_ENABLE_SSH ?= "1"
 # Wired Ethernet is always configured for DHCP.
 #
 # Wi-Fi is optional: set an SSID to enable it. Leave SOUNDTESTER_WIFI_SSID empty to
-# build an Ethernet-only image (no wpa_supplicant, no Wi-Fi firmware).
+# build an Ethernet-only image (no wpa_supplicant, no Wi-Fi firmware). The VIM3L image is
+# always Ethernet-only, whatever is set here.
 SOUNDTESTER_WIFI_SSID ?= ""
 SOUNDTESTER_WIFI_PSK ?= ""
 SOUNDTESTER_WIFI_COUNTRY ?= "SK"
@@ -38,7 +39,8 @@ SOUNDTESTER_WIFI_COUNTRY ?= "SK"
 # --- Bluetooth ---------------------------------------------------------------
 # The onboard radio, as an A2DP sink and source: pair a speaker to play the tester's output on, or
 # a phone to feed it an input. Pairing is done from the web console. Set to "0" to leave out BlueZ
-# and bluez-alsa and switch the radio off in config.txt.
+# and bluez-alsa and switch the radio off in config.txt. The Pi 3 only: the VIM3L image has no
+# Bluetooth, whatever is set here.
 SOUNDTESTER_BLUETOOTH ?= "1"
 
 # --- Web console -------------------------------------------------------------

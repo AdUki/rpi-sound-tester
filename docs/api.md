@@ -15,14 +15,22 @@ counts; each input in `GET /api/state` has a `kind` (`local`, `net` or `device`)
 console shows ("HDMI loopback L"). Each input also carries `active`: a network channel reads
 `false` until a sender has used it, a device input until a device is on it, which is how the
 console keeps unused ones out of sight. The channel exists either way — the index is fixed for the
-life of the daemon, and the arrays in the meters, spectrum and envelope messages always carry every
+life of the daemon, and the arrays in the meters and envelope messages always carry every
 channel — so a headless client can ignore `active` entirely.
 
 Every other playback device is a **sink** (HDMI, a Pi's 3.5 mm jack, a USB interface), found at
 runtime: see Sinks below.
 
-Every PUT field is optional — send only what changes. Out-of-range numbers clamp to their limits;
-bad enums and non-permutation maps are rejected.
+Every PUT field is optional — send only what changes (`PUT /api/channel-map` is the exception: it
+takes both maps). Out-of-range numbers clamp to their limits. What cannot be clamped is rejected: a
+bad enum, an input index that does not exist, a sink `sample_rate` that is not one of its `rates`,
+a channel map whose slots repeat.
+
+A write answers `{"ok": true}` unless its section shows another body. A failure answers
+`{"error": "why"}` with **400** for a body that is not JSON, lacks a required field or holds a bad
+value; **404** for an input, output, sink, channel or Bluetooth device that does not exist; **409**
+when the request does not fit the current state; **503** when what it needs is not running or not
+ready yet.
 
 ### `GET /api`
 This document, rendered to HTML (built from `api.md`). Also served as the static `/api.html`.
@@ -35,7 +43,36 @@ The whole device state in one object: `inputs`, `outputs`, `sinks`, `sources`, `
 console reads). `engine.backend` is `card` (the engine card), `timer` (a board without one) or
 `simulator`. `limits.channel_map` and `limits.sync_watch` are `false` without an engine card: the
 TDM slot map and the I2S sync watch are the Octo's. `limits.bluetooth` says Bluetooth is running.
-Each input and output has a `name`, set only in `config.json` — there is no API to change it.
+Each input and output has a `name`, set only in `config.json` — there is no API to change it. A
+network input with none takes its sender's (`thinkpad`, `thinkpad (1/2)` for half of a stereo
+stream).
+
+- `inputs[]`: `ch`, `name`, `kind`, `label`, `active`, `gain_db`, `mute`, `bypass`, `gain_min_db`,
+  `rms_db`, `peak_db`, `tone` (as in `GET /api/genie/sound`). One per input, `limits.inputs_total`.
+- `outputs[]`: the engine card's outputs, `ch`, `source`, `gain_db`, `mute`, `name`; empty without
+  an engine card.
+- `sinks`, `sources`, `devices`: as `GET /api/sinks`, `/api/sources` and `/api/devices`.
+- `capture`: as `GET /api/capture/status` without the `live_*` fields, plus `analyze_frames`, what
+  the next freeze copies.
+- `engine`: `running`, `sim`, `backend`, `device` (the engine card's ALSA name), `rate`, `period`
+  and `periods` (frames per period, and how many), `format`, `capture_channels` (what the card
+  captures, before the slot map), `xruns`, `generation` (bumps on every xrun), `samples` (the sample
+  counter), `last_error`.
+- `system`: `cpu_pct`, `cpu_cores[]` (per core), `temp_c`, `uptime_s`,
+  `mem` {`total_kb`, `used_kb`, `available_kb`}, `throttle` {`available`, `under_voltage`,
+  `throttled`, `freq_capped`, `under_voltage_seen`, `throttled_seen`} (the Pi firmware's flags;
+  `available` is false elsewhere), `sync_errors`, `hostname`, `ips`, `has_saved_config`,
+  `data_persistent`, `listen_streams` (open listen streams), `loopback_offset_samples` (set in
+  `config.json` only).
+- `limits`: counts: `inputs_total`, `inputs_local`, `inputs_device`, `outputs`, `net_inputs`,
+  `sinks_max`; gain ranges: `input_gain_min_db`, `input_gain_max_db`, `net_gain_min_db`; capture:
+  `capture_max_frames`, `env_column_frames` (frames per scope envelope column), `pinned_mb` (memory
+  locked for the ring, the snapshot and the sinks); listening: `listen_codecs`,
+  `listen_default_codec`, `listen_bitrate_kbps`, `listen_bitrate_min_kbps`,
+  `listen_bitrate_max_kbps`, `opus_rate`; network input: `net_port`, `net_delay_ms`,
+  `net_delay_min_ms`, `net_delay_max_ms`; feature flags: `channel_map`, `sync_watch` and `bluetooth`
+  as above; `capture_config`, `input_mute`, `telemetry_mask` and `net` are always true, so a console
+  can tell an older daemon by their absence.
 
 ## Inputs
 
@@ -46,10 +83,11 @@ Each input and output has a `name`, set only in `config.json` — there is no AP
 Gain and mute, applied **before the ring buffer** — so every reading (meters, spectrum, THD+N,
 scope, xcorr, listen streams) is post-gain and a muted channel reads as silent everywhere.
 
-An ADC channel takes 0…+40 dB: it cannot undo clipping that already happened in the codec, so
-attenuating would only hide the damage from the meters. A **network** channel has no ADC and takes
-−60…+40 dB, which is what gives a mixer on the sending machine a playback volume worth the name.
-Each input reports its own floor as `gain_min_db` in `GET /api/state`.
+An ADC channel, the engine card's or a device's, takes 0…+40 dB: it cannot undo clipping that
+already happened in the codec, so attenuating would only hide the damage from the meters. A
+**network** channel has no ADC and takes −60…+40 dB, which is what gives a mixer on the sending
+machine a playback volume worth the name. Each input reports its own floor as `gain_min_db` in `GET
+/api/state`.
 
 A sender can put its stream beyond both (`mixer off`, below). That input reports `"bypass": true`
 and plays exactly as it arrived, gain and mute ignored, until the stream ends; a stored gain is
@@ -65,7 +103,8 @@ The engine card's outputs; 404 on a board without one.
 {"source": {"type": "silence"}}
 ```
 `type` is `silence` | `input` | `gen`. `index` is any input for `input` — a network channel routes
-like any other — or `sine` | `noise` | `ping` | `music` for `gen`. `gain_db` clamps to −60…0.
+like any other — or `sine` | `noise` | `ping` | `music` for `gen`; a `source` without `type` is
+silence. `gain_db` clamps to −60…0.
 
 ### `POST /api/outputs/{0-7}/identify`
 Three 100 ms beeps on that output only, then it reverts. Tells you which physical socket it is.
@@ -75,8 +114,9 @@ Three 100 ms beeps on that output only, then it reverts. Tells you which physica
 {"input_map": [0,1,2,3,4,5], "output_map": [0,1,2,3,4,5,6,7]}
 ```
 `input_map[logical]` = the TDM slot to capture from; `output_map[logical]` = the slot to play into.
-This corrects the Octo's slot rotation. Each map must be a permutation (in range, no duplicates) or
-the request is rejected. 404 on a board without an engine card.
+This corrects the Octo's slot rotation. Both maps are required: `input_map` is 6 distinct slots of
+the 8 (0–7), `output_map` a permutation of 0–7; anything else is a 400. 404 on a board without an
+engine card.
 
 ## Sinks
 
@@ -103,19 +143,22 @@ picks its speaker through `PUT /api/bluetooth/output`.
  "layouts": ["mono", "stereo", "5.1", "7.1"], "rates": [32000, 44100, 48000, 96000],
  "enabled": true, "open": true, "playing": true, "device": "hw:CARD=b1,DEV=0",
  "sample_rate": 48000, "device_rate": 48000, "layout": "stereo", "speakers": 2,
- "device_channels": 2, "format": "S16_LE", "latency_ms": 112.0, "target_ms": 112.0,
+ "device_channels": 2, "format": "S16_LE", "period_frames": 1024, "buffer_frames": 8192,
+ "latency_ms": 112.0, "target_ms": 112.0,
  "ring_ms": 27.4, "alsa_ms": 84.6, "trim_ppm": -1.2,
  "xruns": 0, "underruns": 0, "overruns": 0, "resyncs": 0, "error": "",
  "outputs": [{"ch": 0, "position": "L", "slot": 0, "source": {"type": "gen", "index": "music"},
-              "gain_db": 0, "mute": false}]}
+              "gain_db": 0, "mute": false, "name": ""}]}
 ```
-`latency_ms` is engine to driver, averaged, and it is held at `target_ms`. It leaves out the driver's
-own pipeline and the TV, receiver or interface. Both are constant, so measure them once: route a
-`tick` to the sink, bring it back into an input (an HDMI audio extractor, a loopback cable), and run
-`genie/sync` against a reference. Keep the ping interval at 1 s or more, so each window holds
-exactly one arrival. `resyncs` counts re-anchors; each is a latency step. `error` says why a device
-will not open. `outputs` lists the layout's channels, each with the PCM `slot` it is sent in.
-`format` is what the PCM opened in: the first of S16_LE, S32_LE, S24_3LE and S24_LE it takes.
+`latency_ms` is engine to driver, averaged, and it is held at `target_ms`. It leaves out the
+driver's own pipeline and the TV, receiver or interface. Both are constant, so measure them once:
+route the ping generator (variant `tick`) to the sink, bring it back into an input (an HDMI audio
+extractor, a loopback cable), and run `genie/sync` against a reference. Keep the ping interval at 1
+s or more, so each window holds exactly one arrival. `resyncs` counts re-anchors; each is a latency
+step. `error` says why a device will not open. `outputs` lists the layout's channels, each with the
+PCM `slot` it is sent in. `format` is what the PCM opened in: the first of S32_LE, S24_LE, S24_3LE
+and S16_LE it takes, the widest first. `period_frames` and `buffer_frames` are the device's, in its
+own frames.
 
 ### `PUT /api/sinks/{id}`
 ```json
@@ -127,11 +170,13 @@ LFE FC …). HDMI drivers tell the sink only a channel count, and the sink picks
 only these four counts map to one layout each. Four channels, for example, could be quad or 3.1, so
 it isn't offered. Mono is sent on both L and R of a stereo stream (`device_channels` 2). 5.1 and 7.1
 need a `sample_rate` of 48000 or less: the Pi carries more than two HDMI channels only up to 48 kHz.
-Any other sink offers `stereo` and its own channel count (`6ch`, `8ch`), in the device's own order.
+Any other sink offers `stereo` and its own channel count (`6ch`, `8ch`), in the device's own order;
+a mono device offers only `1ch`.
 `sample_rate` is one of the sink's `rates`: those of 32000, 44100, 48000, 88200, 96000, 176400 and
 192000 the device accepts. Use 48000 unless you know the sink takes more: an HDMI driver accepts any
 rate whether or not the TV can play it. A new rate or layout restarts that sink only; the engine is
-never touched. Sinks are off until switched on here, and a save keeps them on.
+never touched. Sinks are off until switched on here, and a save keeps them on. Answers with the
+sink, as `GET /api/sinks/{id}` gives it.
 
 ### `PUT /api/sinks/{id}/{ch}` · `POST /api/sinks/{id}/{ch}/identify`
 Exactly as `PUT /api/outputs/{0-7}` and its identify, indexed by channel: on HDMI by **speaker**,
@@ -179,16 +224,16 @@ none; `note` says why one it could be is not (`no free sink slot`, `no free inpu
 ## Bluetooth
 
 The Pi's own Bluetooth radio, in both A2DP roles. A speaker or headphones paired here become a
-stereo **output** that works exactly like the line out. A phone or laptop that plays to the device
+stereo **output**, a sink like any other. A phone or laptop that plays to the device
 becomes a stereo **input** on two adjacent network channels (see *Network inputs*). BlueZ runs the
 radio, and [bluez-alsa](https://github.com/arkq/bluez-alsa) carries the audio (SBC). The device
 manages pairing itself, so nothing needs a shell. It accepts every pairing and every connection,
 like a speaker with no screen, and trusts every device it has paired.
 
 Both directions run on a clock the card does not share. The output is the sink `bluetooth`
-(*Sinks*), whose converter holds its latency constant like any sink's. The input's converter holds it the alignment delay ahead of playout,
-like a network sender's. Pairings are written to `/data/bluetooth` whenever they change, so they
-survive a reboot without a `config/save`.
+(*Sinks*), whose converter holds its latency constant like any sink's. The input's converter holds
+it the alignment delay ahead of playout, like a network sender's. Pairings are written to
+`/data/bluetooth` whenever they change, so they survive a reboot without a `config/save`.
 
 ### `GET /api/bluetooth`
 ```json
@@ -206,7 +251,7 @@ survive a reboot without a `config/save`.
                          "duration_ms": 215000, "position_ms": 41200, "local": false}}],
  "request": null,
  "input": {"enabled": false, "state": "off", "address": "", "name": "", "rate": 0,
-           "input": -1, "error": ""},
+           "channels": 0, "input": -1, "frames": 0, "overruns": 0, "restarts": 0, "error": ""},
  "output": {"enabled": false, "device": "bluealsa:DEV=00:00:00:00:00:00,PROFILE=a2dp", "...": "…"}}
 ```
 `available` is false when there is no adapter or BlueZ is not running, and `error` says why.
@@ -223,7 +268,9 @@ plays to, `player` is this device's own player instead (`"local": true`, below).
 link's AVRCP absolute volume, 0–127, or `null` when the device has none.
 `request` is a pairing question waiting for an answer, described below.
 `input.state` is one of `off`, `waiting` (no device is streaming), `streaming` or `error`.
-`input.input` is the first of the input's two channel indexes, or -1.
+`input.input` is the first of the input's two channel indexes, or -1. `input.frames` counts what
+it has read, `overruns` the times bluez-alsa's buffer filled before it was read, and `restarts` the
+times the input re-anchored (a phone that paused, or a new device).
 `output` is `GET /api/sinks/bluetooth` plus the fields below, or `null` while Bluetooth is not running.
 
 ### `PUT /api/bluetooth`
@@ -233,8 +280,8 @@ link's AVRCP absolute volume, 0–127, or `null` when the device has none.
 ```
 `enabled` powers the radio. `discoverable` makes the device visible in a phone's scan for
 `discoverable_timeout_s` seconds (0–3600, 0 means until turned off). `pairable` lets a device that
-finds it pair. `discoverable` always starts off; the rest are kept by `config/save`. Answers with the
-`GET` body.
+finds it pair. `name` is at most 248 bytes (400 otherwise); empty means the hostname.
+`discoverable` always starts off; the rest are kept by `config/save`. Answers with the `GET` body.
 
 ### `POST /api/bluetooth/scan`
 `{"on": true}` looks for devices (BR/EDR only, since A2DP needs it) and stops by itself after 60 s.
@@ -243,11 +290,15 @@ Scanning shares the radio with any audio link, so expect dropouts on one while i
 ### `POST /api/bluetooth/devices/{address}/pair` · `/connect` · `/disconnect`
 Each starts the operation and answers `{"ok": true}` straight away; watch the device's `busy` and
 `error` fields for the outcome. Pairing a device also connects it. `pair` takes an optional
-`{"pin": "1234"}` for a device old enough to need one, and uses `0000` by default.
+`{"pin": "1234"}` (at most 16 characters) for a device old enough to need one, and uses `0000` by
+default. An address that is malformed or not known answers 404, and 503 means Bluetooth is not
+running.
 
 ### `POST /api/bluetooth/devices/{address}/player`
 `{"command": "play"}`, or `pause`, `stop`, `next` or `previous`: the remote control for a phone
-that is playing to this device. 409 when the device has no media player.
+that is playing to this device, and on a speaker this device plays to, the tester's own player
+(below). 409 when the device has no media player, the command is unknown, or Bluetooth is not
+running.
 
 **The tester's own player.** A speaker this device plays to is offered a media player over AVRCP,
 so a speaker's buttons, and the same buttons on its card, work the Bluetooth output. The track's
@@ -260,9 +311,9 @@ channels through Silence, Sine, Noise, Ping and Music. The position counts the t
 signal has been playing.
 
 ### `PUT /api/bluetooth/devices/{address}` · `DELETE /api/bluetooth/devices/{address}`
-`PUT` takes `{"volume": 0..127}`: the AVRCP absolute volume of the device's audio link, on a phone
-or a speaker. 409 when it has none. `DELETE` forgets the device: it unpairs it and removes its
-keys from `/data` too.
+`PUT` takes `{"volume": 0..127}` (clamped): the AVRCP absolute volume of the device's audio link, on
+a phone or a speaker. 409 when it has none; a failure after that shows in the device's `error`.
+`DELETE` forgets the device: it unpairs it and removes its keys from `/data` too.
 
 ### Pairing requests · `POST /api/bluetooth/request`
 Everything is accepted without asking, with one exception, which only keyboards raise. It appears
@@ -272,12 +323,16 @@ as `request` in `GET /api/bluetooth` and in the 1 Hz WS `system` message (`bt_re
  "passkey": "", "expires_s": 54}
 ```
 `passkey` asks for the six digits the device shows: answer `{"id": 7, "accept": true,
-"passkey": 123456}`. `display` shows a `passkey` to type on the device, and clears itself.
+"passkey": 123456}` (a number or a string). `display` shows a `passkey` to type on the device, and
+clears itself. 409 for an `id` that is no longer waiting, a passkey that is not six digits, or
+Bluetooth not running. In the WS message `bt_request` is `null` while nothing is waiting.
 
 ### `PUT /api/bluetooth/input`
 `{"enabled": true}` takes the audio of the most recently connected device that streams to this
-one. It lands on two adjacent network channels, named after the device. Enabling it turns on the
-alignment delay, exactly as enabling network input does.
+one. It lands on two adjacent network channels, named after the device (`transport: "bluetooth"`
+in `GET /api/net`). Enabling it turns on the alignment delay, exactly as enabling network input
+does. Answers with the `input` object of `GET /api/bluetooth`; enabling it while Bluetooth is not
+running is a 503. `config/save` keeps it.
 
 ### `PUT /api/bluetooth/output`
 ```json
@@ -290,7 +345,9 @@ plus `address` and `name` for the speaker playing, and `device_delay_ms`, the de
 The speaker sets the rate, which `device_rate` reports, so `sample_rate` is only a request.
 `latency_ms` runs from the engine to the Bluetooth stack and leaves out the codec and the radio.
 Those are what the speaker reports, and they are not constant, so calibrate with a ping before
-trusting an absolute delay. Off by default.
+trusting an absolute delay. Off by default. Both fields are optional; `device` must be a bluez-alsa
+PCM (`bluealsa:…`, 400 otherwise) and is kept by `config/save`. 503 when there is no Bluetooth sink
+(Bluetooth is not running).
 
 ## Generators
 
@@ -340,6 +397,7 @@ Freeze copies the recent ring into a snapshot so measurements cannot shift while
 ```json
 {"frozen": true, "freeze_sample": 2897920, "valid_start": 1857536, "valid_len": 1040384, "generation": 0}
 ```
+503 when there is not enough captured audio to freeze yet; resume answers `{"frozen": false}`.
 Ask only for samples in `[valid_start, valid_start + valid_len)`. `generation` bumps on every xrun —
 if it changed, the timeline has a gap. `status` also returns `live_now` (write head) and
 `live_oldest` (oldest readable live sample).
@@ -349,11 +407,15 @@ if it changed, the timeline has a gap. `status` also returns `live_now` (write h
 {"seconds": 20.0}
 ```
 How much the next freeze copies. `{"seconds": N}` or `{"frames": N}`, clamped to
-[4096, `limits.capture_max_frames`]. The reply echoes what took effect. Resets to 20 s on restart.
+[4096, `limits.capture_max_frames`]. The reply says what took effect: `analyze_frames`,
+`analyze_seconds`, `max_frames`, `max_seconds`, `pinned_mb`. 507 when the snapshot cannot be
+allocated that large. Resets to 20 s on restart.
 
 ### `GET /api/capture/window?ch=&start=&len=&cols=`
-The scope. Returns `cols` min/max pairs over the range, or raw samples when `len ≤ 2×cols`. Serves
-the frozen snapshot if frozen, else the live ring.
+The scope. `ch` is required; `len` defaults to 96000, `start` to the last `len` frames and `cols` to
+1024 (1–2048). Answers `{"ch", "start", "len", "raw"}` plus `min[]` and `max[]`, one pair per
+column, or `samples[]` when `raw` (`len ≤ 2×cols`). Serves the frozen snapshot if frozen, else the
+live ring.
 
 ### `POST /api/capture/xcorr`
 ```json
@@ -363,7 +425,8 @@ the frozen snapshot if frozen, else the live ring.
 ```json
 {"lag_samples": 137, "lag_ms": 1.4271, "lag_m": 0.4895, "confidence": 4.2, "peak": 0.99}
 ```
-Cross-correlates two inputs over a window. **Freeze first** (`len` ≤ 2^19). A **positive lag means
+Cross-correlates two inputs over a window. **Freeze first**, or it is a 400; `len` is 64…2^19, and a
+window in which either channel is silent is a 400 too. A **positive lag means
 the signal arrives later on `ch_b`**. `lag_m` is the acoustic distance — meaningful for an air path,
 not a cable.
 
@@ -384,7 +447,7 @@ Is there sound on an input?
                "tone": {"valid": true, "freq_hz": 996.09, "thd_n_pct": 0.0032}}]}
 ```
 `sound` is `peak_db > threshold_db`. Peak is a 3 s hold, so a tick or ping counts as sound, not just
-a steady tone. `threshold_db` defaults to −60. `?ch=0..5` for one input; omit for all six.
+a steady tone. `threshold_db` defaults to −60. `?ch=` for one input; omit it for every input.
 
 ### `GET /api/genie/sync[?ch_a=&ch_b=&cur_x=&cur_y=]`
 Delay between two inputs. A GET, so you can run it from a browser. Every param is optional:
@@ -407,20 +470,23 @@ Without them — every ping marker, plus a summary:
  "snapshot": {"freeze_sample": 3018112, "valid_start": 1097728, "valid_len": 1920384, "generation": 0},
  "measurements": [
    {"center": 1170112, "variant": "tick", "start": 1166016,
-    "lag_samples": 137, "lag_ms": 1.4271, "lag_m": 0.4895, "confidence": 999.0, "peak": 0.99},
+    "len": 18432, "lag_samples": 137, "lag_ms": 1.4271, "lag_m": 0.4895, "confidence": 999.0,
+    "peak": 0.99},
    {"center": 954112, "variant": "tick", "skipped": "outside buffer"}],
  "summary": {"n": 27, "lag_samples_median": 137.0, "lag_ms_median": 1.4271, "lag_m_median": 0.4895,
              "lag_samples_min": 137, "lag_samples_max": 137, "lag_samples_spread": 0,
              "confidence_median": 999.0}}
 ```
-Each ping is bracketed from its emission up to just before the next, so the window holds exactly
-one arrival wherever the loopback delay puts it — the same method the console's Scope uses. A ping
-too near the buffer end is `skipped`; raise the *Analyze buffer* (`POST /api/capture/config`) to
-reach further back. A reading whose `peak` is below 0.05 is flagged `"no_arrival": true` — the pair
-carries no captured arrival for that ping (e.g. it was emitted before routing) — and is left out of
-the summary. `lag_samples_spread` (max−min) is the marker-to-marker jitter. Read each `confidence`:
-below ~2 the lag is ambiguous (a repeating stimulus or a continuous tone). Answers 503 when there is
-not enough captured audio to freeze, 400 when no input has sound and no channels were given.
+Each ping is bracketed from its emission up to just before the next, so the window holds exactly one
+arrival wherever the loopback delay puts it — the same method the console's Scope uses. A ping
+outside the snapshot is `skipped` (`outside buffer`), and so is one too near its end (`too near
+buffer end`) or one whose window `xcorr` refuses (its error); raise the *Analyze buffer* (`POST
+/api/capture/config`) to reach further back. A reading whose `peak` is below 0.05 is flagged
+`"no_arrival": true` — the pair carries no captured arrival for that ping (e.g. it was emitted
+before routing) — and is left out of the summary. `lag_samples_spread` (max−min) is the
+marker-to-marker jitter. Read each `confidence`: below ~2 the lag is ambiguous (a repeating stimulus
+or a continuous tone). Answers 503 when there is not enough captured audio to freeze, 400 when no
+input has sound and no channels were given.
 
 ## Network inputs
 
@@ -433,8 +499,8 @@ each packet starts; the **device** anchors the stream when its first packet arri
 **alignment delay** (`delay_ms`, 1 s by default), and places everything after it contiguously — the
 way an RTP receiver decides playout. Local capture is held back by the same delay, so ring index
 `n` means one instant on every channel. That delay does not appear in measurements: a delay
-measured between a network channel and a real input is the true path delay. It is zero when network
-input is disabled.
+measured between a network channel and a real input is the true path delay. It is on while network
+input or the Bluetooth input (a phone is a sender too) is enabled, and zero otherwise.
 
 Two machines' clocks are never identical, and a sender need not even run at the card's rate. Both
 differences are taken up in one place: every stream passes through an asynchronous sample-rate
@@ -470,19 +536,28 @@ true for the rest of the session.
 
 Only playback into the device is supported; there is no capture direction yet. A Bluetooth phone
 lands on these channels too, through `PUT /api/bluetooth/input`, and is reported here like a
-sender, with its Bluetooth address as `peer`.
+sender, with `transport: "bluetooth"` and its Bluetooth address as `peer`.
 
 ### `GET /api/net`
 ```json
 {"enabled": true, "listening": true, "port": 4010, "delay_ms": 1000,
  "delay_frames": 96000, "rate": 96000, "n_now": 1466240, "lead_seconds": 1.0, "error": "",
  "channels": [{"channel": 0, "input": 6, "connected": true, "peer": "192.168.1.7:41154",
-               "name": "alsa-plugin", "frames_received": 874496, "late_drops": 0,
-               "range_drops": 0, "underruns": 0, "last_target": 1562240,
-               "write_end": 1562496, "peak": 0.79}]}
+               "name": "thinkpad", "host": "thinkpad.lan", "device": "thinkpad",
+               "last_device": "thinkpad", "transport": "net",
+               "stream_index": 1, "stream_count": 1, "frames_received": 874496,
+               "late_drops": 0, "range_drops": 0, "underruns": 0, "resyncs": 0,
+               "last_target": 1562240, "write_end": 1562496,
+               "lead_frames": 96012, "lead_valid": true, "target_lead_frames": 96000,
+               "lead_error_ms": 0.125, "peak": 0.79}]}
 ```
 `input` is the index to use everywhere else — route it with
-`{"source": {"type": "input", "index": 6}}`, or measure it with `?ch_a=0&ch_b=6`.
+`{"source": {"type": "input", "index": 6}}`, or measure it with `?ch_a=0&ch_b=6`. `name` is what
+the sender calls itself (the plugin sends its hostname), `host` its address resolved to a name when
+the network can, and `device` the one to show: `name`, else `host`, else the address. `last_device`
+keeps it after the sender disconnects. `transport`
+is `net`, or `bluetooth` for a phone. `lead_error_ms` is `lead_frames` against
+`target_lead_frames` in milliseconds, meaningful while `lead_valid`.
 
 `late_drops` counts packets that arrived after the instant they asked for. They are discarded, not
 slid forward: playing them late would put the audio at the wrong place on the axis, which is the
@@ -491,10 +566,10 @@ one thing this device must not do. A steady count means the network cannot keep 
 the sender stopped supplying audio before its slot came round.
 
 ### Rates, formats and multi-channel senders
-A sender asks for `channels` (default 1) and gets that many **adjacent** inputs — a stereo source
-becomes NET 1 + NET 2, not NET 1 and NET 5 — so a pair reads as one source. All of its channels
-travel in the same packet and through one converter, which keeps them sample-identical even while
-the stream is being resampled: they cannot come apart because they are never handled apart.
+A sender asks for `channels` (default 1, at most 6) and gets that many **adjacent** inputs — a
+stereo source becomes NET 1 + NET 2, not NET 1 and NET 5 — so a pair reads as one source. All of its
+channels travel in the same packet and through one converter, which keeps them sample-identical even
+while the stream is being resampled: they cannot come apart because they are never handled apart.
 
 `GET /api/net` reports `stream_index` and `stream_count` per channel, and a channel's name gains
 `(1/2)`, `(2/2)` and so on so two cards from one machine are told apart. A mixer drives the whole
@@ -516,8 +591,10 @@ machine cannot be told apart by address — pin those with a port or a channel.
 ```
 `port` is 1–65529, so the six per-channel ports above it exist too. Changing it rebinds the
 listener and drops any connected sender; with network input off it is only remembered, for the
-next enable. Either way `config/save` keeps it. A bind that fails still answers 200 — check
-`listening` and `error`.
+next enable. Either way `config/save` keeps it; a port outside that range is a 400. `delay_ms`
+clamps to `limits.net_delay_min_ms`…`limits.net_delay_max_ms` (0–2000). Answers `{"enabled",
+"listening", "port", "delay_ms", "delay_frames", "error"}`; a bind that fails still answers 200 —
+check `listening` and `error`.
 
 ### On the sending machine
 ```sh
@@ -538,9 +615,9 @@ other way about.
 With no `channel` it follows the same address memory the audio side uses, and keeps following it:
 alsamixer is normally open before anything plays, when that machine's run is one channel wide, and
 the volume widens to cover both when its stereo stream takes NET 1+2. A pinned `CHANNEL` or port
-stays where it was put, still covering the whole run that channel belongs to. Arguments are
-`HOST`, `PORT`, `CHANNEL` and `CHANNELS`, positional or named:
-`soundtester:HOST=bench.local,CHANNELS=2`.
+stays where it was put, still covering the whole run that channel belongs to. The mixer takes
+`HOST`, `PORT` and `CHANNEL`; the PCM also `CHANNELS`, `ENCODING`, `QUALITY` and `MIXER`. Both take
+them positional or named: `soundtester:HOST=bench.local,CHANNELS=2`.
 
 `alsa-plugin/examples/` has a working `/etc/asound.conf` that makes the tester a machine's default
 output and mixer, and a PipeWire sink.
@@ -588,25 +665,30 @@ only ever send PCM — and asking for `ENCODING=vorbis` there says so plainly.
 
 ## Listening
 
-At most 12 listen streams (WS + WAV + Ogg) at once; more get 503.
+At most 12 listen streams (WS + WAV + Ogg) at once; more get 503, and a WebSocket over the limit is
+closed with 1011. `{ch}` is any input, 0 to `limits.inputs_total` − 1.
 
-### `WS /api/listen/{0-5}`
+### `WS /api/listen/{ch}`
 Binary frames: a little-endian `uint64` start sample, then the audio. The index lets a client spot a
 gap and keeps channels aligned. Codec per connection:
 - **`?codec=pcm`** (default): 4096 mono **S16_LE** samples at the native rate.
 - **`?codec=opus`**: one raw **Opus** packet — a 20 ms frame decimated to 48 kHz. `?bitrate=<kbps>`
-  overrides. Offered only at 48/96 kHz (`limits.listen_codecs`).
+  overrides. Offered only at 48/96 kHz (`limits.listen_codecs`); asked for at any other rate, the
+  stream is PCM.
+
+A channel that does not exist closes the socket with 1008.
 
 ### `GET /api/stream.ogg`
-One endless Ogg/Opus stream with all six inputs interleaved, from a single ring cursor so they stay
-sample-aligned. Channels are uncoupled (Opus family 255) — extract them, don't play them as surround:
+One endless Ogg/Opus stream with every input interleaved (`limits.inputs_total` channels, in input
+order), from a single ring cursor so they stay sample-aligned. Channels are uncoupled (Opus family
+255) — extract them, don't play them as surround:
 ```sh
-ffmpeg -i http://soundtester.local/api/stream.ogg -filter_complex \
-  "channelsplit=channel_layout=6.0" -map '[FL]' in0.wav -map '[FR]' in1.wav …
+ffmpeg -i http://soundtester.local/api/stream.ogg \
+  -af 'pan=mono|c0=c0' in0.wav -af 'pan=mono|c0=c6' net1.wav
 ```
-`?bitrate=<kbps>` per channel. Max 2 concurrent. Needs a 48/96 kHz rate.
+`?bitrate=<kbps>` per channel. Max 2 concurrent. Needs a 48/96 kHz rate: 501 at any other.
 
-### `GET /api/inputs/{0-5}/stream.wav`
+### `GET /api/inputs/{ch}/stream.wav`
 Endless mono WAV for VLC/ffmpeg/curl. The sizes are `0xFFFFFFFF` (unknown length); players that trust
 the size stop at 4 GiB — about 6.2 h at 96 kHz.
 
@@ -624,9 +706,10 @@ the same analysis snapshot as the WS feed.
 
 ### `GET /api/meters`
 ```json
-{"type": "meters", "sample": 1488896, "rms_db": [6], "peak_db": [6]}
+{"type": "meters", "sample": 1488896, "rms_db": [-20.1, …], "peak_db": [-18.0, …]}
 ```
-`rms_db` is a 100 ms window; `peak_db` a 3 s hold. Both post input-gain. Silence sits near −120 dB.
+One value per input (`limits.inputs_total`). `rms_db` is a 100 ms window; `peak_db` a 3 s hold. Both
+post input-gain. Silence sits near −120 dB.
 
 ### `GET /api/spectrum?ch=`
 ```json
@@ -634,45 +717,63 @@ the same analysis snapshot as the WS feed.
  "channels": [{"ch": 0, "bins_db": [240], "tone": {"valid": true, "freq_hz": 996.09, "thd_n_pct": 0.0032}}]}
 ```
 240 log-spaced bins, 20 Hz → min(Nyquist, 40 kHz), in dBFS. `bins_hz` gives each bin's center so you
-can threshold by frequency directly. `?ch=0..5` for one input; omit for all six.
+can threshold by frequency directly. `?ch=` for one input; omit it for every input.
 
 ### `WS /api/ws` — push only
 | rate | message |
 |---|---|
-| 10 Hz | `{"type":"meters","sample":…,"rms_db":[6],"peak_db":[6]}` |
+| 10 Hz | `{"type":"meters","sample":…,"rms_db":[…],"peak_db":[…]}`, as `GET /api/meters` |
 | 5 Hz | `{"type":"spectrum","channels":[{"ch":0,"bins":[240],"tone":{…}}]}` |
 | 10 Hz | binary envelope frame (below) |
-| 1 Hz | `{"type":"system","xruns":…,"generation":…,"sync_errors":…,"cpu_pct":…,"temp_c":…,"sinks":[{"id":…,"present":…,"enabled":…,"playing":…,"layout":…,"latency_ms":…,…}],"sources":[{"id":…,"first":…,"channels":…,"present":…,"capturing":…,"error":…}],"bt_request":…,…}` |
+| 1 Hz | `{"type":"system", …}` (below) |
 
-Spectrum bins are quantised to 0.1 dB on the WS to save bandwidth; the GET gives full float precision.
+Spectrum bins are quantised to 0.1 dB on the WS to save bandwidth; the GET gives full float
+precision. Unlike the meters, the WS spectrum leaves out the inputs `POST /api/telemetry/inputs`
+turned off.
 
-Binary envelope frame: `u8 type=1`, `u64 first_sample`, `u16 ncols`, then
-`ncols × 6 × {i16 min, i16 max}`. One column = 480 frames (200 columns/s at 96 kHz).
+The `system` message carries `net_active` (one bool per network channel, `active` of
+`GET /api/state`), `xruns`, `generation`, `sync_errors`, `listen_streams`, `engine_running`, the
+host fields of `system` in `GET /api/state` (`cpu_pct`, `cpu_cores`, `temp_c`, `uptime_s`, `mem`,
+`throttle`), `sinks[]` {`id`, `present`, `enabled`, `playing`, `layout`, `latency_ms`, `trim_ppm`,
+`xruns`, `resyncs`, `error`}, `sources[]` {`id`, `first`, `channels`, `present`, `capturing`,
+`error`} and `bt_request` (*Bluetooth*). A sink or source that comes or goes changes those lists,
+which is the cue to fetch `GET /api/state` again.
+
+Binary envelope frame: `u8 type=2`, `u64 first_sample`, `u16 ncols`, `u8 nchan`, then
+`ncols × nchan × {i16 min, i16 max}`, little-endian, `nchan` being `limits.inputs_total`. One column
+is `limits.env_column_frames` frames (480 at 96 kHz, 200 columns/s).
 
 ### `POST /api/telemetry/inputs`
 ```json
-{"enabled": [true, true, false, false, false, false]}
+{"enabled": [true, true, false, false, false, false, true, true, false, false, false, false, false, false]}
 ```
-Which inputs the console is watching. Disabled ones are dropped from the spectrum message (the widest
+Which inputs the console is watching: one bool per input, exactly `limits.inputs_total` of them
+(400 otherwise). Disabled ones are dropped from the spectrum message (the widest
 frame). Global, last-writer-wins; resets to all-on at restart.
 
 ## System
 
 ### `POST /api/config/save`
-Writes routing (every sink's included, by device id), generators, channel map and Bluetooth
-settings to `/data/config.json` — the only
-state that survives a reboot. `/data` is remounted read-write for the write, then back. If `/data` did not mount the save
-is refused (`data_persistent: false` in `/api/state`).
+Writes the live settings to `/data/config.json`: input gains and mutes, routing (every sink's
+included, by device id), generators, channel map, input and output names,
+`loopback_offset_samples`, the listen codec and bitrate, network input (enabled, port, delay) and
+the Bluetooth settings (radio, name, pairable, timeout, the input switch and the output's device).
+Bluetooth pairings are not in it: they are kept in `/data/bluetooth` as they change. `/data` is
+remounted read-write for the write, then back. Answers `{"ok": true, "path": "/data/config.json"}`;
+if `/data` did not mount the save is refused with a 500 (`data_persistent: false` in
+`/api/state`).
 
 ### `POST /api/config/reset`
-Deletes the saved file; the next boot uses the image defaults.
+Deletes the saved file; the next boot uses the image defaults. Bluetooth pairings stay. Answers
+`{"ok": true}` also when nothing was saved, 500 when the file could not be removed.
 
 ### `POST /api/system/reboot` · `POST /api/system/shutdown`
-Answers `{"ok":true}`, then runs `systemctl reboot` / `poweroff`. Disabled in a simulated run.
+Answers `{"ok":true}`, then runs `systemctl reboot` / `poweroff`. Disabled in a simulated run (403).
 Shutdown exists because a power cut during a `/data` save can corrupt the card.
 
 ### `POST /api/system/inject-kmsg`
-Test hook: feed a line to the kmsg watcher to exercise the I2S-sync-error banner.
+Test hook: feed a line to the kmsg watcher to exercise the I2S-sync-error banner. The body is the
+line, `bcm2835-i2s: I2S SYNC error!` when empty. Answers `{"ok": true, "sync_errors": N}`.
 ```sh
 curl -X POST http://soundtester.local/api/system/inject-kmsg -d 'bcm2835-i2s: I2S SYNC error!'
 ```

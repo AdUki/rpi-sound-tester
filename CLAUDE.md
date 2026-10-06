@@ -2,10 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-A read-only appliance for bench-testing audio gear: a Raspberry Pi (2/3/4, **not** Pi 5) with an
-Audio Injector Octo (CS42448, 6 in / 8 out, 96 kHz S32_LE), or a Khadas VIM3L with no card of its
-own. One C++17 daemon, `soundtesterd`, serves a vanilla-JS web console. The Pi's kernel is pinned
-to **5.15.92** because the Octo produces only noise on every 6.x kernel — do not bump it.
+A read-only appliance for bench-testing audio gear: a Raspberry Pi 3 (the only Pi supported; never a
+Pi 5) with an Audio Injector Octo (CS42448, 6 in / 8 out, 96 kHz S32_LE), or a Khadas VIM3L with no
+card of its own. One C++17 daemon, `soundtesterd`, serves a vanilla-JS web console. The Pi's kernel
+is pinned to **5.15.92** because the Octo produces only noise on every 6.x kernel — do not bump it.
 
 ## Commands
 
@@ -13,7 +13,7 @@ to **5.15.92** because the Octo produces only noise on every 6.x kernel — do n
 make                  # list targets
 make build            # cmake configure (Release) + build into app/build
 make test             # ctest --test-dir app/build --output-on-failure
-make run              # http://localhost:8080 against the simulated card (--sim)
+make run              # http://localhost:8080 against the simulated card (--sim); BOARD= picks the profile
 make run DEVICE=hw:audioinjectoroc,0     # real engine card; SINK=default adds a desktop's sound server as an output
 make plugin           # the ALSA sender plugin in alsa-plugin/ (built for THIS host, not the Pi; VORBIS=0 drops libvorbis)
 make image [BOARD=rpi3|vim3l] [DEV=1]    # Yocto (plain poky/bitbake, scarthgap); needs `make configure` first
@@ -27,9 +27,9 @@ macros in `app/tests/check.h` (no framework); add one with `add_st_test(name)` i
 `app/tests/CMakeLists.txt`.
 
 Build prerequisites: submodules (`git submodule update --init`, all header-only under
-`app/third_party/`), and pkg-config packages alsa, opus, ogg, samplerate, vorbis (+ vorbisenc for
-`test_net_session`). The build also renders `docs/api.md` → `app/www/api.html` (git-ignored) with
-`tools/md2html`, so editing the API doc is part of changing the API.
+`app/third_party/`), and pkg-config packages alsa, opus, ogg, samplerate, vorbis, libsystemd (+
+vorbisenc for `test_net_session`). The build also renders `docs/api.md` → `app/www/api.html`
+(git-ignored) with `tools/md2html`, so editing the API doc is part of changing the API.
 
 Simulator: output c loops back into input c delayed by `period + c*STAGGER` frames (default 137),
 so IN1→IN2 cross-correlation must read exactly 137 samples, IN1→IN3 274. The daemon serves `--www`
@@ -61,9 +61,9 @@ Threads (wired in `app/src/main.cpp`; objects are connected *before* the audio t
   sinks offer CEA-861 speaker layouts (`sink_layout.h`), others stereo and their own width.
 - **NetAudioServer** (`net_audio.cpp`): network inputs from the ALSA plugin. Each packet carries the
   absolute sample index it should play at; `NetTimeline` places it there (the timeline *is* the
-  jitter buffer). Network channels occupy ring slots `[kInputs, kTotalInputs)` and are ordinary inputs
-  everywhere else. `net_proto.h` is plain C shared verbatim by the daemon and `alsa-plugin/` — keep it
-  C-only and bump `ST_NET_PROTO_VERSION` on wire changes.
+  jitter buffer). Network channels occupy ring slots `[channels().net_base(), device_base())` and
+  are ordinary inputs everywhere else. `net_proto.h` is plain C shared verbatim by the daemon and
+  `alsa-plugin/` — keep it C-only and bump `ST_NET_PROTO_VERSION` on wire changes.
 - **Analysis** (10 Hz meters, FFT spectrum, THD+N, scope envelope), **CaptureStore** (freeze snapshot,
   windowed reads, FFT cross-correlation; `genie.h` aggregates per-ping delay readings),
   **KmsgWatch** (flags TDM slot-rotation "I2S SYNC error"s from /dev/kmsg).
@@ -95,7 +95,8 @@ rest over sd-bus (`bluetooth.cpp`, `BtManager`: one thread owns the bus; it is a
 and says yes to everything by request — `bt_agent_policy`). Only where board.json has
 `"bluetooth": true` (the recipe sets it from `SOUNDTESTER_BLUETOOTH`), or with `--bluetooth`; on a
 desktop use `make run BT=fake` (tools/fake-bluez, a private bus) — **never `--bluetooth` on the
-laptop's real bus**, it takes over its adapter and default agent.
+laptop's real bus**, it takes over its adapter and default agent. `make run DEVICE=…` loads a
+board profile that has a radio, so it passes `--no-bluetooth` (`--sim` already leaves it off).
 - **Output** = the sink `bluetooth` (`kBtSinkId`), added with `Devices::add_fixed_sink` since no
   scan finds a bluez-alsa PCM; `PUT /api/bluetooth/output` retargets it to a speaker. It sets
   `SinkDevice::local_queue`: bluez-alsa's `snd_pcm_delay` includes the speaker-reported codec/radio
@@ -124,13 +125,13 @@ laptop's real bus**, it takes over its adapter and default agent.
 `BOARD=` (default `rpi3`) selects `yocto/boards/<board>.mk` (MACHINE, BSP layer, daemon profile
 id) and `yocto/conf/boards/<board>.conf` (the board's bitbake settings). The profile id picks
 `app/config/boards/<profile>.json`, installed as `/etc/soundtester/board.json`: the engine card
-(none on the VIM3L), rate and period (patched from `SOUNDTESTER_RATE/PERIOD`), and optional
-labels, `hdmi` flags and `hidden` flags for device ids — the only per-board data the daemon has. Each board builds in
-`yocto/build-<board>/`; the Makefile writes its `bblayers.conf` and an `auto.conf` that sets
-MACHINE and `require`s the board conf by absolute path. `meta-soundtester` depends only on core;
+(none on the VIM3L) and its `capture_channels`, rate, period and periods (patched from
+`SOUNDTESTER_RATE/PERIOD`), `device_inputs`, `bluetooth`, and optional labels, `hdmi` flags and
+`hidden` flags for device ids — the only per-board data the daemon has. `make run` loads the same
+file with `--board`. Each board builds in `yocto/build-<board>/`; the Makefile writes its
+`bblayers.conf` and an `auto.conf` that sets MACHINE and `require`s the board conf by absolute path. `meta-soundtester` depends only on core;
 BSP-specific recipes live under `dynamic-layers/<collection>/` (the pinned 5.15 Pi kernel under
-`raspberrypi`, VIM3L bits under `meson`). The multi-board roadmap (M1–M8) is in
-`~/.claude/plans/create-grand-plan-change-nested-waffle.md`.
+`raspberrypi`, VIM3L bits under `meson`).
 
 Bitbake parse order bites here: `soundtester-device.conf` (required from `layer.conf`) is read
 first, then `auto.conf` → board conf → `local.conf`, and the BSP's machine conf last. So board

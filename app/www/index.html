@@ -341,7 +341,7 @@
     <label>Frequency <input type="number" id="sinefreq" min="1" max="40000" step="1"> Hz</label>
     <label>Level <input type="range" id="sinelevel" min="-60" max="0" step="0.5">
       <span id="sinelevelv" class="mono val"></span> dBFS</label>
-    <p class="muted small">996.09 Hz is bin-centred at 96 kHz / 8192 — use it for clean THD+N.</p>
+    <p class="muted small">996.09 Hz is bin-centred at 96 and 48 kHz / 8192 — use it for clean THD+N.</p>
   </div>
   <div class="card">
     <h3>Noise</h3>
@@ -418,7 +418,7 @@
     <h3>Sound devices</h3>
     <p class="muted small">Every PCM device ALSA has, as <span class="mono">aplay -l</span> and
       <span class="mono">arecord -l</span> list them, found again every couple of seconds: a USB
-      device plugged in now shows up here, and as an output above.</p>
+      device plugged in now shows up here, and as an output or input on the Dashboard.</p>
     <table id="devtable"></table>
   </div>
   <div class="card wide">

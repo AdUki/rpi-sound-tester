@@ -76,6 +76,7 @@ int main(int argc, char** argv) {
 
   bool sim = false;
   bool bluetooth = false;
+  bool no_bluetooth = false;
   bool verbose = false;
   unsigned sim_stagger = 0;
   std::string board_path = "/etc/soundtester/board.json";
@@ -109,6 +110,10 @@ int main(int argc, char** argv) {
                "Run the Bluetooth manager even where board.json says there is no radio, or under "
                "--sim. It takes over the adapter of the machine it runs on, so on a desktop point "
                "it at tools/fake-bluez instead (make run BT=fake)");
+  app.add_flag("--no-bluetooth", no_bluetooth,
+               "Leave the radio alone even where board.json has one: a board's profile run on a "
+               "desktop (make run DEVICE=...)")
+      ->excludes("--bluetooth");
   app.add_option("--www", www, "Directory of static web files");
   app.add_option("--config", config_path, "Path to the default config");
   app.add_option("--data-dir", data_dir, "Where saved settings live (the writable partition)");
@@ -169,8 +174,9 @@ int main(int argc, char** argv) {
 
   if (net_port > 0) cfg.net_port = net_port;
   // Bluetooth is the board's own radio. A simulated run leaves the workstation's alone unless
-  // asked, and with it the audio paths that would go looking for bluez-alsa.
-  const bool run_bt = bluetooth || (!sim && board.bluetooth);
+  // asked, and so does --no-bluetooth (a board's profile on a desktop), and with it the audio
+  // paths that would go looking for bluez-alsa.
+  const bool run_bt = !no_bluetooth && (bluetooth || (!sim && board.bluetooth));
   if (!run_bt) cfg.bluetooth.input = false;
 
   st::Control ctl;

@@ -464,7 +464,7 @@ class WsReadPump {
   std::thread thread_;
 };
 
-// Binary envelope frame: u8 type=1, u64 first column's sample index, u16 column count, then
+// Binary envelope frame:
 // [u8 type=2][u64 first sample][u16 ncols][u8 nchan] then ncols x nchan x {i16 min, i16 max}.
 //
 // The channel count is on the wire, and the type byte moved from 1 to 2, because the frame used
@@ -693,7 +693,7 @@ void WebServer::install_routes() {
   // The 10 Hz WS "meters" message as a synchronous GET, for headless clients that just want the
   // current per-input level without opening a WebSocket ("which channel has sound"). Same shape as
   // the WS frame (type/sample/rms_db/peak_db) so one parser handles both. rms_db is a 100 ms
-  // window; peak_db carries a 3 s hold. Both are post input-gain — see docs/headless.md.
+  // window; peak_db carries a 3 s hold. Both are post input-gain — see docs/api.md.
   svr.Get("/api/meters", [this](const httplib::Request&, httplib::Response& res) {
     send_json(res, meters_json(d_.analysis.snapshot()));
   });
@@ -732,8 +732,7 @@ void WebServer::install_routes() {
 
   // Per-input telemetry mask. The console posts which inputs it is watching; disabled inputs are
   // dropped from the spectrum message, the widest frame on the wire. Meters and the envelope frame
-  // keep their fixed six-channel shape for compatibility with any console, and the console hides
-  // disabled inputs itself regardless. Global and last-writer-wins — this appliance has one
+  // always carry every input, and the console hides disabled inputs itself regardless. Global and last-writer-wins — this appliance has one
   // operator; see docs/api.md.
   svr.Post("/api/telemetry/inputs", json_route([this](const json& j, const httplib::Request&,
                                                       httplib::Response& res) {
@@ -1376,7 +1375,7 @@ void WebServer::install_routes() {
   // Convenience endpoints that fold the raw telemetry/measurement primitives above into one
   // direct answer, for headless/scripted use. They add no capability the other endpoints lack:
   // sound is a thin wrapper over the analysis snapshot, sync over the freeze+xcorr path. See
-  // docs/headless.md.
+  // docs/api.md, "Genie helpers".
 
   // "Is there sound on a channel?" The verdict is peak_db (a 3 s hold, so it catches a transient
   // tick/ping as well as a sustained tone — an RMS-only test can fall between ticks and miss it)

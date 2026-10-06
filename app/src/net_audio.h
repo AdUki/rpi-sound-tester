@@ -83,7 +83,7 @@ struct NetChannelStatus {
   uint64_t last_target = 0;
   uint64_t write_end = 0;
   // How far ahead of playout the sender's packets are landing, and where the device wants that
-  // to be. The gap between them is what the sender's release-rate servo is closing.
+  // to be. The gap between them is what the device's converter trim is closing.
   int64_t lead_frames = 0;
   bool lead_valid = false;
   uint64_t target_lead_frames = 0;

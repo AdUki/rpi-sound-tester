@@ -1,34 +1,43 @@
 # RPi Sound Tester
 
-A read-only Raspberry Pi appliance for testing audio gear on the bench, built around the
-**Audio Injector Octo** (Cirrus CS42448, 6 in / 8 out, 96 kHz / S32_LE).
+A read-only appliance for testing audio gear on the bench. Two boards are supported:
 
-Plug a device into the sound card, open `http://soundtester.local`, and you get:
+- **Raspberry Pi 3** with the **Audio Injector Octo** (Cirrus CS42448, 6 in / 8 out, 96 kHz /
+  S32_LE), whose clock everything follows;
+- **Khadas VIM3L** with no card of its own: HDMI out, the HDMI loopback and USB audio, at 48 kHz
+  on a timer clock.
 
-- **Inputs (6):** listen to any channel in the browser — send each one to the left ear, the
-  right, both or neither, and channels sharing an ear are mixed — per-channel level/peak meters,
-  spectrum, THD+N, a 6-lane scope you can freeze, and up to +40 dB of digital make-up gain for
-  a device too quiet to read.
-- **Outputs (8 + HDMI + line out):** route any input to any output; sine, white/pink noise,
-  tick/bing/bong pings, and a short looping melody. The Pi's own HDMI audio (mono up to 7.1) and
-  its 3.5 mm jack are outputs too, on the same sample axis, so a TV or AV receiver's latency can
-  be measured like a DAC's.
-- **Bluetooth (A2DP, both ways):** scan, pair and connect from the browser, with nothing to
+Plug a device in, open `http://soundtester.local`, and you get:
+
+- **Inputs:** the Octo's 6 ADCs, 6 **network inputs** that any Linux machine on the LAN plays
+  into through an ALSA plugin, and the capture side of USB interfaces (and the VIM3L's HDMI
+  loopback), found when they are plugged in. Listen to any channel in the browser — send each one
+  to the left ear, the right, both or neither, and channels sharing an ear are mixed — with
+  per-channel level/peak meters, spectrum, THD+N, a scope you can freeze, and up to +40 dB of
+  digital make-up gain for a device too quiet to read.
+- **Outputs:** the Octo's 8 DACs, and every other playback device as a **sink**, found at runtime:
+  HDMI (mono up to 7.1), the Pi's 3.5 mm jack, a USB interface, a Bluetooth speaker. Route any
+  input to any output; sine, white/pink noise, tick/bing/bong pings, and a short looping melody.
+  Every sink plays on the same sample axis, so a TV or AV receiver's latency can be measured like
+  a DAC's.
+- **Bluetooth (A2DP, both ways, Pi 3):** scan, pair and connect from the browser, with nothing to
   confirm. A paired speaker is one more output (its buttons pick the test signal), and a phone
   playing to the tester lands on a pair of inputs on the same sample axis. Pairings survive reboots.
 - **Multiroom sync measurement:** freeze the capture, bracket a ping, and get the delay
   between two inputs **to the sample** — with a confidence number that tells you when not to
   trust it.
 
-Everything hangs off one clock: capture and playback are `snd_pcm_link()`ed on one card, the
-card's FPGA is the master clock for both the codec and the Pi, and every generator is driven
-from the same absolute sample counter that indexes the capture ring. A sample index means the
-same instant on every channel.
+Everything hangs off one clock. On the Pi it is the Octo's: capture and playback are
+`snd_pcm_link()`ed, and the card's FPGA is the master clock for both the codec and the Pi. On the
+VIM3L it is a timer. Every generator is driven from the same absolute sample counter that indexes
+the capture ring, and every other device — a sink, a USB input, a network sender, a phone —
+follows that clock through a sample-rate converter. A sample index means the same instant on
+every channel.
 
 > ### Read this before buying/wiring anything
 > The Octo produces **only distorted noise on every 6.x kernel**. This image pins **5.15.92**,
-> which is the last version known to work. **The Pi 5 cannot work at all** — supported boards
-> are the Pi 2 / 3 / 4. The evidence was collected in `docs/octo-known-issues.md`, since
+> which is the last version known to work. **The Pi 5 cannot work at all**; the image is built
+> and tested for the Pi 3 only. The evidence was collected in `docs/octo-known-issues.md`, since
 > dropped from the tree (`git show 13ea712^:docs/octo-known-issues.md`); milestone 0 is to
 > confirm it on your own card.
 
@@ -39,28 +48,34 @@ entire chain — generators, routing, ring buffer, scope, cross-correlation, lis
 on a laptop.
 
 ```sh
-sudo apt install libopus-dev libogg-dev libsystemd-dev   # the daemon links these (plus libasound2-dev)
+sudo apt install libasound2-dev libopus-dev libogg-dev libsamplerate0-dev libvorbis-dev libsystemd-dev
 git clone --recurse-submodules <url>   # the header-only libraries are submodules; --init works after the fact
 make            # list every target
-make test       # generators, ring buffer, xcorr, wav, config, opus, dsp
+make test       # the unit tests in app/tests
 make run        # http://localhost:8080, simulated card
-make run BT=fake   # ...with a scripted fake BlueZ, to try pairing without a radio
+make run BT=fake          # ...with a scripted fake BlueZ, to try pairing without a radio
+make run SINK=default     # ...and the desktop's speakers as one more output
+make run BOARD=vim3l      # ...with the VIM3L's profile (48 kHz; still a simulated Octo)
 ```
 
 Then: route the ping generator to OUT 1/2/3, go to **Scope & sync**, press **Analyze**,
 bracket a ping with the cursors and press **Measure** — IN 1→IN 2 reads exactly 137 samples,
 IN 1→IN 3 exactly 274.
 
+To feed it from another machine, build the ALSA plugin there (`make plugin plugin-install`) and
+`aplay -D soundtester:<host> file.wav`; it lands on a network input. The plugin is documented in
+[docs/api.md](docs/api.md), *Network inputs*.
+
 ## Build the image
 
-`BOARD=` picks the hardware: `rpi3` (Raspberry Pi 2/3 with the Octo, the default) or `vim3l`
-(Khadas VIM3L). What the board means for the build is in `yocto/boards/<board>.mk` and
-`yocto/conf/boards/<board>.conf`; each board builds in its own `yocto/build-<board>/`, sharing
-downloads and sstate.
+`BOARD=` picks the hardware: `rpi3` (Raspberry Pi 3 with the Octo, the default) or `vim3l` (Khadas
+VIM3L, built without Wi-Fi and Bluetooth). What the board means for the build is in
+`yocto/boards/<board>.mk` and `yocto/conf/boards/<board>.conf`; each board builds in its own
+`yocto/build-<board>/`, sharing downloads and sstate.
 
 Everything you would normally want to change for a bench lives in one file:
-**`yocto/meta-soundtester/conf/soundtester-device.conf`** — hostname, root password, SSH,
-Wi-Fi SSID/PSK and ports. The rootfs is read-only, so these are baked in at build time. (The
+**`yocto/meta-soundtester/conf/soundtester-device.conf`** — hostname, root password, SSH, Wi-Fi
+SSID/PSK, Bluetooth and ports. The rootfs is read-only, so these are baked in at build time. (The
 sample rate and period are the board's, in its board conf.)
 
 That file is not in the repo — it carries a root password and a Wi-Fi PSK in the clear, and git
@@ -84,18 +99,27 @@ reader, but also what an internal drive looks like). Add `DEV=1` to flash the de
 Plain poky and bitbake — no kas, no pip. The first `make image` clones poky,
 meta-openembedded and the board's BSP layer, and generates the build dir's conf files on its
 own; `make bitbake` with no ARGS drops you into the usual bitbake environment if you want to poke
-at it by hand.
+at it by hand, and `make bitbake ARGS="soundtesterd"` cross-builds just the daemon.
+
+A board that is already running takes a new console or daemon over ssh, no reflash:
+
+```sh
+make deploy-www                    # app/www only; the next page load picks it up
+make bitbake ARGS="soundtesterd" && make deploy-daemon   # the daemon and its /etc files; restarts it
+```
+
+Both take `BOARD=` and `TARGET=root@host`.
 
 Two images:
 
 | | rootfs | ssh | tools |
 |---|---|---|---|
-| `soundtester-image` | **read-only** | yes (password from the conf file) | none |
+| `soundtester-image` | **read-only** | yes, unless `SOUNDTESTER_ENABLE_SSH = "0"` (password from the conf file) | none |
 | `soundtester-image-dev` | writable | yes + package management | `alsa-utils`, `i2c-tools`, `strace`, `htop` |
 
 Use the **dev** image when you need `alsa-utils` and friends on the box to poke at the card by
-hand (`aplay -l`, `speaker-test`, `arecord`). The production image is what ships; both have ssh,
-so `journalctl -u soundtesterd -f` on the device is the usual way to watch the daemon.
+hand (`aplay -l`, `speaker-test`, `arecord`). The production image is what ships; with ssh on,
+`journalctl -u soundtesterd -f` on the device is the usual way to watch the daemon.
 
 Settings changed in the web UI live in RAM: the device always boots into a known state.
 **Configuration → Save as boot defaults** writes them to a small ext4 partition (briefly
@@ -104,15 +128,23 @@ remounted read-write), which is also where the SSH host keys live so they surviv
 ## How it fits together
 
 One C++17 daemon, `soundtesterd`. No scripting runtime, no GStreamer, no audio framework. The
-linked libraries are alsa-lib plus libopus + libogg (only the encoded "listen" stream uses those
-two); everything else is header-only, pinned as a git submodule under `app/third_party/`, and
-nothing but the include path points at it.
+linked libraries are alsa-lib, libopus + libogg (the encoded "listen" streams), libvorbis (a
+network sender that compresses), libsamplerate (the converters every other clock goes through) and
+libsystemd (sd-bus, for BlueZ); everything else is header-only, pinned as a git submodule under
+`app/third_party/`, and nothing but the include path points at it.
 
 ```
-Octo 6-in ──ALSA──▶ AUDIO THREAD (SCHED_FIFO 80, mlocked ring)
+Octo 6-in ──ALSA──▶ AUDIO THREAD (SCHED_FIFO 80, mlocked ring)    or, with no card, a timer
                     read 8ch → remap → ring buffer (float32, ~87 s) + sample counter n
-                    generators driven by n, routed per output
+                    generators driven by n, routed per output and per sink channel
 Octo 8-out ◀─ALSA── remap → write 8ch      (streams snd_pcm_link'ed: one clock, one start)
+                    │
+  network senders ──┼─▶ NET AUDIO: each packet placed at the sample it asks for (ASRC)
+  phone (A2DP) ─────┤   BLUETOOTH: BlueZ over sd-bus; a phone is one more sender
+  USB / HDMI in ────┼─▶ DEVICES: scanned every 2 s; each capture device placed at the sample
+                    │            it was captured at (ASRC)
+  HDMI / jack / USB ◀── SINKS: one thread per playback device, latency held constant (ASRC)
+  BT speaker ◀──────┘
                     ├── ANALYSIS (10 Hz): meters, 8192-pt FFT, THD+N, scope columns
                     ├── CAPTURE: freeze snapshot, window, zero-padded FFT cross-correlation
                     └── WEB (cpp-httplib): REST + WebSocket push + live audio streams
@@ -134,12 +166,14 @@ atomic (a torn `{type, index}` would index out of bounds in the audio thread).
 
 ```
 app/            C++17 daemon + vanilla-JS web console (no build step)
-  src/          engine, generators, analysis, capture, web server
-  tests/        ctest: ping spacing, ring seqlock under a concurrent writer,
-                xcorr known-lag recovery, WAV header, config round-trip,
-                Opus cross-channel alignment, dsp conversions
+  src/          engine, generators, analysis, capture, devices and sinks, network input,
+                Bluetooth, web server
+  config/       factory defaults; boards/<profile>.json, the per-board data
+  tests/        ctest: plain executables, one per area (make test)
   third_party/  submodules: cpp-httplib, pocketfft, nlohmann/json, spdlog, CLI11
                 (header-only, pinned at a tag — pocketfft at a commit, it has no tags)
+alsa-plugin/    the sender: an ALSA PCM + mixer plugin for any Linux machine
+tools/          md2html (renders docs/api.md for GET /api), fake-bluez (BlueZ for make run BT=fake)
 yocto/
   meta-soundtester/   layer: images, app recipe, wic layouts; BSP-specific parts (the pinned
                       Pi kernel) under dynamic-layers/<bsp>/
@@ -152,6 +186,7 @@ docs/           api.md
 
 ## Documentation
 
-- **[docs/api.md](docs/api.md)** — the HTTP/WebSocket API, and the single reference since
-  13ea712. The companion docs it replaced (calibration, the Octo's known issues, the bench
-  checklist) are in git history: `git show 13ea712^:docs/<name>.md`.
+- **[docs/api.md](docs/api.md)** — the HTTP/WebSocket API and the ALSA plugin, and the single
+  reference since 13ea712. The daemon serves it rendered at `/api`. The companion docs it replaced
+  (calibration, the Octo's known issues, the bench checklist) are in git history: `git show
+  13ea712^:docs/<name>.md`.

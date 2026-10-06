@@ -36,5 +36,10 @@
   "loopback_offset_samples": 0,
   "listen": { "codec": "opus", "bitrate_kbps": 96 },
   "net": { "enabled": false, "port": 4010, "delay_ms": 1000 },
-  "sinks": {}
+  "sinks": {},
+  "bluetooth": {
+    "enabled": true, "name": "", "pairable": true, "discoverable_timeout_s": 180,
+    "input": { "enabled": false },
+    "output": { "device": "bluealsa:DEV=00:00:00:00:00:00,PROFILE=a2dp" }
+  }
 }

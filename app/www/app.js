@@ -3215,6 +3215,7 @@ function onSystem(s) {
   $('syncbanner').classList.toggle('hidden', !s.sync_errors || state.limits.sync_watch === false);
   renderHost(s);
   renderPower(s.throttle);
+  if ('bt_request' in s) renderBtRequest(s.bt_request);
   // A device came or went: fetch the state that says where it is, and build its sections.
   if ((Array.isArray(s.sinks) && sinkIds(s.sinks) !== sinkIds(state.sinks)) ||
       (Array.isArray(s.sources) && sourceIds(s.sources) !== sourceIds(state.sources))) {

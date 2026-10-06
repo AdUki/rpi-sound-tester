@@ -132,7 +132,7 @@ ifeq ($(DEVICE),)
 	        $(foreach d,$(SINK),--sink $(d)) \
 	        --www $(APP)/www --config $(APP)/config/default-config.json --data-dir /tmp/soundtester
 else
-	@$(FAKEBT)$(BIN) $(if $(FAKEBT),--bluetooth) --device $(DEVICE) --port $(PORT) --board $(APP)/config/boards/$(PROFILE).json \
+	@$(FAKEBT)$(BIN) $(if $(FAKEBT),--bluetooth,--no-bluetooth) --device $(DEVICE) --port $(PORT) --board $(APP)/config/boards/$(PROFILE).json \
 	        $(foreach d,$(SINK),--sink $(d)) \
 	        --www $(APP)/www --config $(APP)/config/default-config.json --data-dir /tmp/soundtester
 endif
@@ -491,4 +491,5 @@ help:
 	     /^## ─/ { gsub(/## /,""); printf "\n\033[2m%s\033[0m\n", $$0; next } \
 	     /^[a-zA-Z_-]+:.*?## / { printf "  \033[1m%-11s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo -e "\n$(DIM)Flags:  BOARD=rpi3|vim3l  DEV=1 (dev image)  FULL=1 (deeper clean)  ARGS=\"...\" (bitbake)$(OFF)"
-	@echo -e "$(DIM)Vars:   DISK=/dev/...  DEVICE=hw:...  PORT=$(PORT)  TARGET=root@host$(OFF)\n"
+	@echo -e "$(DIM)Vars:   DISK=/dev/...  DEVICE=hw:...  PORT=$(PORT)  TARGET=root@host$(OFF)"
+	@echo -e "$(DIM)Run:    SINK=dev (an extra output)  BT=fake  STAGGER=$(STAGGER) (sim loopback)  VORBIS=0 (plugin)$(OFF)\n"
