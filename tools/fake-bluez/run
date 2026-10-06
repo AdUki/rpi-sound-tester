@@ -9,6 +9,7 @@
 # honour it — so it never reaches the real system bus or this machine's own bluetoothd. Both the
 # bus and the fake are stopped when the command (or this script) exits. The address is also
 # written to $FAKE_BLUEZ_ADDR_FILE, which is where tools/fake-bluez/ctl finds it.
+# FAKE_BLUEZ_ADAPTERS=2 gives it two adapters, the scripted world on hci1 (fake_bluez.py --adapters).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -38,7 +39,7 @@ bus_pid=$!
 for _ in $(seq 100); do [ -S "$tmp/bus" ] && break; sleep 0.05; done
 [ -S "$tmp/bus" ] || { echo "fake-bluez: the private bus did not start" >&2; exit 1; }
 
-python3 -u "$here/fake_bluez.py" --address "$addr" &
+python3 -u "$here/fake_bluez.py" --address "$addr" --adapters "${FAKE_BLUEZ_ADAPTERS:-1}" &
 fake_pid=$!
 
 # Ready once it owns both names; a client started earlier would find no BlueZ and give up.

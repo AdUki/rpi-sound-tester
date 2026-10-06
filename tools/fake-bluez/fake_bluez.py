@@ -38,7 +38,11 @@ PCM = 'org.bluealsa.PCM1'
 BA_MGR = 'org.bluealsa.Manager1'
 FAKE = 'org.soundtester.Fake1'
 
+# The adapter the scripted world is in range of. --adapters 2 moves it to hci1 and puts an
+# adapter with nothing in range at hci0, as on a desktop whose own radio PipeWire has and whose
+# second one is the tester's (soundtesterd --bt-adapter).
 ADAPTER_PATH = '/org/bluez/hci0'
+DESK_ADAPTER = ('/org/bluez/hci0', '44:A3:BB:36:5E:2E')
 BA_ROOT = '/org/bluealsa'
 
 UUID_AUDIO_SOURCE = '0000110a-0000-1000-8000-00805f9b34fb'
@@ -65,6 +69,10 @@ def log(*args):
 def err(name, msg):
     """An error as BlueZ names it: org.bluez.Error.<name>, with BlueZ's own message."""
     return dbus.DBusException(msg, name='org.bluez.Error.' + name)
+
+
+def hci_name():
+    return ADAPTER_PATH.rsplit('/', 1)[1]
 
 
 def dev_path(address):
@@ -298,9 +306,10 @@ class AgentManager(PropObject):
 
 
 class Adapter(PropObject):
-    def __init__(self, svc):
+    def __init__(self, svc, path=None, address='B8:27:EB:50:7B:22', world=True):
+        self.world = world   # False: nothing is ever in range of it
         p = {
-            'Address': dbus.String('B8:27:EB:50:7B:22'),
+            'Address': dbus.String(address),
             'AddressType': dbus.String('public'),
             'Name': dbus.String('BlueZ 5.72'),
             'Alias': dbus.String('BlueZ 5.72'),
@@ -324,7 +333,7 @@ class Adapter(PropObject):
             ADAPTER + '.Pairable': self.set_pairable,
             ADAPTER + '.PairableTimeout': self.set_pairable_timeout,
         }
-        super().__init__(svc, ADAPTER_PATH,
+        super().__init__(svc, path or ADAPTER_PATH,
                          {ADAPTER: p, 'org.bluez.Media1': {
                              'SupportedUUIDs': strv([UUID_AUDIO_SOURCE, UUID_AUDIO_SINK])},
                           'org.bluez.GattManager1': {}},
@@ -357,7 +366,7 @@ class Adapter(PropObject):
             self.sync_discovering()
             self.update(ADAPTER, Discoverable=dbus.Boolean(False))
             self.cancel_timer('disc_timer')
-            for d in list(self.svc.devices.values()):
+            for d in list(self.svc.devices.values()) if self.world else ():
                 d.link_lost('adapter powered off')
         self.update(ADAPTER, Powered=dbus.Boolean(on),
                     PowerState=dbus.String('on' if on else 'off'))
@@ -431,10 +440,12 @@ class Adapter(PropObject):
             for t in self.scan_timers:
                 GLib.source_remove(t)
             self.scan_timers = []
-            for d in list(self.svc.devices.values()):
+            for d in list(self.svc.devices.values()) if self.world else ():
                 d.discovery_stopped()
 
     def start_world(self):
+        if not self.world:
+            return
         t = self.transport()
         for w in WORLD:
             if w.get('le_only') and t == 'bredr':
@@ -850,7 +861,7 @@ class Pcm(PropObject):
     def __init__(self, svc, dev, direction):
         playback = direction == 'playback'
         suffix = '/a2dpsrc/sink' if playback else '/a2dpsnk/source'
-        path = BA_ROOT + '/hci0/dev_' + dev.address.replace(':', '_') + suffix
+        path = BA_ROOT + '/' + hci_name() + '/dev_' + dev.address.replace(':', '_') + suffix
         p = {
             'Device': dbus.ObjectPath(dev.path),
             'Sequence': dbus.UInt32(svc.seq),
@@ -928,7 +939,7 @@ class BluealsaManager(ObjectManager):
         return dbus.Dictionary(self.props(), signature='sv')
 
     def props(self):
-        return {'Version': dbus.String('4.0.0'), 'Adapters': strv(['hci0']),
+        return {'Version': dbus.String('4.0.0'), 'Adapters': strv([hci_name()]),
                 'Profiles': strv(['a2dp-source', 'a2dp-sink']),
                 'Codecs': strv(['A2DP-source:SBC', 'A2DP-sink:SBC'])}
 
@@ -1059,6 +1070,8 @@ class Service:
         self.root = ObjectManager(self, '/')
         self.agent_mgr = AgentManager(self)
         self.adapter = Adapter(self)
+        if ADAPTER_PATH != DESK_ADAPTER[0]:
+            self.root.add(Adapter(self, DESK_ADAPTER[0], DESK_ADAPTER[1], world=False))
         self.bluealsa = BluealsaManager(self)
         self.fake = Fake(self)
         self.root.add(self.agent_mgr)
@@ -1131,7 +1144,12 @@ class Service:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--address', required=True, help='the private bus to serve on')
+    ap.add_argument('--adapters', type=int, choices=(1, 2), default=1,
+                    help='2: the world on hci1, and an adapter with nothing in range on hci0')
     args = ap.parse_args()
+    if args.adapters == 2:
+        global ADAPTER_PATH
+        ADAPTER_PATH = '/org/bluez/hci1'
 
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     conn = dbus.bus.BusConnection(args.address)

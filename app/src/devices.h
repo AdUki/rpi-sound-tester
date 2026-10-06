@@ -56,10 +56,10 @@ struct DeviceStatus {
 class Devices {
  public:
   // `engine_device` is the engine card's ALSA name, "" for none; every PCM on that card is the
-  // engine's. `extra_sinks` are ALSA names to offer as sinks although no scan finds them: a
-  // desktop's "default", say.
+  // engine's. `extra_sinks` and `extra_inputs` are ALSA names to play to and capture from although
+  // no scan finds them: a desktop's "pipewire", say. A name in both is one device.
   Devices(Control& ctl, AudioEngine& engine, const Board& board, std::string engine_device,
-          std::vector<std::string> extra_sinks);
+          std::vector<std::string> extra_sinks, std::vector<std::string> extra_inputs = {});
   ~Devices();
   Devices(const Devices&) = delete;
   Devices& operator=(const Devices&) = delete;
@@ -118,6 +118,14 @@ class Devices {
     std::unique_ptr<DeviceInput> in;
   };
 
+  // A device named on the command line.
+  struct Extra {
+    std::string id;    // its device id when it is a hardware device, else the name itself
+    std::string alsa;
+    bool playback = false;
+    bool capture = false;
+  };
+
   void loop();
   void scan();
   // Puts `d` on free slot `slot` with its saved settings. m_ held.
@@ -131,7 +139,7 @@ class Devices {
   AudioEngine& engine_;
   const Board& board_;
   const std::string engine_card_;  // card id; "" for none
-  std::vector<std::string> extra_;
+  std::vector<Extra> extra_;
   std::vector<SinkDevice> fixed_;  // under m_ once started
 
   mutable std::mutex m_;  // guards everything below; outputs_[s] is written once, under it

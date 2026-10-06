@@ -31,6 +31,24 @@ void test_device_paths() {
            std::string("/org/bluez/hci0/dev_5C_E9_1E_22_40_01"));
 }
 
+// A board runs its only radio, or hci0 when a dongle joins it. A desktop names the one that is the
+// tester's, by hci name or by address, and gets nothing at all when that one is not there: never
+// the desktop's own.
+void test_adapter_choice() {
+  const std::vector<BtAdapterId> one = {{"/org/bluez/hci0", "B8:27:EB:50:7B:22"}};
+  const std::vector<BtAdapterId> two = {{"/org/bluez/hci1", "00:1B:DC:08:4B:CC"},
+                                        {"/org/bluez/hci0", "44:A3:BB:36:5E:2E"}};
+  CHECK_EQ(bt_pick_adapter(one, ""), std::string("/org/bluez/hci0"));
+  CHECK_EQ(bt_pick_adapter(two, ""), std::string("/org/bluez/hci0"));
+  CHECK_EQ(bt_pick_adapter({}, ""), std::string());
+  CHECK_EQ(bt_pick_adapter(two, "hci1"), std::string("/org/bluez/hci1"));
+  CHECK_EQ(bt_pick_adapter(two, "00:1b:dc:08:4b:cc"), std::string("/org/bluez/hci1"));
+  CHECK_EQ(bt_pick_adapter(two, "44:A3:BB:36:5E:2E"), std::string("/org/bluez/hci0"));
+  CHECK_EQ(bt_pick_adapter(one, "hci1"), std::string());
+  CHECK_EQ(bt_pick_adapter(one, "00:1B:DC:08:4B:CC"), std::string());
+  CHECK_EQ(bt_pick_adapter(two, "hci"), std::string());
+}
+
 // The output's device is a PCM name, and the console needs the speaker behind it. An address of
 // zeros is bluez-alsa's "most recently connected", which has no address to report.
 void test_pcm_names_round_trip() {
@@ -171,6 +189,7 @@ void test_the_bluetooth_sink() {
 int main() {
   test_addresses();
   test_device_paths();
+  test_adapter_choice();
   test_pcm_names_round_trip();
   test_roles_come_from_the_uuids();
   test_the_agent_policy();

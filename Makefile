@@ -2,6 +2,7 @@
 #
 #   make            list the targets
 #   make run        run it on this machine against a simulated card
+#   make pc         run it on this PC for real, next to its PipeWire (no Yocto)
 #   make image      build the read-only Yocto image (BOARD=rpi3 or vim3l)
 #   make flash      write it to an SD card
 
@@ -67,6 +68,8 @@ SINK    ?=
 #   make run BT=fake
 BT      ?=
 DISK    ?=
+# `make pc`: one more ALSA device to record from, besides PipeWire's (SINK= adds one to play to).
+INPUT   ?=
 
 # What `make configure` writes. Neither is tracked by git.
 #   DEVCONF  — baked into the image (hostname, ssh password, Wi-Fi). Copied from the tracked
@@ -165,6 +168,41 @@ ifdef FULL
 	@rm -rf $(YB)/tmp
 	@echo "Yocto tmp removed; downloads/ and sstate-cache/ kept, so a rebuild is much faster."
 endif
+
+## ─── PC ──────────────────────────────────────────────────────────────────────
+
+# The daemon on this machine for real, not simulated: built with the host's compiler (no Yocto) and
+# run on the "pc" board profile by tools/pc/run. It is one more client of the desktop's PipeWire —
+# it plays to and records from its "pipewire" ALSA PCM and never opens a sound card PipeWire runs —
+# and Bluetooth runs on an adapter of its own, with bluez-alsa started for that adapter alone.
+#   make pc                    http://localhost:8080
+#   make pc BT=hci1            ...with Bluetooth on hci1, or an address (make pc-bt-setup once)
+#   make pc BT=ask             ...asking which adapter; BT=fake: a fake BlueZ, no radio
+PC_PKGS := build-essential cmake pkg-config libasound2-dev libopus-dev libogg-dev \
+           libsamplerate0-dev libvorbis-dev libsystemd-dev
+
+.PHONY: pc
+pc: check-submodules ## Build and run it on this PC next to PipeWire (BT=hciN|address|ask|fake, SINK=, INPUT=)
+	@tools/pc/run --port $(PORT) $(if $(BT),--bt $(BT)) \
+	        $(foreach d,$(SINK),--sink $(d)) $(foreach d,$(INPUT),--input $(d))
+
+.PHONY: pc-deps
+pc-deps: ## Install what building the daemon on this PC needs (Debian/Ubuntu)
+	@missing=""; for p in $(PC_PKGS); do dpkg -s $$p >/dev/null 2>&1 || missing="$$missing $$p"; done; \
+	if [ -z "$$missing" ]; then echo "All build dependencies already installed."; \
+	else echo -e "Installing:$$missing\n"; sudo apt-get install -y $$missing; fi
+
+.PHONY: pc-bt-adapters
+pc-bt-adapters: ## List this PC's Bluetooth adapters and which the desktop is using
+	@tools/pc/bt-adapters
+
+.PHONY: pc-bt-setup
+pc-bt-setup: ## One-time Bluetooth setup for make pc: a local bluez-alsa and one D-Bus policy (sudo)
+	@tools/pc/bt-setup
+
+.PHONY: pc-bt-remove
+pc-bt-remove: ## Undo pc-bt-setup
+	@tools/pc/bt-setup --remove
 
 ## ─── deploy ──────────────────────────────────────────────────────────────────
 
@@ -489,7 +527,8 @@ help:
 	@echo -e "$(BOLD)Sound Tester$(OFF)  $(DIM)boards: $(BOARDS) (BOARD=$(BOARD))$(OFF)\n"
 	@awk 'BEGIN {FS = ":.*## "} \
 	     /^## ─/ { gsub(/## /,""); printf "\n\033[2m%s\033[0m\n", $$0; next } \
-	     /^[a-zA-Z_-]+:.*?## / { printf "  \033[1m%-11s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	     /^[a-zA-Z_-]+:.*?## / { printf "  \033[1m%-14s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo -e "\n$(DIM)Flags:  BOARD=rpi3|vim3l  DEV=1 (dev image)  FULL=1 (deeper clean)  ARGS=\"...\" (bitbake)$(OFF)"
 	@echo -e "$(DIM)Vars:   DISK=/dev/...  DEVICE=hw:...  PORT=$(PORT)  TARGET=root@host$(OFF)"
-	@echo -e "$(DIM)Run:    SINK=dev (an extra output)  BT=fake  STAGGER=$(STAGGER) (sim loopback)  VORBIS=0 (plugin)$(OFF)\n"
+	@echo -e "$(DIM)Run:    SINK=dev (an extra output)  BT=fake  STAGGER=$(STAGGER) (sim loopback)  VORBIS=0 (plugin)$(OFF)"
+	@echo -e "$(DIM)PC:     BT=hciN|address|ask|fake  SINK=dev  INPUT=dev (beyond PipeWire's)$(OFF)\n"

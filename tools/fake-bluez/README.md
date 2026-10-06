@@ -11,6 +11,10 @@ tools/fake-bluez/run CMD ARGS...       # CMD with DBUS_SYSTEM_BUS_ADDRESS on the
 tools/fake-bluez/run python3 tools/fake-bluez/test_fake.py   # the fake's own self-test
 ```
 
+`FAKE_BLUEZ_ADAPTERS=2 tools/fake-bluez/run ...` gives it two adapters, as on a desktop with a USB
+dongle: the scripted world is in range of hci1, and hci0 (44:A3:BB:36:5E:2E) has nothing in range.
+`make pc BT=fake` runs that way, with the daemon on `--bt-adapter hci1`.
+
 `run` starts a `dbus-daemon` on a socket in a private temporary directory, starts
 `fake_bluez.py` on it, and stops both when it exits. sd-bus and libdbus both read
 `DBUS_SYSTEM_BUS_ADDRESS`, so a client under `run` finds the fake where it expects the real

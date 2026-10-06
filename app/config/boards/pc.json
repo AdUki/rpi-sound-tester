@@ -1,0 +1,12 @@
+{
+  "rate": 48000,
+  "period": 1024,
+  "periods": 4,
+  "device_inputs": 2,
+  "desktop": true,
+  "scan": false,
+  "devices": {
+    "pipewire": { "label": "PipeWire" },
+    "default": { "label": "System default" }
+  }
+}

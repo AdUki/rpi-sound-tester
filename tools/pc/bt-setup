@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# One-time Bluetooth setup for running the tester on a PC (make pc-bt-setup).
+#
+#   tools/pc/bt-setup            set it up
+#   tools/pc/bt-setup --remove   take it all out again
+#
+# The tester's audio over Bluetooth goes through bluez-alsa, as on the board. On a desktop it must
+# not run the way its package would — as a system service on every adapter, where it would fight
+# PipeWire for the desktop's own headphones — so nothing is installed with apt and no service is
+# enabled. Instead:
+#
+#   1. bluez-alsa's two Debian/Ubuntu packages are downloaded (apt-get download, no root) and
+#      unpacked under $XDG_DATA_HOME/soundtester/bluez-alsa. tools/pc/run starts that bluealsa, as
+#      you, on the one adapter you give it, and stops it again.
+#   2. Its ALSA plugin is described to alsa-lib in an alsa.conf next to it, which tools/pc/run adds
+#      to ALSA_CONFIG_PATH for soundtesterd alone. Nothing under /etc/alsa or ~/.asoundrc changes.
+#   3. The one change to the system: a D-Bus policy that lets you own the name org.bluealsa on the
+#      system bus and talk to it (the package's own policy allows root and group audio only).
+#      /etc/dbus-1/system.d/soundtester-bluealsa.conf; sudo, once.
+#
+# PipeWire's own configuration is not touched.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+share=${XDG_DATA_HOME:-$HOME/.local/share}/soundtester/bluez-alsa
+policy=/etc/dbus-1/system.d/soundtester-bluealsa.conf
+user=$(id -un)
+bold=$'\033[1m' dim=$'\033[2m' off=$'\033[0m'
+
+if [ "${1:-}" = "--remove" ]; then
+  rm -rf "$share"
+  echo "removed $share"
+  if [ -e "$policy" ]; then
+    sudo rm -f "$policy"
+    echo "removed $policy"
+  fi
+  exit 0
+fi
+[ $# -eq 0 ] || { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+for tool in apt-get dpkg-deb busctl; do
+  command -v "$tool" >/dev/null || {
+    echo "bt-setup: needs $tool. This setup is for Debian/Ubuntu; elsewhere install bluez-alsa"
+    echo "(bluealsa or bluealsad on PATH, its ALSA plugin system-wide) and give your user the"
+    echo "D-Bus policy below by hand:"
+    "$here/bt-policy" "$user"
+    exit 1
+  }
+done
+
+# A system bluez-alsa answering on the bus serves every adapter, the desktop's too, and would leave
+# no name for the tester's own. Not stopped here: someone set it up on purpose.
+if busctl --system status org.bluealsa >/dev/null 2>&1; then
+  echo "${bold}Note:${off} a bluez-alsa is already running on the system bus (org.bluealsa)."
+  echo "tools/pc/run needs that name for its own, on one adapter. Stop it before running:"
+  echo "  sudo systemctl disable --now bluealsa.service"
+  echo
+fi
+
+echo "${bold}1. bluez-alsa${off} ${dim}→ $share${off}"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+(cd "$tmp" && apt-get download bluez-alsa-utils libasound2-plugin-bluez >/dev/null)
+rm -rf "$share"
+mkdir -p "$share"
+for deb in "$tmp"/*.deb; do
+  dpkg-deb -x "$deb" "$share"
+  echo "   $(basename "$deb")"
+done
+bin=$share/usr/bin/bluealsa
+[ -x "$bin" ] || bin=$share/usr/bin/bluealsad
+[ -x "$bin" ] || { echo "bt-setup: no bluealsa binary in the package"; exit 1; }
+
+# The libraries it links are ordinary ones (SBC, LDAC, GLib); install whichever are missing.
+missing=$(ldd "$bin" "$share"/usr/lib/*/alsa-lib/libasound_module_pcm_bluealsa.so 2>/dev/null |
+          sed -n 's/^\s*\(\S*\) => not found$/\1/p' | sort -u)
+if [ -n "$missing" ]; then
+  pkgs=$(apt-cache show bluez-alsa-utils | sed -n 's/^Depends: //p' | head -1 | tr ',' '\n' |
+         sed 's/[ (].*//; s/^ *//' | grep -v '^libasound2-plugin-bluez$' | tr '\n' ' ')
+  echo "   missing libraries: $missing"
+  echo "   installing the libraries bluez-alsa depends on (no services): $pkgs"
+  # shellcheck disable=SC2086
+  sudo apt-get install -y --no-install-recommends $pkgs
+fi
+
+echo "${bold}2. its ALSA plugin${off} ${dim}→ $share/alsa.conf (read by soundtesterd alone)${off}"
+plugdir=$(dirname "$(ls "$share"/usr/lib/*/alsa-lib/libasound_module_pcm_bluealsa.so)")
+{
+  echo "# Written by tools/pc/bt-setup. The bluealsa PCM and CTL as the package defines them, with"
+  echo "# the plugin libraries found here rather than in alsa-lib's directory."
+  echo "pcm_type.bluealsa { lib \"$plugdir/libasound_module_pcm_bluealsa.so\" }"
+  echo "ctl_type.bluealsa { lib \"$plugdir/libasound_module_ctl_bluealsa.so\" }"
+  cat "$share"/etc/alsa/conf.d/*bluealsa*.conf
+} > "$share/alsa.conf"
+
+echo "${bold}3. D-Bus policy${off} ${dim}→ $policy (sudo)${off}"
+"$here/bt-policy" "$user" > "$tmp/policy.conf"
+sudo install -m 0644 "$tmp/policy.conf" "$policy"
+# dbus-daemon notices a new file in system.d by itself; a reload makes sure of it.
+sudo systemctl reload dbus.service 2>/dev/null || sudo busctl --system call org.freedesktop.DBus \
+  /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig >/dev/null 2>&1 || true
+
+echo
+echo "${bold}Done.${off} Pick an adapter PipeWire is not using and run the tester on it:"
+"$here/bt-adapters" | sed 's/^/  /'

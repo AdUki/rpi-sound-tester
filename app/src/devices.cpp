@@ -24,15 +24,24 @@ unsigned input_columns(const PcmCaps& caps) {
 }
 
 Devices::Devices(Control& ctl, AudioEngine& engine, const Board& board,
-                 std::string engine_device, std::vector<std::string> extra_sinks)
+                 std::string engine_device, std::vector<std::string> extra_sinks,
+                 std::vector<std::string> extra_inputs)
     : ctl_(ctl),
       engine_(engine),
       board_(board),
       engine_card_(pcm_card_id(pcm_device_id(engine_device))) {
   // A hardware device named here is one the scan finds anyway, and two slots on one PCM would
-  // leave one of them unable to open it.
-  for (std::string& name : extra_sinks)
-    if (pcm_device_id(name).empty()) extra_.push_back(std::move(name));
+  // leave one of them unable to open it. Without a scan it is found only by being named.
+  auto add = [this](const std::string& name, bool capture) {
+    const std::string hw = pcm_device_id(name);
+    if (board_.scan && !hw.empty()) return;
+    const std::string id = hw.empty() ? name : hw;
+    auto it = std::find_if(extra_.begin(), extra_.end(), [&](const Extra& x) { return x.id == id; });
+    if (it == extra_.end()) it = extra_.insert(extra_.end(), Extra{id, name});
+    (capture ? it->capture : it->playback) = true;
+  };
+  for (const std::string& name : extra_sinks) add(name, false);
+  for (const std::string& name : extra_inputs) add(name, true);
 }
 
 Devices::~Devices() { stop(); }
@@ -142,11 +151,13 @@ int Devices::free_columns_locked(unsigned count) const {
 }
 
 void Devices::scan() {
-  std::vector<PcmDevice> found = scan_pcm_devices();
-  for (const std::string& name : extra_) {
+  std::vector<PcmDevice> found = board_.scan ? scan_pcm_devices() : std::vector<PcmDevice>();
+  for (const Extra& x : extra_) {
     PcmDevice d;
-    d.id = d.alsa = d.card_name = name;
-    d.playback = true;
+    d.id = x.id;
+    d.alsa = d.card_name = x.alsa;
+    d.playback = x.playback;
+    d.capture = x.capture;
     found.push_back(d);
   }
   std::vector<SinkDevice> fixed;

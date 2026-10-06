@@ -299,6 +299,22 @@ std::string bt_address_upper(const std::string& a) {
   return u;
 }
 
+std::string bt_pick_adapter(const std::vector<BtAdapterId>& adapters, const std::string& want) {
+  if (want.empty()) {
+    std::string path;
+    for (const BtAdapterId& a : adapters)
+      if (path.empty() || a.path == "/org/bluez/hci0") path = a.path;
+    return path;
+  }
+  const bool by_address = bt_address_ok(want);
+  for (const BtAdapterId& a : adapters) {
+    if (by_address ? bt_address_upper(a.address) == bt_address_upper(want)
+                   : a.path == "/org/bluez/" + want)
+      return a.path;
+  }
+  return {};
+}
+
 std::string bt_device_path(const std::string& adapter_path, const std::string& address) {
   std::string a = bt_address_upper(address);
   std::replace(a.begin(), a.end(), ':', '_');
@@ -507,6 +523,8 @@ void BtManager::set_not_running_reason(std::string reason) {
   not_running_reason_ = std::move(reason);
 }
 
+void BtManager::set_adapter(std::string want) { want_adapter_ = std::move(want); }
+
 void BtManager::post(std::function<void()> fn) {
   {
     std::lock_guard<std::mutex> lk(m_);
@@ -704,19 +722,25 @@ void BtManager::refresh() {
   sd_bus_error_free(&e);
   if (!agent_registered_) register_agent();
 
-  // The first adapter, or hci0 when there are several: the onboard radio, which is what the
-  // image sets up.
-  std::string apath;
-  for (auto it = objs.begin(); it != objs.end(); ++it) {
-    if (!it->contains(kAdapterIface)) continue;
-    if (apath.empty() || it.key() == "/org/bluez/hci0") apath = it.key();
-  }
+  std::vector<BtAdapterId> adapters;
+  for (auto it = objs.begin(); it != objs.end(); ++it)
+    if (it->contains(kAdapterIface))
+      adapters.push_back({it.key(), str_of((*it)[kAdapterIface], "Address")});
+  const std::string apath = bt_pick_adapter(adapters, want_adapter_);
   if (apath.empty()) {
     available_ = false;
     devices_.clear();
     adapter_ = BtAdapterInfo{};
-    set_error("no Bluetooth adapter: the radio needs dtparam=krnbt=on in config.txt and its "
-              "firmware in /lib/firmware/brcm (dmesg | grep -i blue)");
+    if (!want_adapter_.empty()) {
+      std::string have;
+      for (const BtAdapterId& a : adapters)
+        have += (have.empty() ? "" : ", ") + a.path.substr(a.path.rfind('/') + 1) + " " + a.address;
+      set_error("no Bluetooth adapter " + want_adapter_ + " (BlueZ has " +
+                (have.empty() ? std::string("none") : have) + ")");
+    } else {
+      set_error("no Bluetooth adapter: the radio needs dtparam=krnbt=on in config.txt and its "
+                "firmware in /lib/firmware/brcm (dmesg | grep -i blue)");
+    }
     publish();
     return;
   }
@@ -1217,6 +1241,12 @@ int BtManager::agent_call(sd_bus_message* m, const char* member) {
     return sd_bus_reply_method_errorf(m, "org.bluez.Error.Rejected", "bad arguments");
   }
   const std::string path = dev;
+  // The agent is BlueZ's default for every adapter, and on a desktop the others are the desktop's
+  // own: what pairs with those is not the tester's to say yes to.
+  if (adapter_.path.empty() || path.rfind(adapter_.path + "/", 0) != 0) {
+    LOG_INFO("bluetooth: {} {} refused: not on this tester's adapter", what, path);
+    return sd_bus_reply_method_errorf(m, "org.bluez.Error.Rejected", "not this tester's adapter");
+  }
   const auto started = started_here_.find(path);
   const bool here = started != started_here_.end();
 

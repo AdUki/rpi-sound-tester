@@ -15,6 +15,7 @@ make build            # cmake configure (Release) + build into app/build
 make test             # ctest --test-dir app/build --output-on-failure
 make run              # http://localhost:8080 against the simulated card (--sim); BOARD= picks the profile
 make run DEVICE=hw:audioinjectoroc,0     # real engine card; SINK=default adds a desktop's sound server as an output
+make pc [BT=hci1|<addr>|ask|fake]        # the real daemon on this desktop, next to PipeWire (tools/pc/run; no Yocto)
 make plugin           # the ALSA sender plugin in alsa-plugin/ (built for THIS host, not the Pi; VORBIS=0 drops libvorbis)
 make image [BOARD=rpi3|vim3l] [DEV=1]    # Yocto (plain poky/bitbake, scarthgap); needs `make configure` first
 make bitbake ARGS="soundtesterd" [BOARD=…]   # cross-build just the daemon (ARGS="-e <recipe>" to inspect variables)
@@ -119,6 +120,19 @@ board profile that has a radio, so it passes `--no-bluetooth` (`--sim` already l
   pulses the codec reset for 1.5 s; a cs42xx8 probe inside it got -121 for good): kernel patch 0003
   defers instead. A manual sysfs `bind` does not exercise the deferred list — test via a module load.
 - Device names are attacker-controlled text from anyone in radio range: `esc()` them in app.js.
+
+## PC (no Yocto)
+
+`make pc` (`tools/pc/run`) builds with the host's compiler and runs on `app/config/boards/pc.json`:
+no engine card (timer), `"desktop": true` (no reboot/shutdown, BT pairings not mirrored to the data
+dir), `"scan": false` (never open a card PipeWire runs; only what `--sink`/`--input` name, by
+default the `pipewire` ALSA PCM both ways). **Do not touch PipeWire's config.** Bluetooth runs on
+one adapter (`--bt-adapter hciN|<addr>`, `bt_pick_adapter`): devices of other adapters are not
+listed and the agent rejects their requests. `make pc-bt-setup` unpacks bluez-alsa under
+`~/.local/share/soundtester/bluez-alsa` (no apt install, no service: the packaged service would take
+every adapter from PipeWire) and installs one D-Bus policy letting the user own `org.bluealsa`;
+`run` starts `bluealsa -i <addr>` as the user and points `ALSA_CONFIG_PATH` at the plugin for the
+daemon alone. `make pc BT=fake` uses tools/fake-bluez with `FAKE_BLUEZ_ADAPTERS=2` (world on hci1).
 
 ## Boards (Yocto)
 

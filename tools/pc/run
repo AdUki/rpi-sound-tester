@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Builds soundtesterd for this PC and runs it (make pc). No Yocto: the same daemon, built with the
+# host's compiler, on the "pc" board profile (app/config/boards/pc.json).
+#
+#   tools/pc/run                       http://localhost:8080
+#   tools/pc/run --bt hci1             ...with Bluetooth on adapter hci1 (or its address)
+#   tools/pc/run --bt ask              ...asking which adapter (tools/pc/bt-adapters lists them)
+#   tools/pc/run --bt fake             ...with a fake BlueZ instead of a radio (tools/fake-bluez)
+#
+# Options:
+#   --port N          HTTP port (default $PORT or 8080)
+#   --bt ADAPTER      hciN | an address | ask | fake. Needs tools/pc/bt-setup once (not for fake)
+#   --sink NAME       one more ALSA device to play to (repeatable)
+#   --input NAME      one more ALSA device to record from (repeatable)
+#   --no-sink         do not play to PipeWire
+#   --no-input        do not record from PipeWire (its default source: the microphone, say)
+#   --data-dir DIR    where "Save as boot defaults" writes (default ~/.local/state/soundtester)
+#   --no-build        run what is built
+#   -v                debug logging
+#   -- ARGS           passed to soundtesterd as they are
+#
+# PipeWire is left alone: the daemon is one more ALSA client of it, through pipewire-alsa's
+# "pipewire" PCM, and shows up as "PipeWire ALSA [soundtesterd]" in pavucontrol and wpctl, where
+# its stream can be moved to any device. The sound cards PipeWire runs are never opened directly
+# (pc.json has "scan": false); one that is not PipeWire's can be named with --sink/--input hw:...
+#
+# Bluetooth needs an adapter of its own: bluez-alsa is started for that adapter alone, as you,
+# and stopped when the daemon exits. PipeWire's Bluetooth keeps working on the others. On the
+# tester's adapter both register audio endpoints with BlueZ, so a device connecting there may
+# still end up with PipeWire; and while the tester runs it is BlueZ's default pairing agent, which
+# refuses pairings that a device starts towards the desktop's adapters (pairing from the desktop's
+# own Bluetooth settings is unaffected).
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../.." && pwd)
+bin=$root/app/build/soundtesterd
+share=${XDG_DATA_HOME:-$HOME/.local/share}/soundtester/bluez-alsa
+bold=$'\033[1m' dim=$'\033[2m' off=$'\033[0m'
+
+port=${PORT:-8080}
+bt=""
+sinks=()
+inputs=()
+pw_sink=1
+pw_input=1
+data_dir=${XDG_STATE_HOME:-$HOME/.local/state}/soundtester
+build=1
+extra=()
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+need() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "run: $1 needs a value" >&2; exit 2; }; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --port) need "$@"; port=$2; shift 2 ;;
+    --bt) need "$@"; bt=$2; shift 2 ;;
+    --sink) need "$@"; sinks+=("$2"); shift 2 ;;
+    --input) need "$@"; inputs+=("$2"); shift 2 ;;
+    --no-sink) pw_sink=0; shift ;;
+    --no-input) pw_input=0; shift ;;
+    --data-dir) need "$@"; data_dir=$2; shift 2 ;;
+    --no-build) build=0; shift ;;
+    -v|--verbose) extra+=(-v); shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; extra+=("$@"); break ;;
+    *) echo "run: unknown option $1 (--help)" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$build" = 1 ]; then
+  make -C "$root" --no-print-directory build
+fi
+[ -x "$bin" ] || { echo "run: no $bin; build it with make build" >&2; exit 1; }
+
+# PipeWire, as ALSA sees it. Without pipewire-alsa the "default" PCM is whatever the system has.
+pcm=pipewire
+if ! aplay -L 2>/dev/null | grep -qx pipewire; then
+  if command -v aplay >/dev/null; then
+    pcm=default
+    echo "${bold}Note:${off} no ALSA PCM named pipewire (package pipewire-alsa); using default."
+  fi
+fi
+[ "$pw_sink" = 1 ] && sinks=("$pcm" "${sinks[@]}")
+[ "$pw_input" = 1 ] && inputs=("$pcm" "${inputs[@]}")
+
+args=(--board "$root/app/config/boards/pc.json" --port "$port" --www "$root/app/www"
+      --config "$root/app/config/default-config.json" --data-dir "$data_dir")
+for s in "${sinks[@]}"; do args+=(--sink "$s"); done
+for i in "${inputs[@]}"; do args+=(--input "$i"); done
+mkdir -p "$data_dir"
+
+wrap=()
+ba_pid=""
+cleanup() {
+  if [ -n "$ba_pid" ]; then
+    kill "$ba_pid" 2>/dev/null || true
+    wait "$ba_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+case "$bt" in
+  "") ;;
+  fake)
+    # Two adapters, the scripted world on hci1: the same shape as a desktop with a dongle.
+    wrap=(env FAKE_BLUEZ_ADAPTERS=2 "$root/tools/fake-bluez/run")
+    args+=(--bluetooth --bt-adapter hci1)
+    ;;
+  *)
+    if [ "$bt" = ask ]; then
+      read -r hci addr < <("$here/bt-adapters" --ask) || exit 1
+    else
+      read -r hci addr < <("$here/bt-adapters" --resolve "$bt") || exit 1
+    fi
+    [ -n "${addr:-}" ] || exit 1
+
+    bluealsa=""
+    for b in "$share/usr/bin/bluealsad" "$share/usr/bin/bluealsa"; do
+      [ -x "$b" ] && { bluealsa=$b; break; }
+    done
+    if [ -n "$bluealsa" ]; then
+      # Its ALSA plugin, for soundtesterd alone: the system's ALSA configuration stays as it is.
+      export ALSA_CONFIG_PATH="${ALSA_CONFIG_PATH:-/usr/share/alsa/alsa.conf}:$share/alsa.conf"
+    else
+      bluealsa=$(command -v bluealsad || command -v bluealsa || true)
+    fi
+    if [ -z "$bluealsa" ]; then
+      echo "run: no bluez-alsa. Set Bluetooth up once with:  ${bold}make pc-bt-setup${off}" >&2
+      exit 1
+    fi
+    if busctl --system status org.bluealsa >/dev/null 2>&1; then
+      echo "run: a bluez-alsa is already running on the system bus. It serves every adapter, the" >&2
+      echo "desktop's too, and holds the name this one needs:" >&2
+      echo "  sudo systemctl disable --now bluealsa.service" >&2
+      exit 1
+    fi
+
+    # By address: hci numbers change when a dongle is plugged in again.
+    log=$data_dir/bluealsa.log
+    echo "${dim}bluez-alsa on $hci ($addr), log in $log${off}"
+    "$bluealsa" -i "$addr" -p a2dp-source -p a2dp-sink >"$log" 2>&1 &
+    ba_pid=$!
+    for _ in $(seq 50); do
+      busctl --system status org.bluealsa >/dev/null 2>&1 && break
+      kill -0 "$ba_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if ! busctl --system status org.bluealsa >/dev/null 2>&1; then
+      echo "run: bluez-alsa did not come up:" >&2
+      tail -5 "$log" >&2
+      if grep -q "acquire D-Bus name" "$log"; then
+        echo "The D-Bus policy that allows it is missing:  ${bold}make pc-bt-setup${off}" >&2
+      fi
+      exit 1
+    fi
+    args+=(--bluetooth --bt-adapter "$addr")
+    ;;
+esac
+
+echo "${bold}http://localhost:$port${off}  ${dim}PipeWire: ${sinks[*]:-no} out, ${inputs[*]:-no} in" \
+     "· Bluetooth: ${bt:-off} · saves to $data_dir${off}"
+status=0
+"${wrap[@]}" "$bin" "${args[@]}" "${extra[@]}" || status=$?
+exit "$status"

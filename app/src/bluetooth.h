@@ -33,6 +33,16 @@ std::string bt_device_path(const std::string& adapter_path, const std::string& a
 std::string bt_pcm_name(const std::string& address);
 std::string bt_pcm_address(const std::string& pcm);
 
+// One adapter as BlueZ lists it: /org/bluez/hci0 and its address.
+struct BtAdapterId {
+  std::string path;
+  std::string address;
+};
+// The tester's adapter, of those BlueZ has. `want` is an hci name ("hci1") or an address, for a
+// machine whose other adapters belong to someone else (a desktop's, to PipeWire); "" is the first,
+// or hci0 when there are several: a board's onboard radio. "" when none is.
+std::string bt_pick_adapter(const std::vector<BtAdapterId>& adapters, const std::string& want);
+
 // What an A2DP device can do, from the service UUIDs it advertises: a sink takes audio (a
 // speaker), a source sends it (a phone). A laptop can be both.
 struct BtRoles {
@@ -171,6 +181,8 @@ class BtManager {
   bool start();
   void stop();
   void set_not_running_reason(std::string reason);
+  // Which adapter to run (bt_pick_adapter's `want`). Before start().
+  void set_adapter(std::string want);
 
   BtStatus status() const;
   BtSettings settings() const;
@@ -301,6 +313,7 @@ class BtManager {
   uint64_t scan_until_ns_ = 0;
   uint64_t persist_at_ns_ = 0;
   uint64_t persist_late_ns_ = 0;  // a second copy, for a key that lands after the first
+  std::string want_adapter_;  // set before start
   std::string adapter_path_;  // the adapter last reconciled; a new one is reconciled again
   std::vector<BtDeviceInfo> devices_;
   BtAdapterInfo adapter_;

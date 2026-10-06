@@ -1,0 +1,17 @@
+#!/bin/sh
+# Prints the D-Bus policy tools/pc/bt-setup installs as /etc/dbus-1/system.d/soundtester-bluealsa.conf:
+# user $1 may own org.bluealsa on the system bus (the bluealsa tools/pc/run starts, as that user)
+# and talk to it (soundtesterd, and the ALSA plugin inside it).
+user=${1:?usage: bt-policy USER}
+cat <<EOF
+<!-- Written by soundtester's tools/pc/bt-setup; tools/pc/bt-setup --remove deletes it.
+     Lets $user run bluez-alsa on one adapter for the sound tester, without root. -->
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="$user">
+    <allow own="org.bluealsa"/>
+    <allow send_destination="org.bluealsa"/>
+  </policy>
+</busconfig>
+EOF

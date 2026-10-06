@@ -86,6 +86,8 @@ int main(int argc, char** argv) {
   int port = 80;
   int net_port = 0;  // 0 = whatever the config says
   std::vector<std::string> extra_sinks;
+  std::vector<std::string> extra_inputs;
+  std::string bt_adapter;
   std::string www = "/usr/share/soundtester/www";
   std::string config_path = "/etc/soundtester/config.json";
   std::string data_dir = "/data";
@@ -106,6 +108,10 @@ int main(int argc, char** argv) {
   app.add_option("--sink", extra_sinks,
                  "Also offer this ALSA device as a sink, e.g. default to hear it through a "
                  "desktop's speakers (repeatable; hardware devices are found without it)");
+  app.add_option("--input", extra_inputs,
+                 "Also record from this ALSA device, e.g. pipewire for a desktop's default "
+                 "source (repeatable; hardware devices are found without it, unless board.json "
+                 "has \"scan\": false)");
   app.add_flag("--bluetooth", bluetooth,
                "Run the Bluetooth manager even where board.json says there is no radio, or under "
                "--sim. It takes over the adapter of the machine it runs on, so on a desktop point "
@@ -114,6 +120,10 @@ int main(int argc, char** argv) {
                "Leave the radio alone even where board.json has one: a board's profile run on a "
                "desktop (make run DEVICE=...)")
       ->excludes("--bluetooth");
+  app.add_option("--bt-adapter", bt_adapter,
+                 "The Bluetooth adapter to run, as hciN or its address, where the machine has "
+                 "others that are not the tester's: a desktop whose own radio PipeWire uses "
+                 "(default: hci0, or the only one)");
   app.add_option("--www", www, "Directory of static web files");
   app.add_option("--config", config_path, "Path to the default config");
   app.add_option("--data-dir", data_dir, "Where saved settings live (the writable partition)");
@@ -193,7 +203,8 @@ int main(int argc, char** argv) {
   if (cfg.net_enabled) net.start(ctl.net.port.load());
 
   // Sinks are found at runtime, and each hands the engine its ring when it is: see Devices.
-  st::Devices devices(ctl, engine, board, sim ? std::string() : eopt.device, extra_sinks);
+  st::Devices devices(ctl, engine, board, sim ? std::string() : eopt.device, extra_sinks,
+                      extra_inputs);
   // The Bluetooth output: a sink on bluez-alsa's playback PCM, which no scan finds. Stereo, as A2DP
   // is, at whichever of SBC's rates the speaker agreed to.
   if (run_bt) {
@@ -214,11 +225,12 @@ int main(int argc, char** argv) {
   bt_settings.pairable = cfg.bluetooth.pairable;
   bt_settings.discoverable_timeout_s = cfg.bluetooth.discoverable_timeout_s;
   st::BtManager bt(bt_settings);
+  bt.set_adapter(bt_adapter);
   // BlueZ keeps its pairing keys in /var/lib/bluetooth, which on the read-only image is RAM. They
   // are copied to the data partition whenever the set of paired devices changes, and the boot
-  // script (soundtester-bluetooth) puts them back before bluetoothd starts. Not in a simulated run:
-  // those keys are the workstation's, or the fake's.
-  if (!sim) {
+  // script (soundtester-bluetooth) puts them back before bluetoothd starts. Not in a simulated run
+  // or on a desktop: those keys are the workstation's, or the fake's.
+  if (!sim && !board.desktop) {
     bt.on_bonds_changed([&store] {
       std::string err;
       if (!store.save_dir("/var/lib/bluetooth", "bluetooth", &err))
@@ -261,7 +273,9 @@ int main(int argc, char** argv) {
     bt.set_not_running_reason(
         sim ? "the simulator leaves this machine's Bluetooth alone — run it with --bluetooth, or "
               "make run BT=fake"
-            : "this board has no Bluetooth (board.json)");
+            : board.desktop ? "not started: run it with a free adapter (make pc BT=hci1; "
+                              "make pc-bt-adapters lists them)"
+                            : "this board has no Bluetooth (board.json)");
   }
   if (ctl.net.bt_input.load()) bt_in.start();
 
@@ -277,9 +291,9 @@ int main(int argc, char** argv) {
   st::WebOptions wopt;
   wopt.www_dir = www;
   wopt.port = port;
-  // A simulated run is a developer's workstation: its reboot/shutdown buttons must not
-  // systemctl the host.
-  wopt.allow_reboot = !sim;
+  // A simulated run, or any run on a desktop, is someone's workstation: its reboot/shutdown
+  // buttons must not systemctl the host.
+  wopt.allow_reboot = !sim && !board.desktop;
 
   st::Deps deps{ctl, net, devices, bt, bt_in, ring, engine, analysis, capture, kmsg, store, cfg};
   st::WebServer server(deps, wopt);

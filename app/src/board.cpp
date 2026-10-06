@@ -34,6 +34,8 @@ bool load_board(const std::string& path, Board* out, std::string* err) {
     b.periods = j.value("periods", b.periods);
     b.device_inputs = j.value("device_inputs", b.device_inputs);
     b.bluetooth = j.value("bluetooth", b.bluetooth);
+    b.desktop = j.value("desktop", b.desktop);
+    b.scan = j.value("scan", b.scan);
     if (j.contains("devices")) {
       for (const auto& [id, d] : j.at("devices").items()) {
         DeviceHint h;

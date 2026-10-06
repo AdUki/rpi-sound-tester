@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Lists this machine's Bluetooth adapters, and which of them the desktop is using.
+
+  tools/pc/bt-adapters               the table
+  tools/pc/bt-adapters --resolve X   "hciN ADDRESS" of adapter X (hciN or an address), or exit 1
+  tools/pc/bt-adapters --ask         the table, then asks which one; prints "hciN ADDRESS"
+
+The tester runs one adapter of its own (soundtesterd --bt-adapter) next to a desktop whose
+PipeWire keeps the others. An adapter with a device connected is the desktop's in all likelihood:
+the tester would share it with PipeWire, which registers its audio endpoints on every adapter.
+
+Read-only: it asks BlueZ over the system bus (busctl) and changes nothing.
+"""
+import json
+import re
+import subprocess
+import sys
+
+ADAPTER = 'org.bluez.Adapter1'
+DEVICE = 'org.bluez.Device1'
+TRANSPORT = 'org.bluez.MediaTransport1'
+ADDRESS = re.compile(r'^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$')
+
+
+def unwrap(v):
+    """busctl's JSON carries every variant as {"type": ..., "data": ...}."""
+    if isinstance(v, dict) and set(v) == {'type', 'data'}:
+        return unwrap(v['data'])
+    if isinstance(v, dict):
+        return {k: unwrap(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [unwrap(x) for x in v]
+    return v
+
+
+def objects():
+    try:
+        out = subprocess.run(
+            ['busctl', '--system', '--json=short', 'call', 'org.bluez', '/',
+             'org.freedesktop.DBus.ObjectManager', 'GetManagedObjects'],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        sys.exit('bt-adapters: cannot ask BlueZ: %s' % e)
+    if out.returncode != 0:
+        sys.exit('bt-adapters: BlueZ does not answer (is bluetooth.service running?) %s'
+                 % out.stderr.strip())
+    return unwrap(json.loads(out.stdout)['data'][0])
+
+
+def adapters():
+    objs = objects()
+    found = []
+    for path, ifaces in sorted(objs.items()):
+        if ADAPTER not in ifaces:
+            continue
+        a = ifaces[ADAPTER]
+        connected = []
+        audio = []
+        for p, i in objs.items():
+            if not p.startswith(path + '/'):
+                continue
+            if DEVICE in i and i[DEVICE].get('Connected'):
+                connected.append(i[DEVICE].get('Alias') or i[DEVICE].get('Address'))
+            if TRANSPORT in i:
+                audio.append(p)
+        found.append({
+            'hci': path.rsplit('/', 1)[1],
+            'path': path,
+            'address': a.get('Address', '').upper(),
+            'alias': a.get('Alias', ''),
+            'powered': bool(a.get('Powered')),
+            'connected': connected,
+            'audio': audio,
+        })
+    return found
+
+
+def bluealsa_running():
+    r = subprocess.run(['busctl', '--system', 'status', 'org.bluealsa'],
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def table(found):
+    if not found:
+        print('No Bluetooth adapters.')
+        return
+    print('%-6s %-17s %-8s %s' % ('', 'address', 'power', 'name / in use'))
+    for a in found:
+        use = a['alias']
+        if a['connected']:
+            use += '  — connected: %s%s' % (', '.join(a['connected']),
+                                           ' (audio)' if a['audio'] else '')
+        print('%-6s %-17s %-8s %s' % (a['hci'], a['address'], 'on' if a['powered'] else 'off',
+                                       use))
+    free = [a['hci'] for a in found if not a['connected']]
+    print()
+    if len(found) == 1:
+        print('One adapter: the tester would share it with the desktop (PipeWire).')
+    elif free:
+        print('Nothing connected to: %s. Run the tester on one of them: make pc BT=%s'
+              % (', '.join(free), free[-1]))
+    else:
+        print('Every adapter has something connected; the tester will share one with PipeWire.')
+    if bluealsa_running():
+        print('Note: a bluez-alsa is already on the system bus (org.bluealsa). '
+              'make pc BT=... starts its own and needs that one stopped.')
+
+
+def resolve(found, want):
+    for a in found:
+        if (ADDRESS.match(want) and a['address'] == want.upper()) or a['hci'] == want:
+            return a
+    return None
+
+
+def main():
+    args = sys.argv[1:]
+    found = adapters()
+    if not args:
+        table(found)
+        return 0
+    if args[0] == '--resolve' and len(args) == 2:
+        a = resolve(found, args[1])
+        if not a:
+            have = ', '.join('%s %s' % (x['hci'], x['address']) for x in found) or 'none'
+            print('no Bluetooth adapter %s (this machine has: %s)' % (args[1], have),
+                  file=sys.stderr)
+            return 1
+        print(a['hci'], a['address'])
+        return 0
+    if args[0] == '--ask':
+        # The table goes to stderr: stdout is the answer, for a script to read.
+        sys.stdout, out = sys.stderr, sys.stdout
+        table(found)
+        if not found:
+            return 1
+        free = [a for a in found if not a['connected']]
+        default = (free[-1] if free else found[-1])['hci']
+        try:
+            ans = input('\nAdapter for the tester [%s]: ' % default).strip() or default
+        except EOFError:
+            return 1
+        a = resolve(found, ans)
+        if not a:
+            print('no adapter %s' % ans)
+            return 1
+        print(a['hci'], a['address'], file=out)
+        return 0
+    print(__doc__.strip().split('\n\n')[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

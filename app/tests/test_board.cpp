@@ -55,6 +55,16 @@ void test_the_shipped_boards() {
   CHECK(hdmi && hdmi->hdmi && !hdmi->hidden);
   CHECK(vim3l.hint("G12BKHADASVIM3L,1") && vim3l.hint("G12BKHADASVIM3L,1")->hidden);
   CHECK(vim3l.hint("Device,0") == nullptr);
+  CHECK(!pi.desktop && pi.scan && !vim3l.desktop && vim3l.scan);
+
+  // A PC: a timer for a clock, and PipeWire owns its cards, so nothing is scanned.
+  Board pc;
+  CHECK(load_board(ST_BOARDS_DIR "/pc.json", &pc, &err));
+  CHECK(pc.engine_device.empty());
+  CHECK_EQ(pc.rate, 48000u);
+  CHECK(pc.desktop);
+  CHECK(!pc.scan);
+  CHECK(!pc.bluetooth);
 }
 
 // No board file is a desktop: no engine card, no hints. A broken one is an error.
@@ -65,6 +75,7 @@ void test_missing_and_broken_files() {
   CHECK(b.engine_device.empty());
   CHECK_EQ(b.rate, 48000u);
   CHECK(b.devices.empty());
+  CHECK(!b.desktop && b.scan);
 
   const std::string bad = write_temp("{ \"rate\": ");
   std::string err;

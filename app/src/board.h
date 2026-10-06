@@ -33,6 +33,14 @@ struct Board {
   // The board has a Bluetooth radio, and the image BlueZ and bluez-alsa to run it: the daemon then
   // manages it and offers the Bluetooth sink and input.
   bool bluetooth = false;
+  // A general-purpose machine rather than the appliance (a PC, profile "pc"): the console's reboot
+  // and shutdown buttons do nothing, and Bluetooth pairings are left where its own bluetoothd
+  // keeps them.
+  bool desktop = false;
+  // Put every sound card ALSA lists to use. False where something else owns them — a desktop's
+  // PipeWire: the daemon then opens only what it is named (--sink, --input), and a hardware
+  // device only when it is named that way too.
+  bool scan = true;
   std::map<std::string, DeviceHint> devices;  // by device id: "<card id>,<device>"
 
   // The hint for device `id`, or nullptr.

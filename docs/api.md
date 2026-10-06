@@ -218,6 +218,9 @@ Every PCM device ALSA has, as `aplay -l` and `arecord -l` list them, and what th
   "sink": 1, "input": 8, "input_channels": 2, "note": ""}]
 ```
 `engine` marks the engine card's own; `hidden` one board.json says the board wires to nothing.
+Where board.json has `"scan": false` (a PC, whose cards PipeWire runs) the list holds only the
+devices the daemon was named (`--sink`, `--input`: `pipewire`, say), each under its name as its id
+(a hardware one under its device id).
 `sink` is the sink slot its playback is on and `input` the first input its capture is on, -1 for
 none; `note` says why one it could be is not (`no free sink slot`, `no free input columns`).
 
@@ -234,6 +237,10 @@ Both directions run on a clock the card does not share. The output is the sink `
 (*Sinks*), whose converter holds its latency constant like any sink's. The input's converter holds
 it the alignment delay ahead of playout, like a network sender's. Pairings are written to
 `/data/bluetooth` whenever they change, so they survive a reboot without a `config/save`.
+
+On a PC (`make pc BT=hci1`) it runs the one adapter it is given (`--bt-adapter`, an hci name or an
+address) and leaves the others to the desktop: devices on them are not listed, and the pairing
+agent refuses what they ask. Pairings stay where the PC's own bluetoothd keeps them.
 
 ### `GET /api/bluetooth`
 ```json
@@ -254,7 +261,8 @@ it the alignment delay ahead of playout, like a network sender's. Pairings are w
            "channels": 0, "input": -1, "frames": 0, "overruns": 0, "restarts": 0, "error": ""},
  "output": {"enabled": false, "device": "bluealsa:DEV=00:00:00:00:00:00,PROFILE=a2dp", "...": "…"}}
 ```
-`available` is false when there is no adapter or BlueZ is not running, and `error` says why.
+`available` is false when there is no adapter (or not the one `--bt-adapter` names) or BlueZ is
+not running, and `error` says why.
 `audio` is false while bluez-alsa is not running. Pairing and scanning still work without it.
 `name` is empty in `settings` when the adapter takes the hostname.
 `sink` means the device can take audio (a speaker), `source` that it can send audio (a phone).
@@ -768,7 +776,8 @@ Deletes the saved file; the next boot uses the image defaults. Bluetooth pairing
 `{"ok": true}` also when nothing was saved, 500 when the file could not be removed.
 
 ### `POST /api/system/reboot` · `POST /api/system/shutdown`
-Answers `{"ok":true}`, then runs `systemctl reboot` / `poweroff`. Disabled in a simulated run (403).
+Answers `{"ok":true}`, then runs `systemctl reboot` / `poweroff`. Disabled in a simulated run and
+on a desktop (board.json's `desktop`, as on a PC): 403.
 Shutdown exists because a power cut during a `/data` save can corrupt the card.
 
 ### `POST /api/system/inject-kmsg`

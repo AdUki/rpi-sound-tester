@@ -66,6 +66,39 @@ To feed it from another machine, build the ALSA plugin there (`make plugin plugi
 `aplay -D soundtester:<host> file.wav`; it lands on a network input. The plugin is documented in
 [docs/api.md](docs/api.md), *Network inputs*.
 
+## Run it on a PC
+
+The same daemon also runs for real on a Linux desktop, with no Yocto and no simulated card: built
+with the host's compiler, paced by a timer, playing to and recording from the desktop's PipeWire.
+
+```sh
+make pc-deps              # the -dev packages (Debian/Ubuntu), once
+make pc                   # http://localhost:8080
+make pc BT=hci1           # ...with Bluetooth on adapter hci1 (or its address)
+make pc BT=ask            # ...asking which; make pc-bt-adapters lists them
+make pc BT=fake           # ...with the fake BlueZ (two adapters), no radio needed
+make pc INPUT=hw:2,0      # ...also recording from a card PipeWire does not run (SINK= to play to one)
+```
+
+PipeWire is not touched. The daemon is one more ALSA client of it (its `pipewire` PCM), listed as
+*PipeWire ALSA [soundtesterd]* in pavucontrol or `wpctl status`, where its output and input can be
+moved to any device; it never opens a sound card PipeWire runs (`app/config/boards/pc.json` has
+`"scan": false`). Recording from PipeWire's default source means the microphone is in use while it
+runs (`tools/pc/run --no-input` leaves it alone). Settings save to `~/.local/state/soundtester`;
+the console's reboot and shutdown buttons do nothing on a PC.
+
+**Bluetooth** wants an adapter the desktop is not using, e.g. a USB dongle next to the built-in
+radio. Set it up once with `make pc-bt-setup`: it unpacks bluez-alsa under
+`~/.local/share/soundtester` (apt-get download — nothing installed, no service enabled) and, with
+sudo, adds one D-Bus policy, `/etc/dbus-1/system.d/soundtester-bluealsa.conf`, so that you can run
+it (`make pc-bt-remove` takes both out). `make pc BT=hci1` then starts bluez-alsa for that adapter
+alone and stops it with the daemon; the console's Bluetooth tab pairs and connects on hci1 only.
+Two things still clash with PipeWire, which registers its own audio endpoints on every adapter:
+a device that connects to hci1 may end up with PipeWire rather than the tester (disconnect it in
+the desktop's Bluetooth settings and connect it from the console again), and while the tester runs
+it is BlueZ's default pairing agent, so it refuses pairings a device starts towards the desktop's
+adapter (pairing from the desktop's own Bluetooth settings still works).
+
 ## Build the image
 
 `BOARD=` picks the hardware: `rpi3` (Raspberry Pi 3 with the Octo, the default) or `vim3l` (Khadas
@@ -173,7 +206,8 @@ app/            C++17 daemon + vanilla-JS web console (no build step)
   third_party/  submodules: cpp-httplib, pocketfft, nlohmann/json, spdlog, CLI11
                 (header-only, pinned at a tag — pocketfft at a commit, it has no tags)
 alsa-plugin/    the sender: an ALSA PCM + mixer plugin for any Linux machine
-tools/          md2html (renders docs/api.md for GET /api), fake-bluez (BlueZ for make run BT=fake)
+tools/          md2html (renders docs/api.md for GET /api), fake-bluez (BlueZ for make run BT=fake),
+                pc (make pc: run, Bluetooth setup and adapter list on a desktop)
 yocto/
   meta-soundtester/   layer: images, app recipe, wic layouts; BSP-specific parts (the pinned
                       Pi kernel) under dynamic-layers/<bsp>/
