@@ -171,9 +171,10 @@ const dbToLin = db => Math.pow(10, db / 20);
 let monitorDb = 0;
 
 // How far ahead of real time the browser schedules monitor audio: the playback buffer. A bigger
-// buffer rides out a jittery link (fewer of the late re-anchors connWatch flags) but adds that
-// much delay between the device and what you hear. Configurable from the dashboard.
-const MON_LAT_MIN_MS = 50, MON_LAT_MAX_MS = 500;
+// buffer rides out a jittery link (fewer of the late chunks connWatch flags) but adds that much
+// delay between the device and what you hear. A buffer longer than the link's stalls (a VPN that
+// drops out for a few seconds) plays straight through them. Configurable from the dashboard.
+const MON_LAT_MIN_MS = 50, MON_LAT_MAX_MS = 5000;
 let monLatency = 0.15;   // seconds
 
 // Listen codec. PCM (raw S16) is the wire default and the always-available fallback; Opus is
@@ -193,6 +194,7 @@ const monitor = {
   master: null,    // monitor volume, applied to the summed mix
   anchorN: null,   // capture sample mapped to anchorT on the context clock
   anchorT: 0,
+  lastLate: -Infinity,   // context time of the last late chunk, so one stall is one dropout
 
   ensure() {
     if (!this.ctx) {
@@ -212,28 +214,62 @@ const monitor = {
     rampGain(this.master, dbToLin(db));
   },
 
-  // Absolute capture sample -> context play time. Chunks are scheduled monLatency ahead of real
-  // time (the playback buffer). When the mapped time falls outside its window — a late chunk, a
-  // ring lap, or capture/DAC clock drift finally accumulating — the anchor shifts for EVERY stream
-  // at once: one brief glitch on all channels, and they come out the other side still aligned with
-  // each other. A per-stream recovery would not. The upper bound tracks the buffer so a larger
-  // buffer is not itself mistaken for a discontinuity.
-  timeFor(sample) {
+  // Absolute capture sample -> context play time for listener `li`'s chunk, or null to drop it.
+  // Chunks are scheduled monLatency ahead of real time (the playback buffer).
+  //
+  // A chunk mapped into the past (or barely ahead) arrived too late to play. Usually that is a
+  // stalled link: TCP holds everything sent during the stall and then delivers it in one burst,
+  // oldest first. Those chunks are dropped, not re-timed. Once the burst catches up, the stream
+  // carries on at the same anchor and the same latency, so the stall is heard as a gap. Re-timing
+  // the backlog instead would stack seconds of audio on top of what is already queued, which is
+  // heard as a loud burst of noise.
+  //
+  // The anchor only moves when it has to, and then for EVERY stream at once: when a stream stays
+  // late and is not catching up (the link's delay grew, or the capture and DAC clocks drifted
+  // apart by a buffer's worth), or when a chunk maps past the buffer (a capture discontinuity).
+  // Everything already queued is stopped first, so a re-anchor is one short gap on all channels
+  // that come out of it still aligned with each other. A per-stream recovery would not be.
+  timeFor(sample, li) {
     const now = this.ctx.currentTime;
     if (this.anchorN === null) {
       this.anchorN = sample;
       this.anchorT = now + monLatency;
     }
-    let t = this.anchorT + (sample - this.anchorN) / rate;
-    if (t < now + 0.02 || t > now + monLatency + 0.45) {
-      // A chunk mapped into the past (or barely ahead) arrived too late to schedule — that is the
-      // link falling behind, the one re-anchor cause we can pin on the connection. A far-future
-      // map is a capture discontinuity or a start-up burst, so it re-anchors silently.
-      if (t < now + 0.02) connWatch.drop();
-      this.anchorT += (now + monLatency) - t;
-      t = now + monLatency;
+    const t = this.anchorT + (sample - this.anchorN) / rate;
+    if (t > now + monLatency + 0.45) {
+      this.reanchor(sample, now);
+      return now + monLatency;
     }
-    return t;
+    if (t >= now + 0.02) {
+      li.late = null;
+      return t;
+    }
+
+    // Late. A burst replays a whole stall; it counts as one dropout, not one per chunk.
+    if (now - this.lastLate > 0.5) connWatch.drop();
+    this.lastLate = now;
+    const late = now - t;
+    // Catching up means the lateness falls by at least 10% of the time spent waiting for it.
+    if (!li.late || late < li.late.late - 0.05) {
+      if (!li.late || now - li.late.t >= 0.5) li.late = {t: now, late};
+      return null;
+    }
+    if (now - li.late.t < 0.5) return null;
+    this.reanchor(sample, now);
+    return now + monLatency;
+  },
+
+  // Drop everything queued, then map `sample` to a full buffer ahead of `now`.
+  reanchor(sample, now) {
+    this.flush(now);
+    this.anchorN = sample;
+    this.anchorT = now + monLatency;
+  },
+
+  // Drop everything queued; the next chunk to arrive sets a fresh anchor.
+  flush(now) {
+    for (const l of listeners.values()) l.flush(now);
+    this.anchorN = null;
   },
 
   idle() {
@@ -242,14 +278,14 @@ const monitor = {
 };
 
 // A dropout you HEAR has two possible causes: the device's own xruns (already in the header) or a
-// slow / lossy link between this browser and the Sound Tester. The scheduler re-anchors — one
-// glitch across every channel — whenever a monitor chunk reaches us too late to play on time, and
-// a live listen socket closing on its own is the same story. Both are the link, not the device, so
+// slow / lossy link between this browser and the Sound Tester. Monitor audio reaching us too late
+// to play on time is the link, and a live listen socket closing on its own is the same story, so
 // they get their own banner. The count clears once the link has run clean for a few seconds.
 const connWatch = {
   count: 0,
   timer: null,
   drop(reason) {
+    noteNetDrop();
     this.count++;
     const b = $('connbanner');
     if (!b) return;
@@ -260,6 +296,20 @@ const connWatch = {
     this.timer = setTimeout(() => { this.count = 0; b.classList.add('hidden'); }, 6000);
   },
 };
+
+// The header's running tally of network dropouts since the page loaded: late monitor audio, a
+// listen socket lost, or the feed stalling. One stall usually trips several of those at once, so
+// anything within a few seconds of the last one is the same dropout.
+let netDrops = 0, netDropLast = -Infinity;
+function noteNetDrop() {
+  const now = performance.now();
+  if (now - netDropLast > 5000) netDrops++;
+  netDropLast = now;
+  const pill = $('netdrops');
+  pill.textContent = `net drops ${netDrops}`;
+  pill.className = 'pill warn';
+  pill.title = `Network dropouts since this page loaded; the last at ${new Date().toLocaleTimeString()}.`;
+}
 
 class Listener {
   constructor(ch) {
@@ -278,6 +328,8 @@ class Listener {
     this.taps.r.gain.value = 0;
     this.taps.l.connect(monitor.merger, 0, 0);
     this.taps.r.connect(monitor.merger, 0, 1);
+    this.srcs = new Set();   // chunks scheduled and not yet played out, so a flush can stop them
+    this.late = null;        // {t, late}: when this stream went late, and by how much (timeFor)
 
     if (this.codec === 'opus') this.connectOpus();
     else this.connect('pcm');
@@ -322,13 +374,24 @@ class Listener {
   }
 
   // Fed to both taps unconditionally; which ears actually hear it is the taps' gains. Scheduled
-  // on the shared timeline by the chunk's absolute capture index.
+  // on the shared timeline by the chunk's absolute capture index; a late chunk is dropped.
   schedule(ab, start) {
+    const t = monitor.timeFor(start, this);
+    if (t === null) return;
     const src = monitor.ctx.createBufferSource();
     src.buffer = ab;
     src.connect(this.taps.l);
     src.connect(this.taps.r);
-    src.start(monitor.timeFor(start));
+    src.onended = () => this.srcs.delete(src);
+    this.srcs.add(src);
+    src.start(t);
+  }
+
+  // Stop everything queued, so a new anchor never plays on top of the old one's audio.
+  flush(now) {
+    for (const s of this.srcs) { try { s.stop(now); } catch (e) { /* never started */ } }
+    this.srcs.clear();
+    this.late = null;
   }
 
   // Opus: [u64 capture index][raw Opus packet]. Decode to Float32 @ opusRate and schedule on the
@@ -346,6 +409,7 @@ class Listener {
   }
 
   onchunk(buf) {
+    if (this.closed) return;   // a message already in flight when the user stopped
     const ctx = monitor.ctx;
     const view = new DataView(buf);
     const start = Number(view.getBigUint64(0, true));
@@ -385,11 +449,12 @@ class Listener {
     // fresh Listener before this (old) socket's onclose fires a second stop(); without this guard
     // that late stop would evict the replacement.
     if (listeners.get(this.ch) === this) listeners.delete(this.ch);
-    // Up to ~150 ms of this channel is already scheduled. Fade it, then tear the nodes down:
-    // disconnecting immediately truncates that tail mid-waveform, which is a click.
+    // Up to a monitor buffer of this channel is already scheduled. Fade it, then tear the nodes
+    // down: disconnecting immediately truncates that tail mid-waveform, which is a click.
     this.setSide('l', false);
     this.setSide('r', false);
     setTimeout(() => {
+      this.flush(monitor.ctx.currentTime);
       try { this.taps.l.disconnect(); } catch (e) { /* already gone */ }
       try { this.taps.r.disconnect(); } catch (e) { /* already gone */ }
     }, RAMP_S * 1000 + 50);
@@ -445,29 +510,40 @@ function setMonitorLabel(db) {
 
 // Also survives a reload, for the same bench reason. Stored in ms because that is what the slider
 // and the readout speak; monLatency stays in seconds because that is what the scheduler speaks.
+// The slider is logarithmic: 50 ms to 5 s on a linear one would leave the low end, where a good
+// link wants to sit, a few pixels wide.
+const MON_LAT_STEPS = 1000;
+const latFromSlider = v => {
+  const ms = MON_LAT_MIN_MS * Math.pow(MON_LAT_MAX_MS / MON_LAT_MIN_MS, v / MON_LAT_STEPS);
+  return ms < 1000 ? Math.round(ms / 10) * 10 : Math.round(ms / 100) * 100;
+};
+const latToSlider = ms =>
+  Math.round(Math.log(ms / MON_LAT_MIN_MS) / Math.log(MON_LAT_MAX_MS / MON_LAT_MIN_MS) * MON_LAT_STEPS);
+
 function initMonitorLatency() {
   let ms = parseFloat(lsGet('monitor_latency_ms'));
   ms = Number.isFinite(ms) ? Math.min(MON_LAT_MAX_MS, Math.max(MON_LAT_MIN_MS, ms)) : 150;
   monLatency = ms / 1000;
 
   const sl = $('monlat');
-  sl.min = MON_LAT_MIN_MS;
-  sl.max = MON_LAT_MAX_MS;
-  sl.value = ms;
+  sl.min = 0;
+  sl.max = MON_LAT_STEPS;
+  sl.value = latToSlider(ms);
   setLatencyLabel(ms);
   sl.oninput = e => {
-    const v = parseFloat(e.target.value);
+    const v = latFromSlider(parseFloat(e.target.value));
     monLatency = v / 1000;
     setLatencyLabel(v);
     lsSet('monitor_latency_ms', String(v));
   };
-  // Apply the new buffer once, on release: dropping the anchor re-establishes the lead at the new
-  // depth on the next chunk. Doing it per input event would re-anchor once per pixel of the drag.
-  sl.onchange = () => { monitor.anchorN = null; };
+  // Apply the new buffer once, on release: the queued audio stops and the next chunk anchors
+  // at the new depth. Doing it per input event would re-anchor once per pixel of the drag, and
+  // only dropping the anchor would play the new timeline over the old one's queue.
+  sl.onchange = () => { if (monitor.ctx) monitor.flush(monitor.ctx.currentTime); };
 }
 
 function setLatencyLabel(ms) {
-  $('monlatv').textContent = `${Math.round(ms)} ms`;
+  $('monlatv').textContent = ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
 }
 
 // Listen codec + bitrate. PCM is always offered; Opus only when the daemon supports it at the
@@ -3334,6 +3410,24 @@ let feedStopped = false;
 let statePoll = null;   // 5 s /api/state poll handle
 let pingPoll = null;    // 1 s /api/pings/recent poll handle
 
+// A stalled link (a VPN dropping out for a few seconds) does not close the socket, so the pill
+// would say "connected" over a page that has stopped moving. The daemon pushes at least a system
+// message a second, so a quiet spell well past that is the link, and the pill says so.
+const FEED_STALL_MS = 1600;
+let feedLastMsg = 0;
+let feedStalled = false;
+setInterval(() => {
+  const stalled = !!feedWs && feedWs.readyState === WebSocket.OPEN &&
+                  performance.now() - feedLastMsg > FEED_STALL_MS;
+  if (stalled === feedStalled) return;
+  feedStalled = stalled;
+  if (stalled) noteNetDrop();
+  $('conn').textContent = stalled ? 'stalled' : 'connected';
+  $('conn').className = stalled ? 'pill warn' : 'pill good';
+  $('conn').title = stalled ? 'Nothing has arrived from the Sound Tester for a while: the network '
+                              + 'link is stalled. The page catches up once it recovers.' : '';
+}, 250);
+
 function connect() {
   if (feedStopped) return;   // a queued reconnect must not reopen a feed the user paused
   if (feedWs) return;        // never run two sockets at once (e.g. a rapid re-toggle)
@@ -3342,12 +3436,15 @@ function connect() {
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
+    feedLastMsg = performance.now();
     $('conn').textContent = 'connected';
     $('conn').className = 'pill good';
     sendTelemetryMask();   // re-apply the input mask after every (re)connect, incl. a daemon restart
   };
   ws.onclose = () => {
     feedWs = null;
+    feedStalled = false;
+    $('conn').title = '';
     if (feedStopped) {   // deliberately closed by the Pause-feed toggle — stay closed
       $('conn').textContent = 'paused';
       $('conn').className = 'pill warn';
@@ -3358,6 +3455,7 @@ function connect() {
     setTimeout(connect, 1000);
   };
   ws.onmessage = e => {
+    feedLastMsg = performance.now();
     if (e.data instanceof ArrayBuffer) { onEnvelope(e.data); return; }
     const msg = JSON.parse(e.data);
     if (msg.type === 'meters') onMeters(msg);

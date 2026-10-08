@@ -15,6 +15,7 @@
     <span id="conn" class="pill bad">connecting</span>
     <span id="engine" class="pill"></span>
     <span id="xruns" class="pill"></span>
+    <span id="netdrops" class="pill good" title="Network dropouts since this page loaded.">net drops 0</span>
     <span id="cpu" class="pill"></span>
   </div>
 </header>
@@ -43,8 +44,8 @@
   <strong>Monitor audio is dropping out over the connection.</strong>
   <span id="conntext"></span>
   The audio is reaching this browser too late to play cleanly — the cause is the network between
-  your browser and the Sound Tester, not the device under test. Move closer to the access point or
-  use a wired connection. The meters, THD+N and the scope read the device directly and are
+  your browser and the Sound Tester, not the device under test. Raise the Monitor buffer past the
+  length of the stalls, move closer to the access point, or use a wired connection. The meters, THD+N and the scope read the device directly and are
   unaffected.
 </div>
 <!-- A device pairing with this one is waiting for an answer. On every tab, because the question
@@ -97,12 +98,14 @@
 
   <div class="monitor">
     <span class="mlabel">Monitor buffer</span>
-    <input type="range" id="monlat" step="10">
+    <input type="range" id="monlat" step="1">
     <span id="monlatv" class="mono val">150 ms</span>
     <span class="muted small mnote">
       How far ahead the browser queues the monitor audio before playing it. A larger buffer rides
       out a jittery link and clears the connection dropouts flagged above, at the cost of that much
-      more delay between the device and what you hear. It changes nothing that is measured; the
+      more delay between the device and what you hear. Over a link that stalls for seconds at a
+      time (a VPN), a buffer longer than the stall plays straight through it; a shorter one goes
+      quiet for the stall and picks up again. It changes nothing that is measured; the
       device never hears it.
     </span>
   </div>
