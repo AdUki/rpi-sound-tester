@@ -609,7 +609,9 @@ function clearSpectrumCanvas(ch) {
 // placeholder, blank the spectrum, disable the Listen buttons and drop any live listen stream.
 function applyInputEnabled(ch) {
   const on = inputEnabled[ch];
-  const card = document.querySelector(`#inputs .card:nth-child(${ch + 1})`);
+  // By id: network cards are in a grid of their own and device inputs follow them in the ring, so
+  // neither sits at position ch of #inputs.
+  const card = $('card' + ch);
   if (card) card.classList.toggle('disabled', !on);
   const cb = $('en' + ch);
   if (cb) cb.checked = on;
@@ -630,16 +632,20 @@ function applyInputEnabled(ch) {
     delete barState[ch];
     clearSpectrumCanvas(ch);
   }
+  if (card) syncAllBox(card.parentElement);
   scopeDirty = true;
 }
 
-// One entry point for both checkbox sets (dashboard #en, scope #lane): flip the state, persist it,
-// reflect it everywhere (applyInputEnabled ticks both twins), refetch the frozen scope without the
-// dropped lane, and tell the daemon.
-function setInputEnabled(ch, on) {
-  inputEnabled[ch] = on;
+// One entry point for both checkbox sets (dashboard #en, scope #lane) and a section's "all" box:
+// flip the state of one channel or a list of them, persist it, reflect it everywhere
+// (applyInputEnabled ticks both twins), refetch the frozen scope without the dropped lanes, and
+// tell the daemon — once, however many channels changed.
+function setInputEnabled(chs, on) {
+  [].concat(chs).forEach(ch => {
+    inputEnabled[ch] = on;
+    applyInputEnabled(ch);
+  });
   saveInputEnabled();
-  applyInputEnabled(ch);
   syncDelaySelects();
   invalidateWindows();
   sendTelemetryMask();
@@ -653,12 +659,47 @@ function sendTelemetryMask() {
   post('/telemetry/inputs', {enabled: inputEnabled.slice()}).catch(() => { /* best effort */ });
 }
 
+// A section heading's box ticks or clears every box of its kind in the grid under it — an input
+// section's enables, an output section's mutes — and reads half-ticked when they disagree. Its id
+// is the grid's plus "all"; the boxes it stands for carry the class `secbox`, and a hidden card's
+// (an unused network channel) are left out.
+const sectionBoxes = grid => [...grid.querySelectorAll('.card:not([hidden]) input.secbox')];
+
+function syncAllBox(grid) {
+  const all = grid && $(grid.id + 'all');
+  if (!all) return;
+  const boxes = sectionBoxes(grid);
+  const n = boxes.filter(b => b.checked).length;
+  setAttr(all, 'checked', boxes.length > 0 && n === boxes.length);
+  setAttr(all, 'indeterminate', n > 0 && n < boxes.length);
+  setAttr(all, 'disabled', !boxes.length);
+}
+
+// Inputs flip in one go; anything else by firing each box's own change handler, so the section
+// does exactly what ticking its boxes one by one would.
+function wireAllBox(grid) {
+  const all = $(grid.id + 'all');
+  if (!all) return;
+  all.onchange = e => {
+    const on = e.target.checked;
+    const boxes = sectionBoxes(grid).filter(b => b.checked !== on);
+    if (boxes.length && boxes[0].id.startsWith('en')) {
+      setInputEnabled(boxes.map(b => parseInt(b.id.slice(2), 10)), on);
+    } else {
+      boxes.forEach(b => { b.checked = on; b.dispatchEvent(new Event('change')); });
+    }
+    syncAllBox(grid);
+  };
+  syncAllBox(grid);
+}
+
 function buildInputs() {
   loadInputEnabled();
   // A daemon built before input gain existed sends no gain_db; render no slider rather than
   // a control wired to a 404.
   const hasGain = state.inputs.length && state.inputs[0].gain_db !== undefined;
   const hasMute = !!(state.limits && state.limits.input_mute);
+  const canForget = !!(state.limits && state.limits.net_forget);
   $('gainnote').classList.toggle('hidden', !hasGain);
 
   // Rendered for every ring channel, then shown or hidden by applyNetAvailability(); an unused
@@ -667,10 +708,13 @@ function buildInputs() {
   const card = i => `
     <div class="card" id="card${i.ch}"${inputAvailable(i.ch) ? '' : ' hidden'}>
       <div class="chan-head">
-        <label class="en" title="Enable / disable this input"><input type="checkbox"
+        <label class="en" title="Enable / disable this input"><input type="checkbox" class="secbox"
           id="en${i.ch}" ${inputEnabled[i.ch] ? 'checked' : ''}></label>
         <span class="chan-name">${inputLabel(i.ch)}${i.name ? ' — ' + esc(i.name) : ''}</span>
         <span class="listen-grp">
+          ${canForget && isNetInput(i.ch) ? `<button id="netrm${i.ch}" class="lbtn netrm"
+            title="Nothing is sending on this channel: take it off the console"
+            aria-label="Remove" hidden>✕</button>` : ''}
           <button id="listenL${i.ch}" class="lbtn">Listen L</button>
           <button id="listenR${i.ch}" class="lbtn">Listen R</button>
         </span>
@@ -694,12 +738,14 @@ function buildInputs() {
   $('inputs').innerHTML = state.inputs.filter(i => !isNetInput(i.ch)).map(card).join('');
   $('netinputs').innerHTML = state.inputs.filter(i => isNetInput(i.ch)).map(card).join('');
   syncNetSection();
+  syncNetRemove();
 
   state.inputs.forEach(i => {
     const c = i.ch;
     $('listenL' + c).onclick = () => toggleListen(c, 'l');
     $('listenR' + c).onclick = () => toggleListen(c, 'r');
     $('en' + c).onchange = e => setInputEnabled(c, e.target.checked);
+    if ($('netrm' + c)) $('netrm' + c).onclick = () => forgetNetChannel(c - NET_BASE);
     applyInputEnabled(c);   // reflect the persisted state on this fresh card
     // By id, not by position: the network cards live in their own grid, so an index into
     // #inputs stopped meaning channel c the moment they moved out of it.
@@ -721,6 +767,8 @@ function buildInputs() {
     };
     applyInputBypass(i);
   });
+  wireAllBox($('inputs'));
+  wireAllBox($('netinputs'));
 }
 
 // `mixer off` on the sender: the device plays that stream exactly as it arrived, so the gain and
@@ -817,7 +865,7 @@ function buildOutputCards(el, outs, p, label, path) {
       <label>Source <select id="${p}src${o.ch}" class="outsrc">${optsFor(sourceValue(o.source))}</select></label>
       <label>Gain <input type="range" id="${p}gain${o.ch}" min="-60" max="0" step="0.5">
         <span id="${p}gainv${o.ch}" class="mono val"></span> dB</label>
-      <label><input type="checkbox" id="${p}mute${o.ch}"> Mute</label>
+      <label><input type="checkbox" class="secbox" id="${p}mute${o.ch}"> Mute</label>
     </div>`).join('');
 
   outs.forEach(o => {
@@ -845,10 +893,13 @@ function buildOutputCards(el, outs, p, label, path) {
       $(p + 'gainv' + c).textContent = parseFloat(e.target.value).toFixed(1);
       put(`${path}/${c}`, {gain_db: parseFloat(e.target.value)}).catch(err => toast(err.message));
     };
-    $(p + 'mute' + c).onchange = e =>
+    $(p + 'mute' + c).onchange = e => {
+      syncAllBox(el);
       put(`${path}/${c}`, {mute: e.target.checked}).catch(err => toast(err.message));
+    };
     $(p + 'id' + c).onclick = () => post(`${path}/${c}/identify`).catch(err => toast(err.message));
   });
+  wireAllBox(el);
 }
 
 function buildOutputs() {
@@ -916,7 +967,9 @@ function buildSinks() {
   sinks = list.map(sinkDesc);
   $('sinks').innerHTML = sinks.map(k => `
     <div id="${k.k}sec">
-      <h2>${k.title} <span class="muted small mono">${esc(k.id)}</span></h2>
+      <h2>${k.title} <span class="muted small mono">${esc(k.id)}</span>
+        <label class="allbox" title="Mute or unmute every channel of this output"><input
+          type="checkbox" id="${k.k}outsall"> mute all</label></h2>
       <div class="socbar">
         <label class="socon"><input type="checkbox" id="${k.k}on"> On</label>
         <span id="${k.k}state" class="pill">off</span>
@@ -1031,6 +1084,7 @@ function syncSinkCards(sink, h) {
     if (idle(src)) setAttr(src, 'value', sourceValue(o.source));
     if (idle(mute)) setAttr(mute, 'checked', !!o.mute);
   });
+  syncAllBox($(sink.k + 'outs'));
 }
 
 // Which device a sink is playing to, where that is not obvious: the Bluetooth output names its
@@ -1223,23 +1277,52 @@ function refreshPings() {
 // Shows or hides the network channels to match what the daemon reports. Cards are built once and
 // toggled rather than re-rendered: rebuilding would tear down the listen buttons and the spectrum
 // canvases of every input on the page each time a sender came or went.
-function applyNetAvailability(active) {
+function applyNetAvailability(active, connected) {
+  if (Array.isArray(connected)) {
+    connected.forEach((on, i) => { netConnected[i] = !!on; });
+    syncNetRemove();
+  }
   if (!Array.isArray(active)) return;
   let changed = false;
   for (let i = 0; i < active.length; i++) {
     if (netAvailable[i] !== !!active[i]) { netAvailable[i] = !!active[i]; changed = true; }
   }
-  if (!changed) return;
+  if (changed) showNetChannels();
+}
+
+function showNetChannels() {
   for (let c = NIN_LOCAL; c < NIN; c++) {
     const el = $('card' + c);
     if (el) el.hidden = !inputAvailable(c);
     const lane = $('lanewrap' + c);
     if (lane) lane.hidden = !inputAvailable(c);
   }
+  syncAllBox($('netinputs'));
   syncNetSection();
   syncDelaySelects();          // the xcorr pair pickers follow shownInputs()
   refreshOutputSourceOptions();  // a routable NET source appears or goes
   scopeDirty = true;
+}
+
+// Which network channels have a sender on them right now, from the 1 Hz system frame. Only a
+// channel without one can be removed.
+const netConnected = [];
+
+function syncNetRemove() {
+  for (let i = 0; i < NIN - NET_BASE; i++) {
+    const b = $('netrm' + (NET_BASE + i));
+    if (b) setAttr(b, 'hidden', netConnected[i] !== false);
+  }
+}
+
+// Takes a network channel nobody is sending on off the console: the daemon forgets it was ever
+// used, and its card, lane and source entries go until a sender uses it again. Its routing stays.
+function forgetNetChannel(i) {
+  api(`/net/channels/${i}`, {method: 'DELETE'}).then(() => {
+    netAvailable[i] = false;
+    showNetChannels();
+    if (tabActive('net')) refreshNet();
+  }).catch(err => toast(err.message));
 }
 
 // Re-offers the source lists without rebuilding the output cards. buildOutputs() would redraw
@@ -1329,6 +1412,7 @@ function refreshNet() {
     }
     renderNetSnippet();
 
+    const forget = !!state.limits.net_forget;
     $('netchans').innerHTML = n.channels.map(c => {
       const label = `NET ${c.channel + 1}`;
       // Who is on it, or — once they have gone — who was, since the channel is kept for them and
@@ -1344,9 +1428,12 @@ function refreshNet() {
       // Drops are the number that matters: frames arriving after their slot has played cannot be
       // placed anywhere truthful, so they are discarded rather than shifted.
       const drops = c.late_drops + c.range_drops;
+      const removable = forget && !c.connected && (c.last_device || c.frames_received);
       return `<div class="card">
         <div class="chan-head"><span class="chan-name">${label}</span>
-          <span class="muted small">route as <span class="mono">index ${c.input}</span></span></div>
+          <span class="muted small">route as <span class="mono">index ${c.input}</span></span>
+          ${removable ? `<button class="netrm" data-ch="${c.channel}"
+            title="Nothing is sending on this channel: take it off the console">Remove</button>` : ''}</div>
         <div class="small">${state_}</div>
         <div class="readout small">
           <span class="mono">${(c.frames_received / (rate || 96000)).toFixed(1)} s received</span>
@@ -1358,6 +1445,9 @@ function refreshNet() {
         </div>
       </div>`;
     }).join('');
+    $('netchans').querySelectorAll('button.netrm').forEach(b => {
+      b.onclick = () => forgetNetChannel(parseInt(b.dataset.ch, 10));
+    });
   }).catch(() => { /* the poll retries */ });
 }
 
@@ -3206,7 +3296,7 @@ function onSpectrum(msg) {
 }
 
 function onSystem(s) {
-  applyNetAvailability(s.net_active);
+  applyNetAvailability(s.net_active, s.net_connected);
   setText($('xruns'), `xruns ${s.xruns}`);
   setClass($('xruns'), 'pill ' + (s.xruns ? 'warn' : 'good'));
   setText($('cpu'), `cpu ${s.cpu_pct.toFixed(0)}%` + (s.temp_c > 0 ? ` · ${s.temp_c.toFixed(0)}°C` : ''));

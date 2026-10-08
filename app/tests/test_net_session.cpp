@@ -351,6 +351,37 @@ struct AudioThread {
   std::vector<float> live, ring;
 };
 
+// A channel a sender has been and gone from stays on the console until it is taken away; one with
+// a sender on it cannot be.
+void test_a_free_channel_can_be_forgotten() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  {
+    Sender tx(net, static_cast<unsigned>(kRate));
+    const std::vector<float> chunk(kNetPacketFrames, 0.25f);
+    const uint64_t reader = 40 * kTestPeriod;
+    NetTestAccess::distribute(tx.s, chunk.data(), chunk.size(), reader + 4 * kTestPeriod, reader,
+                              static_cast<uint64_t>(kRate * kNetTimelineMs / 2000.0));
+    CHECK(net.channel_connected(0));
+    CHECK(!net.forget_channel(0));
+    CHECK(net.channel_in_use(0));
+    net.release_channels(0, 1);
+  }
+  CHECK(!net.channel_connected(0));
+  CHECK(net.channel_in_use(0));  // gone, but it left audio behind
+  CHECK(net.forget_channel(0));
+  CHECK(!net.channel_in_use(0));
+  CHECK(!net.channel_connected(0));
+  CHECK_EQ(net.status()[0].frames_received, 0u);
+  CHECK(net.status()[0].last_device.empty());
+  CHECK(!net.forget_channel(kNetInputs));
+  // Nor is a returning sender steered back to it: it takes the lowest free channel instead.
+  CHECK_EQ(net.claim_channels(2, "10.0.0.9", 1), 2);
+  net.release_channels(2, 1);
+  CHECK(net.forget_channel(2));
+  CHECK_EQ(net.claim_channels(kNetInputs, "10.0.0.9", 1), 0);
+}
+
 // A packet has to land two blocks ahead of where the audio thread is reading, or it is dropped as
 // late: the reader could otherwise reach its frames while they are still being written. The blocks
 // are the period the server was built with, so the guard follows it; main() builds it with the
@@ -538,6 +569,7 @@ int main() {
   test_an_in_process_sender_is_labelled_as_such();
   test_a_feed_lands_the_delay_ahead_of_playout();
   test_a_channel_is_only_in_use_once_it_has_been();
+  test_a_free_channel_can_be_forgotten();
   test_a_mixer_follows_its_sender_onto_the_whole_run();
   test_a_pinned_mixer_stays_on_its_channel();
   test_a_packet_must_clear_the_guard();

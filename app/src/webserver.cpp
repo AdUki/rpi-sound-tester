@@ -682,6 +682,7 @@ void WebServer::install_routes() {
           {"net_delay_min_ms", kNetDelayMinMs},
           {"net_delay_max_ms", kNetDelayMaxMs},
           {"net", true},
+          {"net_forget", true},
           {"bluetooth", d_.bt.status().running},
           {"pinned_mb", (d_.ring.pinned_bytes() + d_.capture.pinned_bytes() +
                          d_.devices.pinned_bytes()) /
@@ -1279,6 +1280,16 @@ void WebServer::install_routes() {
                         {"error", d_.net.last_error()}});
   }));
 
+  // Takes a channel nobody is sending on off the console. Its ring column keeps whatever audio
+  // was in it; it is only no longer shown, and no longer kept for the machine that used it.
+  svr.Delete("/api/net/channels/:n", [this](const httplib::Request& req,
+                                           httplib::Response& res) {
+    unsigned c;
+    if (!parse_index(req, "n", kNetInputs, &c)) return send_error(res, 404, "no such channel");
+    if (!d_.net.forget_channel(c)) return send_error(res, 409, "a sender is on this channel");
+    send_ok(res);
+  });
+
   svr.Post("/api/capture/freeze", [this](const httplib::Request&, httplib::Response& res) {
     const CaptureStatus cs = d_.capture.freeze(d_.engine.stats().generation);
     if (!cs.frozen) return send_error(res, 503, "not enough captured audio to freeze yet");
@@ -1830,9 +1841,14 @@ void WebServer::run_publisher() {
       if (have_clients) {
         const EngineStats es = d_.engine.stats();
         json net_active = json::array();
-        for (unsigned c = 0; c < kNetInputs; ++c) net_active.push_back(d_.net.channel_in_use(c));
+        json net_connected = json::array();
+        for (unsigned c = 0; c < kNetInputs; ++c) {
+          net_active.push_back(d_.net.channel_in_use(c));
+          net_connected.push_back(d_.net.channel_connected(c));
+        }
         json j{{"type", "system"},
                {"net_active", net_active},
+               {"net_connected", net_connected},
                {"xruns", es.xruns},
                {"generation", es.generation},
                {"sync_errors", d_.kmsg.sync_errors()},

@@ -1036,6 +1036,43 @@ bool NetAudioServer::channel_in_use(unsigned c) const {
          ch.frames_received.load(std::memory_order_relaxed) != 0;
 }
 
+bool NetAudioServer::channel_connected(unsigned c) const {
+  return c < kNetInputs && chans_[c]->claimed.load(std::memory_order_relaxed);
+}
+
+bool NetAudioServer::forget_channel(unsigned c) {
+  if (c >= kNetInputs) return false;
+  Channel& ch = *chans_[c];
+  // Held as a claim while it is cleared, so a sender arriving meanwhile is given another channel
+  // rather than one being wiped under it.
+  bool expected = false;
+  if (!ch.claimed.compare_exchange_strong(expected, true)) return false;
+  ch.timeline.reset();
+  ch.frames_received.store(0);
+  ch.late_drops.store(0);
+  ch.range_drops.store(0);
+  ch.underruns.store(0);
+  ch.resyncs.store(0);
+  ch.last_target.store(0);
+  ch.lead_avg.store(0);
+  ch.lead_valid.store(false);
+  ch.peak_milli.store(0);
+  {
+    std::lock_guard<std::mutex> lock(ch.m);
+    ch.peer.clear();
+    ch.name.clear();
+    ch.host.clear();
+    ch.transport = "net";
+    ch.last_ip.clear();
+    ch.last_device.clear();
+    ch.stream_base = 0;
+    ch.stream_count = 1;
+    ch.stream_index = 1;
+  }
+  ch.claimed.store(false);
+  return true;
+}
+
 std::vector<NetChannelStatus> NetAudioServer::status() const {
   std::vector<NetChannelStatus> out;
   out.reserve(kNetInputs);

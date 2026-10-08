@@ -164,6 +164,12 @@ main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
 /* Per-input enable checkbox at the head of the card. Unchecking dims the body and stops the page
    rendering that input; the head stays crisp so the control and the name are always readable. */
 .chan-head .en { flex: 0 0 auto; display: inline-flex; align-items: center; margin: 0; cursor: pointer; }
+.chan-head .netrm { flex: 0 0 auto; }
+/* A section heading's box for every card under it: read as a control, not as more heading. */
+h2 .allbox { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0 0 0 0.75rem;
+  font-size: 0.8rem; font-weight: normal; text-transform: none; letter-spacing: normal;
+  color: var(--fg); cursor: pointer; vertical-align: middle; }
+h2 .allbox input { margin: 0; }
 .card.disabled .meter,
 .card.disabled .readout,
 .card.disabled canvas.mini,

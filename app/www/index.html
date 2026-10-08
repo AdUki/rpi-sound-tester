@@ -68,7 +68,8 @@
 <main>
 
 <section id="dash" class="panel active">
-  <h2>Inputs</h2>
+  <h2>Inputs <label class="allbox" title="Enable or disable every input in this section"><input
+    type="checkbox" id="inputsall"> all</label></h2>
   <p class="muted small">
     <strong>Listen L</strong> / <strong>Listen R</strong> send an input to that ear — press both
     to hear it centred, none to stop it. Inputs sharing an ear are summed at unity, so several
@@ -129,7 +130,8 @@
        rather than from the card's ADCs, they come and go, and the thing an operator most needs
        to know about them is that they nonetheless share one sample axis with the inputs above. -->
   <div id="netsec" hidden>
-    <h2>Network inputs</h2>
+    <h2>Network inputs <label class="allbox" title="Enable or disable every network input shown"><input
+      type="checkbox" id="netinputsall"> all</label></h2>
     <p class="muted small">Sent over the network by a machine running the
       <span class="mono">soundtester</span> ALSA plugin, or played to the device over Bluetooth.
       They sit on the same sample axis as the inputs above, so a delay measured between a network
@@ -140,7 +142,8 @@
 
   <!-- The engine card's own outputs: the Octo's DACs. A board without one has none. -->
   <div id="outsec">
-    <h2>Outputs</h2>
+    <h2>Outputs <label class="allbox" title="Mute or unmute every output"><input
+      type="checkbox" id="outputsall"> mute all</label></h2>
     <div id="outputs" class="grid"></div>
   </div>
 

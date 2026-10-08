@@ -71,7 +71,7 @@ stream).
   `listen_default_codec`, `listen_bitrate_kbps`, `listen_bitrate_min_kbps`,
   `listen_bitrate_max_kbps`, `opus_rate`; network input: `net_port`, `net_delay_ms`,
   `net_delay_min_ms`, `net_delay_max_ms`; feature flags: `channel_map`, `sync_watch` and `bluetooth`
-  as above; `capture_config`, `input_mute`, `telemetry_mask` and `net` are always true, so a console
+  as above; `capture_config`, `input_mute`, `telemetry_mask`, `net` and `net_forget` are always true, so a console
   can tell an older daemon by their absence.
 
 ## Inputs
@@ -540,7 +540,7 @@ setup packets travel once, before any audio.
 A network channel's ring slot is permanent, because the ring is one pinned allocation and because
 a freeze taken after the sender disconnected still has to be analysable. What is dynamic is
 whether the console shows it: `active` goes true when a sender first uses the channel and stays
-true for the rest of the session.
+true for the rest of the session, or until `DELETE /api/net/channels/{n}` takes it away.
 
 Only playback into the device is supported; there is no capture direction yet. A Bluetooth phone
 lands on these channels too, through `PUT /api/bluetooth/input`, and is reported here like a
@@ -572,6 +572,11 @@ slid forward: playing them late would put the audio at the wrong place on the ax
 one thing this device must not do. A steady count means the network cannot keep up with `delay_ms`
 — raise it. `range_drops` means the sender aimed outside the buffer entirely, and `underruns` means
 the sender stopped supplying audio before its slot came round.
+
+### `DELETE /api/net/channels/{0-5}`
+Forgets a channel no sender is on: `active` goes false, its counters and `last_device` are cleared,
+and a returning sender is no longer steered back to it. Its routing is left as it is, and so is the
+audio already in its ring column. A sender on the channel is a 409; check `limits.net_forget`.
 
 ### Rates, formats and multi-channel senders
 A sender asks for `channels` (default 1, at most 6) and gets that many **adjacent** inputs — a
@@ -740,7 +745,7 @@ precision. Unlike the meters, the WS spectrum leaves out the inputs `POST /api/t
 turned off.
 
 The `system` message carries `net_active` (one bool per network channel, `active` of
-`GET /api/state`), `xruns`, `generation`, `sync_errors`, `listen_streams`, `engine_running`, the
+`GET /api/state`), `net_connected` (one per network channel, `connected` of `GET /api/net`), `xruns`, `generation`, `sync_errors`, `listen_streams`, `engine_running`, the
 host fields of `system` in `GET /api/state` (`cpu_pct`, `cpu_cores`, `temp_c`, `uptime_s`, `mem`,
 `throttle`), `sinks[]` {`id`, `present`, `enabled`, `playing`, `layout`, `latency_ms`, `trim_ppm`,
 `xruns`, `resyncs`, `error`}, `sources[]` {`id`, `first`, `channels`, `present`, `capturing`,

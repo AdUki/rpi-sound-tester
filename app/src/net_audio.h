@@ -205,6 +205,12 @@ class NetAudioServer {
   // has been and gone leaves audio in the ring, and a freeze taken after it disconnected has to
   // stay analysable. A channel nobody has ever used stays out of the way entirely.
   bool channel_in_use(unsigned c) const;
+  // A sender is on the channel right now.
+  bool channel_connected(unsigned c) const;
+  // Puts a channel with no sender back as it was before anyone used it: out of channel_in_use(),
+  // its counters and whose it was forgotten, so a returning sender is no longer steered back to
+  // it. False, and nothing changed, while a sender is on it.
+  bool forget_channel(unsigned c);
   uint16_t port() const { return ctl_.net.port.load(); }
   bool listening() const { return listening_.load(); }
   std::string last_error() const;
