@@ -177,6 +177,13 @@ let monitorDb = 0;
 const MON_LAT_MIN_MS = 50, MON_LAT_MAX_MS = 5000;
 let monLatency = 0.15;   // seconds
 
+// How far ahead of playback a queued chunk becomes an audio node. The browser's audio thread walks
+// every scheduled node on each render quantum, played yet or not, so a 5 s buffer held as nodes
+// (~500 of them) costs enough per quantum to miss deadlines, which is heard as clicks. The rest of
+// the buffer waits in a plain queue. A tab playing audio is exempt from timer throttling, so the
+// pump below keeps well ahead of this.
+const NODE_LOOKAHEAD_S = 1.0;
+
 // Listen codec. PCM (raw S16) is the wire default and the always-available fallback; Opus is
 // opt-in per connection (?codec=opus) and decoded in the browser by the vendored WASM decoder,
 // which keeps channels sample-aligned exactly as PCM does (each chunk still carries its absolute
@@ -204,6 +211,8 @@ const monitor = {
       this.master.gain.value = dbToLin(monitorDb);   // the slider may have been moved before this
       this.merger.connect(this.master);
       this.master.connect(this.ctx.destination);
+      // Feeds the nodes during a stall too, when no chunk arrives to do it.
+      setInterval(() => { for (const l of listeners.values()) l.pump(); }, 100);
     }
     if (this.ctx.state === 'suspended') this.ctx.resume();
     return this.ctx;
@@ -328,6 +337,7 @@ class Listener {
     this.taps.r.gain.value = 0;
     this.taps.l.connect(monitor.merger, 0, 0);
     this.taps.r.connect(monitor.merger, 0, 1);
+    this.queue = [];         // [AudioBuffer, play time] not yet a node (NODE_LOOKAHEAD_S)
     this.srcs = new Set();   // chunks scheduled and not yet played out, so a flush can stop them
     this.late = null;        // {t, late}: when this stream went late, and by how much (timeFor)
 
@@ -378,19 +388,32 @@ class Listener {
   schedule(ab, start) {
     const t = monitor.timeFor(start, this);
     if (t === null) return;
-    const src = monitor.ctx.createBufferSource();
-    src.buffer = ab;
-    src.connect(this.taps.l);
-    src.connect(this.taps.r);
-    src.onended = () => this.srcs.delete(src);
-    this.srcs.add(src);
-    src.start(t);
+    this.queue.push([ab, t]);
+    this.pump();
+  }
+
+  // Turn queued chunks due within NODE_LOOKAHEAD_S into nodes. One whose time has already passed
+  // (the page was stalled that long) is dropped: started late it would play over the next one.
+  pump() {
+    const now = monitor.ctx.currentTime;
+    while (this.queue.length && this.queue[0][1] < now + NODE_LOOKAHEAD_S) {
+      const [ab, t] = this.queue.shift();
+      if (t < now + 0.005) continue;
+      const src = monitor.ctx.createBufferSource();
+      src.buffer = ab;
+      src.connect(this.taps.l);
+      src.connect(this.taps.r);
+      src.onended = () => this.srcs.delete(src);
+      this.srcs.add(src);
+      src.start(t);
+    }
   }
 
   // Stop everything queued, so a new anchor never plays on top of the old one's audio.
   flush(now) {
     for (const s of this.srcs) { try { s.stop(now); } catch (e) { /* never started */ } }
     this.srcs.clear();
+    this.queue.length = 0;
     this.late = null;
   }
 
