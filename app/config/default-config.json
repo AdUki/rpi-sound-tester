@@ -35,7 +35,7 @@
   "output_names": ["", "", "", "", "", "", "", ""],
   "loopback_offset_samples": 0,
   "listen": { "codec": "opus", "bitrate_kbps": 96 },
-  "net": { "enabled": false, "port": 4010, "delay_ms": 1000 },
+  "net": { "enabled": true, "port": 4010, "delay_ms": 1000 },
   "sinks": {},
   "bluetooth": {
     "enabled": true, "name": "", "pairable": true, "discoverable_timeout_s": 180,

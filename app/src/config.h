@@ -81,8 +81,9 @@ struct Config {
 
   // Network audio input. `net_delay_ms` is how far local capture is held back so that a network
   // channel and an ADC channel that heard the same thing land on the same sample index. It only
-  // takes effect while net_enabled, so a device with no remote sender behaves as it always did.
-  bool net_enabled = false;
+  // takes effect while net_enabled, so a device with network input off captures with no delay.
+  // On by default, so a sender can play to a freshly booted device with nothing to switch on.
+  bool net_enabled = true;
   int net_port = kNetPort;
   int net_delay_ms = static_cast<int>(kNetDelayDefaultMs);
 
