@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -82,6 +83,13 @@ std::string reverse_lookup(const sockaddr_in& addr) {
   std::string h(host);
   if (!h.empty() && h.back() == '.') h.pop_back();
   return h;
+}
+
+// "AA:BB:CC:DD:EE:FF", spelled like the Bluetooth addresses the console already shows.
+std::string mac_string(const uint8_t* m) {
+  char b[18];
+  snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+  return b;
 }
 
 // A bench machine that is switched off mid-stream never closes its socket, and without this the
@@ -174,6 +182,8 @@ struct NetAudioServer::Channel {
   // what lets the console still say whose channel this is while the machine is switched off.
   std::string last_ip;
   std::string last_device;
+  // The MAC the claim's HELLO gave, empty for none: the machine, where last_ip is only its lease.
+  std::string last_mac;
   // The stream name the run was last claimed for ("main", "notif", or none): with last_ip, what a
   // returning sender is matched on.
   std::string last_stream;
@@ -182,6 +192,13 @@ struct NetAudioServer::Channel {
   unsigned stream_base = 0;
   unsigned stream_count = 1;
   unsigned stream_index = 1;  // 1-based position within that run
+  // The HELLO instance id of the claim (0: none), and the socket of the session holding it (-1:
+  // none, or a sender in this process). The fd is cleared under m before the claim is dropped and
+  // closed only after, so whoever reads it under m while it is set has a live socket.
+  uint64_t instance = 0;
+  int holder_fd = -1;
+  // release_seq_ when the channel was last let go: the lower, the longer it has been free.
+  uint64_t released_seq = 0;
 
   // Caller holds m.
   std::string device_locked() const {
@@ -296,7 +313,8 @@ unsigned NetAudioServer::connected_count() const {
 }
 
 int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigned count,
-                                   const std::string& stream) {
+                                   const std::string& stream, uint64_t instance, int holder_fd,
+                                   const std::string& mac) {
   const unsigned total = this->count();
   if (count == 0 || count > total) return -1;
 
@@ -323,13 +341,88 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
       Channel& c = *chans_[b + i];
       std::lock_guard<std::mutex> lock(c.m);
       c.last_ip = ip;
+      c.last_mac = mac;
       c.last_stream = stream;
       c.stream_base = b;
       c.stream_count = count;
       c.stream_index = i + 1;
+      c.instance = instance;
+      c.holder_fd = holder_fd;
     }
     return static_cast<int>(b);
   };
+
+  // Whether a channel was last this machine's: by MAC when both sides have one, since a laptop
+  // back on the network with a new lease is still the same sender. Caller holds the channel's m.
+  auto same_machine = [&](const Channel& ch) {
+    if (!mac.empty() && !ch.last_mac.empty()) return ch.last_mac == mac;
+    return ch.last_ip == ip;
+  };
+
+  // A run still held by this very stream, whose old connection the device has not seen die. The
+  // same PCM back on a new connection (its instance id): the plugin drops a link that stalls and
+  // reconnects at once, long before the device has read the old socket's backlog to its end. Or
+  // the same output of the same machine opened again (its MAC and stream name): a laptop back from
+  // suspend reopens its PCM, and the connection from before it slept ends only when keepalive
+  // gives up on it, half a minute on. Either way the run reads as taken and the stream would be
+  // handed a second channel. So shut our end of the old connection down, without asking whether
+  // it is still alive, and take the run when its session lets go — pinned or not. The stream that
+  // loses its run that way may be alive after all (one PCM opened twice), so it is remembered and
+  // is not allowed the same back: the two would take the run from each other for as long as both
+  // played. It gets a channel of its own instead.
+  if (instance != 0 || !mac.empty()) {
+    bool displaced = false;
+    if (instance != 0) {
+      std::lock_guard<std::mutex> lock(displaced_m_);
+      displaced = std::find(displaced_.begin(), displaced_.end(), instance) != displaced_.end();
+    }
+    int back = -1;  // the run to take over; -1: wait for the old ones to go, then place as usual
+    bool back_same_open = false;
+    std::vector<std::pair<unsigned, unsigned>> stale;  // every run shut down: base, count
+    std::string from;
+    for (unsigned c = 0; c < total; ++c) {
+      Channel& ch = *chans_[c];
+      std::lock_guard<std::mutex> lock(ch.m);
+      if (ch.stream_base != c || ch.holder_fd < 0) continue;
+      const bool same_open = instance != 0 && ch.instance == instance;
+      const bool same_output =
+          !displaced && !mac.empty() && ch.last_mac == mac && ch.last_stream == stream;
+      if (!same_open && !same_output) continue;
+      if (!same_open && ch.instance != 0) {
+        std::lock_guard<std::mutex> dlock(displaced_m_);
+        displaced_.push_back(ch.instance);
+        if (displaced_.size() > kNetDisplacedMax) displaced_.pop_front();
+      }
+      ::shutdown(ch.holder_fd, SHUT_RDWR);
+      stale.emplace_back(c, ch.stream_count);
+      from += (from.empty() ? "" : ", ") + ch.peer;
+      // A run as wide as this one, where a pin allows: this PCM's own first, else the first found.
+      if (ch.stream_count == count && (want >= total || c == want) &&
+          (back < 0 || (same_open && !back_same_open))) {
+        back = static_cast<int>(c);
+        back_same_open = same_open;
+      }
+    }
+
+    // Its session wakes on the shutdown at once; the bound is for one still busy elsewhere (its
+    // reverse lookup), and stays inside the sender's wait for the HELLO_ACK.
+    auto let_go = [&] {
+      for (const auto& [b, n] : stale)
+        for (unsigned i = 0; i < n; ++i)
+          if (chans_[b + i]->claimed.load()) return false;
+      return true;
+    };
+    bool gone = stale.empty();
+    for (int i = 0; i < kNetTakeBackMs / 10 && !gone; ++i) {
+      if (back >= 0 && try_run(static_cast<unsigned>(back))) {
+        LOG_INFO("net: {} took channel(s) from {} over from its old connection {}", ip, back, from);
+        return took(static_cast<unsigned>(back));
+      }
+      gone = back < 0 && let_go();
+      if (!gone) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!gone) LOG_WARN("net: {} would not let go; {} goes elsewhere", from, ip);
+  }
 
   // An explicit `channel N` (or a per-channel port) always wins — that is how you pin two streams
   // from one machine, which the address alone cannot tell apart.
@@ -341,13 +434,44 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
     bool mine;
     {
       std::lock_guard<std::mutex> lock(chans_[c]->m);
-      mine = chans_[c]->last_ip == ip && chans_[c]->last_stream == stream &&
+      mine = same_machine(*chans_[c]) && chans_[c]->last_stream == stream &&
              chans_[c]->stream_base == c;
     }
     if (mine && try_run(c)) return took(c);
   }
-  for (unsigned c = 0; c + count <= total; ++c)
-    if (try_run(c)) return took(c);
+
+  // Nowhere of its own: channels nobody remembers first, lowest first, then the run let go longest
+  // ago. The lowest free channel may be the place of a machine that is only switched off, and
+  // taking it would overwrite the memory that brings that machine back there.
+  struct Free {
+    bool remembered = false;
+    uint64_t released = 0;  // the newest release in the run
+    unsigned base = 0;
+  };
+  std::vector<Free> spare;
+  for (unsigned b = 0; b + count <= total; ++b) {
+    Free f;
+    f.base = b;
+    bool ok = true;
+    for (unsigned i = 0; i < count && ok; ++i) {
+      const Channel& ch = *chans_[b + i];
+      if (ch.claimed.load()) {
+        ok = false;
+        break;
+      }
+      std::lock_guard<std::mutex> lock(ch.m);
+      f.remembered = f.remembered || !ch.last_ip.empty();
+      f.released = std::max(f.released, ch.released_seq);
+    }
+    if (ok) spare.push_back(f);
+  }
+  std::stable_sort(spare.begin(), spare.end(), [](const Free& a, const Free& b) {
+    if (a.remembered != b.remembered) return !a.remembered;
+    return a.remembered && a.released < b.released;
+  });
+  // Claimed in that order: one taken meanwhile by another sender just fails its CAS.
+  for (const Free& f : spare)
+    if (try_run(f.base)) return took(f.base);
   return -1;
 }
 
@@ -367,6 +491,9 @@ void NetAudioServer::release_channels(unsigned base, unsigned count) {
       c.peer.clear();
       c.name.clear();
       c.host.clear();
+      // Before the claim goes: nobody may shut the socket down once its session can close it.
+      c.holder_fd = -1;
+      c.released_seq = release_seq_.fetch_add(1) + 1;
     }
     c.claimed.store(false);
   }
@@ -467,6 +594,8 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
       channels = ch_count;
 
       std::string name;
+      uint64_t instance = 0;
+      std::string mac;
       const uint32_t nlen = st_get_u32(p + ST_HELLO_O_NAME_LEN);
       if (nlen && nlen <= len - ST_HELLO_FIXED) {
         name.assign(reinterpret_cast<const char*>(p + ST_HELLO_FIXED),
@@ -475,12 +604,15 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
         char sname[ST_NET_MAX_STREAM_NAME + 1];
         if (st_get_trailing_str(p, len, ST_HELLO_FIXED + nlen, sname, sizeof(sname)))
           stream = sname;
+        instance = st_get_hello_instance(p, len, ST_HELLO_FIXED + nlen);
+        uint8_t m[ST_HELLO_MAC_BYTES];
+        if (st_get_hello_mac(p, len, ST_HELLO_FIXED + nlen, m)) mac = mac_string(m);
       }
 
       const uint16_t want = port_channel >= 0
                                 ? static_cast<uint16_t>(port_channel)
                                 : st_get_u16(p + ST_HELLO_O_WANT_CH);
-      base = srv.claim_channels(want, ip, channels, stream);
+      base = srv.claim_channels(want, ip, channels, stream, instance, fd, mac);
       if (base < 0) {
         reject(ST_HELLO_BUSY);
         return false;
@@ -510,9 +642,10 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
       st_put_u32(ack + ST_ACK_O_COUNT, channels);
       if (!send_msg(fd, ST_MSG_HELLO_ACK, ack, sizeof(ack))) return false;
 
-      LOG_INFO("net: {} ({}{}{}) took {} channel(s) from {} — input{} {}", peer,
+      LOG_INFO("net: {} ({}{}{}{}{}) took {} channel(s) from {} — input{} {}", peer,
                name.empty() ? "anonymous" : name, stream.empty() ? "" : ", stream ", stream,
-               channels, base, channels > 1 ? "s" : "", st::channels().net_base() + base);
+               mac.empty() ? "" : ", ", mac, channels, base, channels > 1 ? "s" : "",
+               st::channels().net_base() + base);
 
       // Only now, with the handshake already answered, ask who this address belongs to. A
       // resolver with nothing to talk to blocks for seconds, and the sender is waiting.
@@ -1089,8 +1222,10 @@ bool NetAudioServer::forget_channel(unsigned c) {
     ch.host.clear();
     ch.transport = "net";
     ch.last_ip.clear();
+    ch.last_mac.clear();
     ch.last_device.clear();
     ch.last_stream.clear();
+    ch.instance = 0;
     ch.stream_base = 0;
     ch.stream_count = 1;
     ch.stream_index = 1;
@@ -1132,6 +1267,7 @@ std::vector<NetChannelStatus> NetAudioServer::status() const {
       s.last_device = ch.last_device;
       s.stream = s.connected ? ch.last_stream : std::string{};
       s.last_stream = ch.last_stream;
+      s.mac = ch.last_mac;
       s.transport = ch.transport;
     }
     out.push_back(std::move(s));

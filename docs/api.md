@@ -555,7 +555,7 @@ sender, with `transport: "bluetooth"` and its Bluetooth address as `peer`.
  "channels": [{"channel": 0, "input": 6, "connected": true, "peer": "192.168.1.7:41154",
                "name": "thinkpad", "stream": "main", "last_stream": "main",
                "host": "thinkpad.lan", "device": "thinkpad",
-               "last_device": "thinkpad", "transport": "net",
+               "last_device": "thinkpad", "mac": "3C:7C:3F:12:9A:01", "transport": "net",
                "stream_index": 1, "stream_count": 1, "frames_received": 874496,
                "late_drops": 0, "range_drops": 0, "underruns": 0, "resyncs": 0,
                "last_target": 1562240, "write_end": 1562496,
@@ -567,8 +567,12 @@ sender, with `transport: "bluetooth"` and its Bluetooth address as `peer`.
 the sender calls itself (the plugin sends its hostname), `host` its address resolved to a name when
 the network can, and `device` the one to show: `name`, else `host`, else the address. `last_device`
 keeps it after the sender disconnects. `stream` is which of the machine's outputs this is — the
-PCM's `name` setting, empty without one — and `last_stream` keeps it like `last_device`; the
-channel's name in `GET /api/state` reads `main · thinkpad`. `inputs` is how many network channels
+PCM's `name` setting, or without one the plugin's default: the ALSA PCM's own name (`bench`), or
+for a bare `soundtester:HOST` the program playing (`aplay`); empty only from an older plugin — and
+`last_stream` keeps it like `last_device`; the channel's name in `GET /api/state` reads
+`main · thinkpad`. `mac` is the hardware address of the sender's interface that reaches the
+device, kept past the disconnect; empty from an older plugin, and for a phone (its address is
+`peer`). `inputs` is how many network channels
 there are, `inputs_configured` how many the next start will have. `transport`
 is `net`, or `bluetooth` for a phone. `lead_error_ms` is `lead_frames` against
 `target_lead_frames` in milliseconds, meaningful while `lead_valid`.
@@ -600,11 +604,25 @@ The device listens on the base port for *any* channel, and on **base + 1 + N for
 channel, so it wins over the `channel` argument in the sender's config.
 
 With neither, a returning sender is given **the channel it used last time**, matched on its
-address and its stream name. Routing set up against NET 3 therefore keeps meaning that machine
-across a reconnect, and a channel goes on saying whose it was while the machine is switched off.
-Two streams from one machine are told apart by `name` (`main`, `notif`): each is a sender of its
-own and comes back to its own run. Unnamed, they cannot be told apart by address — pin those with
-a port or a channel. The memory lasts as long as the daemon runs.
+machine — its MAC, or its address from a plugin that sends none — and its stream name. Routing set
+up against NET 3 therefore keeps meaning that machine across a reconnect, or a new DHCP lease, and
+a channel goes on saying whose it was while the machine is switched off. Two streams from one
+machine are told apart by `name` (`main`, `notif`, or the default the plugin picks): each is a
+sender of its own and comes back to its own run. Two opens of one PCM cannot be told apart — pin
+those with a port or a channel. The memory lasts as long as the daemon runs.
+
+A sender with no channel of its own takes one nobody remembers first (never used, or removed in
+the console), and only then the one let go longest ago — so it does not land on the place of a
+machine that is merely switched off.
+
+A stream whose run is still held never gets a second channel. A PCM whose link dropped reconnects
+before the device has seen its old connection die, and says so with the instance id in its HELLO;
+a machine back from suspend opens its PCM afresh while the connection from before it slept would
+hold on until keepalive ends it, half a minute on — and says so with the same MAC and stream name.
+Either way the device closes the old connection, without asking whether it is still alive, and
+hands the same channel straight back, pinned or not. One PCM really played twice at once from one
+machine therefore moves the first player off its channel once: it comes back to a channel of its
+own and is not allowed to take the run back.
 
 ### `PUT /api/net`
 ```json

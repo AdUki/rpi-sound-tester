@@ -198,7 +198,56 @@ static inline uint32_t st_header_len(const uint8_t* p) { return st_get_u32(p + 4
    apart without pinning them. A trailing field rather than a new version: a device that predates
    it never reads past name[], and a sender that predates it sends none. CTL_HELLO carries the
    same trailer, so a mixer can follow one named stream of a machine that sends several. At most
-   ST_NET_MAX_STREAM_NAME bytes. */
+   ST_NET_MAX_STREAM_NAME bytes. The plugin names every stream: without a `name` setting, after its
+   ALSA PCM ("bench"), or for the bare `soundtester:HOST` the program playing ("aplay").
+
+   Optional, after the stream field: [u64 instance], random per PCM open and the same for every
+   reconnection of it, never 0. A sender that has dropped its link and comes back with the same id
+   is the stream still holding its old run — the device just has not seen that connection die yet,
+   because it is still reading the backlog, or waiting on keepalive for a peer that vanished. The
+   device closes that connection and hands the run straight back, instead of a new channel. A
+   sender that sends an id always sends the stream field before it, empty as [u32 0], so the id's
+   offset never depends on guessing. Absent (an older sender), it reads as 0: no takeover.
+
+   Optional, after the instance id: [u8 mac[6]], the hardware address of the sender's interface
+   that reaches the device; all zero when it has none (loopback). It is what the device knows a
+   machine by — an address a DHCP lease can change, the MAC it cannot — and a stream with the MAC
+   and stream name of a run that is still held is that machine's same output reopened: the device
+   closes the old connection and hands the run over, whatever its instance id. Absent, the
+   machine is known by its address, as before. */
+#define ST_HELLO_INSTANCE_BYTES 8u
+#define ST_HELLO_MAC_BYTES 6u
+
+/* Where whatever follows the optional string field at `off` starts: past its bytes when it is
+   there, `len` when it is not (nothing can follow a field that is absent). */
+static inline uint32_t st_trailing_str_end(const uint8_t *p, uint32_t len, uint32_t off) {
+  if (off > len || len - off < 4u) return len;
+  uint32_t slen = st_get_u32(p + off);
+  if (slen > len - off - 4u) return len;
+  return off + 4u + slen;
+}
+
+/* The HELLO's instance id, given where its stream field starts; 0 when it carries none. */
+static inline uint64_t st_get_hello_instance(const uint8_t *p, uint32_t len, uint32_t stream_off) {
+  uint32_t at = st_trailing_str_end(p, len, stream_off);
+  if (len - at < ST_HELLO_INSTANCE_BYTES) return 0;
+  return st_get_u64(p + at);
+}
+
+/* The HELLO's MAC into `mac`, given where its stream field starts: 1 when it carries a real one, 0
+   when it has none, a short one, or all zeros. */
+static inline int st_get_hello_mac(const uint8_t *p, uint32_t len, uint32_t stream_off,
+                                   uint8_t mac[ST_HELLO_MAC_BYTES]) {
+  uint32_t at = st_trailing_str_end(p, len, stream_off);
+  if (len - at < ST_HELLO_INSTANCE_BYTES + ST_HELLO_MAC_BYTES) return 0;
+  at += ST_HELLO_INSTANCE_BYTES;
+  int any = 0;
+  for (uint32_t i = 0; i < ST_HELLO_MAC_BYTES; ++i) {
+    mac[i] = p[at + i];
+    any |= mac[i];
+  }
+  return any != 0;
+}
 
 /* HELLO_ACK: proto, status, rate, granted_channel, max_lead_frames, granted_channels.
    `granted_channel` is the FIRST of `granted_channels` adjacent inputs — a multi-channel sender

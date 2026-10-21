@@ -159,6 +159,12 @@ inline constexpr unsigned kNetDelayMaxMs = 2000;
 // period would drop every packet of a short net.delay_ms (21 to 43 ms) as late.
 inline constexpr unsigned kNetGuardPeriod = 1024;
 
+// Longest a reconnecting sender waits for the stale connection holding its run to let go, once that
+// connection has been shut down. Well inside the plugin's 2 s wait for its HELLO_ACK.
+inline constexpr int kNetTakeBackMs = 1000;
+// How many displaced streams (live ones whose run a newer open took over) are remembered.
+inline constexpr size_t kNetDisplacedMax = 64;
+
 // Per-channel timeline depth. Two readers sit in it at once — the playout read at n and the
 // trailing ring read at n - delay — while the sender writes a delay ahead of playout, so the
 // live span is about twice the delay. This has to clear 2 * kNetDelayMaxMs with room over.

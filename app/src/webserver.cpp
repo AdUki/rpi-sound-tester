@@ -1212,6 +1212,7 @@ void WebServer::install_routes() {
                        {"host", c.host},
                        {"device", c.device},
                        {"last_device", c.last_device},
+                       {"mac", c.mac},
                        {"transport", c.transport},
                        {"stream_index", c.stream_index},
                        {"stream_count", c.stream_count},

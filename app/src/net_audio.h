@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -67,6 +68,9 @@ struct NetChannelStatus {
   std::string stream;
   std::string last_stream;
   std::string host;   // reverse-resolved hostname, when the network can supply one
+  // The MAC the sender gave in its HELLO ("aa:bb:cc:dd:ee:ff"), kept past the disconnect like
+  // last_device; empty for a sender that sends none.
+  std::string mac;
   // "net" for a sender on the LAN, "bluetooth" for the Bluetooth input. Kept after a disconnect,
   // with last_device, so the console can still say what kind of thing the channel was used by.
   std::string transport = "net";
@@ -142,9 +146,23 @@ class NetAudioServer {
   // NET 3 and NET 6 — and all-or-nothing, because a half-claimed run would strand one channel of
   // a pair owned by nobody. `want` < count() pins the run explicitly; anything else prefers
   // wherever this address and `stream` were last time, so routing survives a reconnect and two
-  // named streams from one machine keep to their own channels.
+  // named streams from one machine keep to their own channels. A sender with nowhere of its own
+  // takes channels nobody remembers first, then the ones freed longest ago, so it does not land on
+  // the place of a machine that is only switched off.
+  //
+  // `mac` is the HELLO's MAC (empty: none). With one, it is what the machine is known by instead
+  // of `ip`, which a new DHCP lease changes.
+  //
+  // `instance` is the HELLO's instance id (0: none), and `holder_fd` the socket of the session
+  // making the claim. A claim with the instance of a run still held is that same PCM back on a new
+  // connection while the device still thinks the old one is alive; one with the MAC and stream of
+  // a run still held is that machine's same output reopened (a laptop back from suspend, whose
+  // old connection only keepalive would ever end). Either way the old socket is shut down and the
+  // run handed over, pinned or not. A stream that lost its run that way is not taken for stale in
+  // turn: coming back, it gets a channel of its own instead of taking the run back again.
   int claim_channels(unsigned want, const std::string& ip, unsigned count,
-                     const std::string& stream = {});
+                     const std::string& stream = {}, uint64_t instance = 0, int holder_fd = -1,
+                     const std::string& mac = {});
   void release_channels(unsigned base, unsigned count);
 
   // The run of channels one mixer connection drives: the whole of whatever `ip` is streaming.
@@ -290,6 +308,12 @@ class NetAudioServer {
 
   std::vector<std::unique_ptr<Channel>> chans_;
   std::atomic<uint64_t> reader_n_{0};
+  // Counts releases, so a free channel can say how long ago it was let go.
+  std::atomic<uint64_t> release_seq_{0};
+  // Instance ids of live streams whose run a newer open of the same machine and stream took over,
+  // newest last. Bounded: an id that has fallen off is one that has long since closed.
+  std::mutex displaced_m_;
+  std::deque<uint64_t> displaced_;
 
   // The base port takes any channel; base + 1 + c is a direct line to channel c, so a sender can
   // be pinned by the one setting its .asoundrc already had. One socket each, all in one poll.

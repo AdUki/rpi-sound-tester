@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "channel_layout.h"
@@ -152,6 +153,191 @@ void test_a_returning_sender_gets_its_old_channel() {
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2), 3);
 }
 
+// The other half of that: a new sender must not take the place of one that is only switched off,
+// overwriting the memory that would bring it back there.
+void test_a_new_sender_leaves_an_absent_senders_channel_alone() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1), 0);
+  net.release_channels(0, 1);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.8", 1), 1);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1), 0);
+}
+
+// With every channel remembered, the one let go longest ago is reused; for a run, the newer of its
+// channels' releases is what counts.
+void test_once_everything_is_remembered_the_longest_free_goes_first() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  const unsigned n = net.count();
+  for (unsigned c = 0; c < n; ++c)
+    CHECK_EQ(net.claim_channels(c, "10.0.1." + std::to_string(c), 1), static_cast<int>(c));
+  // Let go from the top down, so the last channel has been free longest.
+  for (unsigned c = n; c-- > 0;) net.release_channels(c, 1);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.2.1", 1), static_cast<int>(n - 1));
+  // Of the pairs left, n-3 + n-2 was let go longest ago.
+  if (n >= 3) {
+    CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.2.2", 2), static_cast<int>(n - 3));
+  }
+}
+
+// What serve() does with a session's socket: read until it dies, then let the run go and close it.
+std::thread stale_session(NetAudioServer& net, int fd, unsigned base, unsigned count) {
+  return std::thread([&net, fd, base, count] {
+    char b[64];
+    while (::recv(fd, b, sizeof(b), 0) > 0) {
+    }
+    net.release_channels(base, count);
+    ::close(fd);
+  });
+}
+
+// A PCM whose link dropped comes back with the same instance id while the device is still reading
+// its old connection: that connection is shut down and the run handed straight back, pinned or not.
+void test_a_reconnecting_pcm_takes_its_run_back_from_the_stale_connection() {
+  constexpr uint64_t kId = 0x1234567890abcdefull;
+  for (const uint16_t want : {static_cast<uint16_t>(ST_HELLO_ANY_CHANNEL), uint16_t{2}}) {
+    Control ctl;
+    NetAudioServer net(ctl, kRate, kTestPeriod);
+    CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", 1), 0);
+    int old_fds[2], new_fds[2];
+    CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, old_fds), 0);
+    CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, new_fds), 0);
+
+    const int base = net.claim_channels(want, "10.0.0.7", 2, "main", kId, old_fds[0]);
+    CHECK_EQ(base, want == 2 ? 2 : 1);
+    std::thread stale = stale_session(net, old_fds[0], static_cast<unsigned>(base), 2);
+
+    // The sender's end is still open: only the device's shutdown can end that session.
+    CHECK_EQ(net.claim_channels(want, "10.0.0.7", 2, "main", kId, new_fds[0]), base);
+    stale.join();
+    CHECK(net.channel_connected(static_cast<unsigned>(base)));
+    CHECK_EQ(net.status()[static_cast<unsigned>(base)].stream, std::string("main"));
+
+    net.release_channels(static_cast<unsigned>(base), 2);
+    ::close(old_fds[1]);
+    ::close(new_fds[0]);
+    ::close(new_fds[1]);
+  }
+}
+
+// Without a MAC, another open of the same PCM name from the same address is not known to be the
+// same machine (it may be a second one behind a NAT): it never takes over, however alike it looks.
+void test_without_a_mac_a_different_instance_never_takes_over() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  int fds[2];
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "main", 111, fds[0]), 0);
+  std::thread live = stale_session(net, fds[0], 0, 1);
+
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "main", 222), 1);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "main"), 2);  // no id at all
+  CHECK(net.channel_connected(0));
+
+  // Nothing has touched its socket: it still carries data.
+  CHECK_EQ(::send(fds[1], "x", 1, MSG_NOSIGNAL), 1);
+  ::close(fds[1]);
+  live.join();
+  CHECK(!net.channel_connected(0));
+}
+
+constexpr const char* kMac = "3C:7C:3F:12:9A:01";
+
+// The same output of the same machine opened afresh — a new instance id, as a laptop back from
+// suspend reopens its PCM — while the device still holds the connection from before: that
+// connection is shut down and the run handed over, named or not, pinned or not.
+void test_a_reopened_output_takes_its_run_over_by_mac_and_stream() {
+  for (const std::string stream : {"main", ""}) {
+    for (const uint16_t want : {static_cast<uint16_t>(ST_HELLO_ANY_CHANNEL), uint16_t{2}}) {
+      Control ctl;
+      NetAudioServer net(ctl, kRate, kTestPeriod);
+      CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", 1), 0);
+      int old_fds[2], new_fds[2];
+      CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, old_fds), 0);
+      CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, new_fds), 0);
+
+      const int base = net.claim_channels(want, "10.0.0.7", 2, stream, 111, old_fds[0], kMac);
+      CHECK_EQ(base, want == 2 ? 2 : 1);
+      std::thread stale = stale_session(net, old_fds[0], static_cast<unsigned>(base), 2);
+
+      // Back on a new lease, too: the MAC is what says it is the same machine.
+      CHECK_EQ(net.claim_channels(want, "10.0.0.9", 2, stream, 222, new_fds[0], kMac), base);
+      stale.join();
+      CHECK(net.channel_connected(static_cast<unsigned>(base)));
+      CHECK_EQ(net.status()[static_cast<unsigned>(base)].mac, std::string(kMac));
+
+      net.release_channels(static_cast<unsigned>(base), 2);
+      ::close(old_fds[1]);
+      ::close(new_fds[0]);
+      ::close(new_fds[1]);
+    }
+  }
+}
+
+// One PCM really open twice at once: the second takes the run, and the first — alive, so its plugin
+// reconnects — gets a channel of its own instead of taking the run back, and so on for ever.
+void test_a_displaced_stream_does_not_take_its_run_back() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  int a_fds[2], b_fds[2];
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, a_fds), 0);
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, b_fds), 0);
+
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "bench", 111, a_fds[0], kMac),
+           0);
+  std::thread a = stale_session(net, a_fds[0], 0, 1);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "bench", 222, b_fds[0], kMac),
+           0);
+  a.join();
+  std::thread b = stale_session(net, b_fds[0], 0, 1);
+
+  // The first player reconnects with its own id: a channel of its own, and b keeps its socket.
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "bench", 111, -1, kMac), 1);
+  CHECK(net.channel_connected(0));
+  CHECK_EQ(::send(b_fds[1], "x", 1, MSG_NOSIGNAL), 1);
+
+  ::close(b_fds[1]);
+  b.join();
+  CHECK(!net.channel_connected(0));
+  ::close(a_fds[1]);
+}
+
+// The machine's other outputs are other senders: a different stream name, or a different machine
+// with the same name, takes nothing over.
+void test_another_output_of_the_machine_is_left_alone() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  int fds[2];
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "main", 111, fds[0], kMac), 0);
+  std::thread live = stale_session(net, fds[0], 0, 1);
+
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "notif", 222, -1, kMac), 1);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "", 333, -1, kMac), 2);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.8", 1, "main", 444, -1,
+                              "3C:7C:3F:12:9A:02"),
+           3);
+  CHECK(net.channel_connected(0));
+  CHECK_EQ(::send(fds[1], "x", 1, MSG_NOSIGNAL), 1);
+
+  ::close(fds[1]);
+  live.join();
+}
+
+// A returning machine is matched on its MAC: a new lease still brings it back to its channel, and
+// another machine that has inherited its old address does not get it.
+void test_a_machine_is_known_by_its_mac_across_a_new_address() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "main", 1, -1, kMac), 0);
+  net.release_channels(0, 1);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "main", 2, -1,
+                              "3C:7C:3F:12:9A:02"),
+           1);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.20", 1, "main", 3, -1, kMac), 0);
+}
+
 // Two named streams from one machine ("main" and "notif") are two senders: each comes back to its
 // own run, and a mixer that names one drives that one.
 void test_named_streams_keep_their_own_channels() {
@@ -196,6 +382,39 @@ void test_the_stream_name_trailer_parses() {
   // Kept to what fits.
   CHECK_EQ(st_get_trailing_str(p, 21, 12, out, 3), 2u);
   CHECK_EQ(std::string(out), std::string("ma"));
+}
+
+// The optional instance id after the stream field: behind an empty field and a named one, and
+// absent or cut short (none).
+void test_the_instance_id_trailer_parses() {
+  uint8_t p[64] = {0};
+  CHECK_EQ(st_get_hello_instance(p, 12, 12), uint64_t{0});  // an older sender: nothing at all
+  st_put_u32(p + 12, 0);
+  st_put_u64(p + 16, 0xfeedull);
+  CHECK_EQ(st_get_hello_instance(p, 24, 12), uint64_t{0xfeed});
+  st_put_u32(p + 12, 4);
+  memcpy(p + 16, "main", 4);
+  st_put_u64(p + 20, 42);
+  CHECK_EQ(st_get_hello_instance(p, 28, 12), uint64_t{42});
+  CHECK_EQ(st_get_hello_instance(p, 20, 12), uint64_t{0});  // a stream name and no id
+  CHECK_EQ(st_get_hello_instance(p, 25, 12), uint64_t{0});  // an id cut short
+}
+
+// The optional MAC after the instance id: present, absent, cut short, and all zeros (none).
+void test_the_mac_trailer_parses() {
+  uint8_t p[64] = {0};
+  uint8_t mac[ST_HELLO_MAC_BYTES];
+  st_put_u32(p + 12, 4);
+  memcpy(p + 16, "main", 4);
+  st_put_u64(p + 20, 42);
+  CHECK_EQ(st_get_hello_mac(p, 28, 12, mac), 0);  // an id and no MAC
+  const uint8_t m[ST_HELLO_MAC_BYTES] = {0x3c, 0x7c, 0x3f, 0x12, 0x9a, 0x01};
+  memcpy(p + 28, m, sizeof(m));
+  CHECK_EQ(st_get_hello_mac(p, 34, 12, mac), 1);
+  CHECK(memcmp(mac, m, sizeof(m)) == 0);
+  CHECK_EQ(st_get_hello_mac(p, 33, 12, mac), 0);  // cut short
+  memset(p + 28, 0, sizeof(m));
+  CHECK_EQ(st_get_hello_mac(p, 34, 12, mac), 0);  // loopback: none
 }
 
 // ---- a sender that lives in this process: the Bluetooth input --------------------------------
@@ -612,8 +831,18 @@ int main() {
   test_a_run_that_does_not_fit_claims_nothing();
   test_an_explicit_channel_wins_and_can_be_refused();
   test_a_returning_sender_gets_its_old_channel();
+  test_a_new_sender_leaves_an_absent_senders_channel_alone();
+  test_once_everything_is_remembered_the_longest_free_goes_first();
+  test_a_reconnecting_pcm_takes_its_run_back_from_the_stale_connection();
+  test_without_a_mac_a_different_instance_never_takes_over();
+  test_a_reopened_output_takes_its_run_over_by_mac_and_stream();
+  test_a_displaced_stream_does_not_take_its_run_back();
+  test_another_output_of_the_machine_is_left_alone();
+  test_a_machine_is_known_by_its_mac_across_a_new_address();
   test_named_streams_keep_their_own_channels();
   test_the_stream_name_trailer_parses();
+  test_the_instance_id_trailer_parses();
+  test_the_mac_trailer_parses();
   test_an_in_process_sender_is_labelled_as_such();
   test_a_feed_lands_the_delay_ahead_of_playout();
   test_a_channel_is_only_in_use_once_it_has_been();

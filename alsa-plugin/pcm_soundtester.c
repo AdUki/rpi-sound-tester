@@ -21,9 +21,12 @@
 #include <alsa/pcm_external.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <netpacket/packet.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -73,13 +76,14 @@ typedef struct {
   snd_pcm_ioplug_t io;
 
   char *host;
-  char *stream;    /* the `name` setting: which of this machine's outputs this is, or NULL */
+  char *stream;    /* which of this machine's outputs this is: `name`, else a default; or NULL */
   long port;
   long want_channel;
   long channels;   /* each becomes its own input on the device */
   long encoding;   /* ST_ENC_PCM or ST_ENC_VORBIS */
   double quality;  /* Vorbis VBR quality, -0.1 .. 1.0 */
   int mixer;       /* 0: the device leaves this stream's level alone (see `mixer` in the conf) */
+  uint64_t instance; /* this open, across its reconnections: the HELLO's instance id */
 
   int sk_fd;       /* the live link, or -1. Owned by the audio path once adopted. */
   int timer_fd;
@@ -250,6 +254,34 @@ static void link_nap(st_pcm_t *st, int ms) {
   }
 }
 
+/* The hardware address of the interface this socket leaves by, which is what the device knows this
+ * machine by across DHCP leases. All zeros — none — over loopback or a tunnel, or when it cannot be
+ * found. */
+static void local_mac(int fd, uint8_t mac[ST_HELLO_MAC_BYTES]) {
+  memset(mac, 0, ST_HELLO_MAC_BYTES);
+  struct sockaddr_in me;
+  socklen_t mlen = sizeof(me);
+  if (getsockname(fd, (struct sockaddr *)&me, &mlen) != 0 || me.sin_family != AF_INET) return;
+  struct ifaddrs *ifs = NULL;
+  if (getifaddrs(&ifs) != 0) return;
+  const char *ifname = NULL;
+  for (struct ifaddrs *a = ifs; a && !ifname; a = a->ifa_next)
+    if (a->ifa_addr && a->ifa_addr->sa_family == AF_INET &&
+        ((struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr == me.sin_addr.s_addr)
+      ifname = a->ifa_name;
+  /* An address on an alias ("eth0:1") is the hardware of eth0. */
+  const size_t n = ifname ? strcspn(ifname, ":") : 0;
+  for (struct ifaddrs *a = ifs; a && n; a = a->ifa_next) {
+    if (!a->ifa_addr || a->ifa_addr->sa_family != AF_PACKET || strncmp(a->ifa_name, ifname, n) ||
+        a->ifa_name[n] != '\0')
+      continue;
+    const struct sockaddr_ll *ll = (const struct sockaddr_ll *)a->ifa_addr;
+    if (ll->sll_halen == ST_HELLO_MAC_BYTES) memcpy(mac, ll->sll_addr, ST_HELLO_MAC_BYTES);
+    break;
+  }
+  freeifaddrs(ifs);
+}
+
 /* Connector thread. Returns a handshaken socket, or fills `why` for the caller to report — a retry
  * loop must not repeat itself. */
 static int link_connect(st_pcm_t *st, unsigned int *rate, uint64_t *max_lead, char *why,
@@ -268,7 +300,8 @@ static int link_connect(st_pcm_t *st, unsigned int *rate, uint64_t *max_lead, ch
   name[sizeof(name) - 1] = '\0';
   uint32_t nlen = (uint32_t)strlen(name);
 
-  uint8_t hello[ST_HELLO_FIXED + ST_NET_MAX_NAME + 4 + ST_NET_MAX_STREAM_NAME];
+  uint8_t hello[ST_HELLO_FIXED + ST_NET_MAX_NAME + 4 + ST_NET_MAX_STREAM_NAME +
+                ST_HELLO_INSTANCE_BYTES + ST_HELLO_MAC_BYTES];
   memset(hello, 0, sizeof(hello));
   st_put_u32(hello + ST_HELLO_O_MAGIC, ST_NET_MAGIC);
   st_put_u32(hello + ST_HELLO_O_PROTO, ST_NET_PROTO_VERSION);
@@ -282,7 +315,15 @@ static int link_connect(st_pcm_t *st, unsigned int *rate, uint64_t *max_lead, ch
   memcpy(hello + ST_HELLO_FIXED, name, nlen);
   /* Optional, after the hostname: a device that predates it reads no further. */
   uint32_t hlen = ST_HELLO_FIXED + nlen;
-  hlen += st_put_trailing_str(hello + hlen, st->stream);
+  const uint32_t slen = st_put_trailing_str(hello + hlen, st->stream);
+  if (slen == 0) st_put_u32(hello + hlen, 0); /* present though empty, so the id's place is known */
+  hlen += slen ? slen : 4u;
+  /* Lets the device recognise this PCM coming back while its last connection still holds the run. */
+  st_put_u64(hello + hlen, st->instance);
+  hlen += ST_HELLO_INSTANCE_BYTES;
+  /* And this machine reopening it: same MAC and stream name, whatever the instance. */
+  local_mac(fd, hello + hlen);
+  hlen += ST_HELLO_MAC_BYTES;
 
   uint8_t ack[ST_HELLO_ACK_BYTES];
   uint32_t len = 0;
@@ -690,6 +731,40 @@ static int set_hw_constraints(st_pcm_t *st) {
   return 0;
 }
 
+/* Random, so two opens of one PCM on one machine never share an id; never 0, which means "none". */
+static uint64_t new_instance_id(const void *salt) {
+  uint64_t id = 0;
+  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    if (read(fd, &id, sizeof(id)) != (ssize_t)sizeof(id)) id = 0;
+    close(fd);
+  }
+  if (id == 0) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    id = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^ ((uint64_t)getpid() << 20) ^
+         (uint64_t)(uintptr_t)salt;
+  }
+  return id ? id : 1;
+}
+
+/* The stream name when the conf gives none, so that every stream is told apart from this machine's
+ * others and shows as something: the ALSA PCM's own name ("bench", "default"), or for the bare
+ * `soundtester:HOST`, which names no output of its own, the program playing ("aplay"). */
+static void default_stream_name(const char *pcm, char *out, size_t n) {
+  out[0] = '\0';
+  const size_t len = pcm ? strcspn(pcm, ":") : 0;
+  if (len && !(len == strlen("soundtester") && !strncmp(pcm, "soundtester", len))) {
+    snprintf(out, n, "%.*s", (int)len, pcm);
+    return;
+  }
+  FILE *f = fopen("/proc/self/comm", "re");
+  if (!f) return;
+  if (fgets(out, (int)n, f)) out[strcspn(out, "\n")] = '\0';
+  else out[0] = '\0';
+  fclose(f);
+}
+
 SND_PCM_PLUGIN_DEFINE_FUNC(soundtester) {
   static const char *const T = "soundtester";
   snd_config_iterator_t i, next;
@@ -762,14 +837,20 @@ SND_PCM_PLUGIN_DEFINE_FUNC(soundtester) {
   st->encoding = encoding;
   st->quality = quality;
   st->mixer = mixer;
+  st->instance = new_instance_id(st);
   st->port = port;
   st->max_lead = ASSUMED_MAX_LEAD;
   atomic_init(&st->handoff_fd, -1);
   atomic_init(&st->want_link, 1);
   atomic_init(&st->quit, 0);
+  char dname[ST_NET_MAX_STREAM_NAME + 1];
+  if (!sname || !*sname) {
+    default_stream_name(name, dname, sizeof(dname));
+    sname = dname;
+  }
   st->host = strdup(host);
-  st->stream = sname && *sname ? strdup(sname) : NULL;
-  if (!st->host || (sname && *sname && !st->stream)) {
+  st->stream = *sname ? strdup(sname) : NULL;
+  if (!st->host || (*sname && !st->stream)) {
     free(st->host);
     free(st->stream);
     free(st);
