@@ -121,9 +121,9 @@ void test_a_run_that_does_not_fit_claims_nothing() {
   NetAudioServer net(ctl, kRate, kTestPeriod);
   // Take one in the middle so no run of the full width can fit.
   CHECK_EQ(net.claim_channels(2, "10.0.0.9", 1), 2);
-  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", kNetInputs), -1);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", net.count()), -1);
   // Everything except the one deliberately taken must still be free.
-  for (unsigned c = 0; c < kNetInputs; ++c) {
+  for (unsigned c = 0; c < net.count(); ++c) {
     if (c == 2) continue;
     CHECK_EQ(net.claim_channels(c, "10.0.0.5", 1), static_cast<int>(c));
   }
@@ -134,7 +134,7 @@ void test_an_explicit_channel_wins_and_can_be_refused() {
   NetAudioServer net(ctl, kRate, kTestPeriod);
   CHECK_EQ(net.claim_channels(3, "10.0.0.1", 1), 3);
   CHECK_EQ(net.claim_channels(3, "10.0.0.2", 1), -1);  // taken: no silent fallback elsewhere
-  CHECK_EQ(net.claim_channels(kNetInputs, "10.0.0.2", 1), 0);  // out of range = "any"
+  CHECK_EQ(net.claim_channels(net.count(), "10.0.0.2", 1), 0);  // out of range = "any"
 }
 
 // The property routing depends on: a machine that comes back gets the channel it had, so an
@@ -150,6 +150,52 @@ void test_a_returning_sender_gets_its_old_channel() {
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.8", 1), 0);
   // The original machine still comes back to 3, not to the next free channel.
   CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2), 3);
+}
+
+// Two named streams from one machine ("main" and "notif") are two senders: each comes back to its
+// own run, and a mixer that names one drives that one.
+void test_named_streams_keep_their_own_channels() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2, "main"), 0);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2, "notif"), 2);
+  net.release_channels(0, 2);
+  net.release_channels(2, 2);
+
+  // Back in the other order: by address alone notif would be handed main's run.
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2, "notif"), 2);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2, "main"), 0);
+  // An unnamed stream from the same machine is a third sender.
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1), 4);
+
+  CHECK_EQ(net.mixer_run("10.0.0.7", ST_CTL_ANY_CHANNEL, "notif").base, 2u);
+  CHECK_EQ(net.mixer_run("10.0.0.7", ST_CTL_ANY_CHANNEL, "main").base, 0u);
+  // A stream that has never played: any of the machine's, as an unnamed mixer would.
+  CHECK_EQ(net.mixer_run("10.0.0.7", ST_CTL_ANY_CHANNEL, "alarm").base, 0u);
+
+  const std::vector<NetChannelStatus> st = net.status();
+  CHECK_EQ(st[2].stream, std::string("notif"));
+  CHECK_EQ(st[2].last_stream, std::string("notif"));
+  CHECK(st[4].stream.empty());
+}
+
+// The optional trailing stream name: present, absent (an older sender), and malformed.
+void test_the_stream_name_trailer_parses() {
+  uint8_t p[64] = {0};
+  char out[ST_NET_MAX_STREAM_NAME + 1];
+  // No bytes after the fixed part: what an older sender's message looks like.
+  CHECK_EQ(st_get_trailing_str(p, 12, 12, out, sizeof(out)), 0u);
+  CHECK_EQ(std::string(out), std::string());
+  st_put_u32(p + 12, 4);
+  memcpy(p + 16, "ma\nin", 5);
+  st_put_u32(p + 12, 5);
+  CHECK_EQ(st_get_trailing_str(p, 21, 12, out, sizeof(out)), 4u);  // control bytes dropped
+  CHECK_EQ(std::string(out), std::string("main"));
+  // A length running past the payload is no name at all, not a read off the end.
+  CHECK_EQ(st_get_trailing_str(p, 18, 12, out, sizeof(out)), 0u);
+  // Kept to what fits.
+  CHECK_EQ(st_get_trailing_str(p, 21, 12, out, 3), 2u);
+  CHECK_EQ(std::string(out), std::string("ma"));
 }
 
 // ---- a sender that lives in this process: the Bluetooth input --------------------------------
@@ -271,7 +317,7 @@ void test_a_channel_is_only_in_use_once_it_has_been() {
   net.release_channels(0, 1);
   // Still "in use" would be wrong here: nothing was ever sent, so there is nothing to look at.
   CHECK(!net.channel_in_use(0));
-  CHECK(!net.channel_in_use(kNetInputs));  // out of range is never in use
+  CHECK(!net.channel_in_use(net.count()));  // out of range is never in use
 }
 
 // ---- where a sender's audio lands --------------------------------------------------------
@@ -374,12 +420,12 @@ void test_a_free_channel_can_be_forgotten() {
   CHECK(!net.channel_connected(0));
   CHECK_EQ(net.status()[0].frames_received, 0u);
   CHECK(net.status()[0].last_device.empty());
-  CHECK(!net.forget_channel(kNetInputs));
+  CHECK(!net.forget_channel(net.count()));
   // Nor is a returning sender steered back to it: it takes the lowest free channel instead.
   CHECK_EQ(net.claim_channels(2, "10.0.0.9", 1), 2);
   net.release_channels(2, 1);
   CHECK(net.forget_channel(2));
-  CHECK_EQ(net.claim_channels(kNetInputs, "10.0.0.9", 1), 0);
+  CHECK_EQ(net.claim_channels(net.count(), "10.0.0.9", 1), 0);
 }
 
 // A packet has to land two blocks ahead of where the audio thread is reading, or it is dropped as
@@ -566,6 +612,8 @@ int main() {
   test_a_run_that_does_not_fit_claims_nothing();
   test_an_explicit_channel_wins_and_can_be_refused();
   test_a_returning_sender_gets_its_old_channel();
+  test_named_streams_keep_their_own_channels();
+  test_the_stream_name_trailer_parses();
   test_an_in_process_sender_is_labelled_as_such();
   test_a_feed_lands_the_delay_ahead_of_playout();
   test_a_channel_is_only_in_use_once_it_has_been();

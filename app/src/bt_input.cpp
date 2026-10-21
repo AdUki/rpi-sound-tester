@@ -108,7 +108,7 @@ void BtInput::run() {
 
 bool BtInput::record(const std::string& address, const std::string& name, unsigned rate,
                      unsigned channels) {
-  if (channels == 0 || channels > kNetInputs) channels = kBtChannels;
+  if (channels == 0 || channels > net_.count()) channels = kBtChannels;
   const std::string dev = bt_pcm_name(address);
   {
     // Named before anything can fail, so an error says whose stream it is about.
@@ -162,7 +162,7 @@ bool BtInput::record(const std::string& address, const std::string& name, unsign
   if ((err = snd_pcm_hw_params(pcm, hw)) < 0) return fail("hw_params", err);
   snd_pcm_hw_params_get_period_size(hw, &period, nullptr);
 
-  const int base = net_.claim_channels(kNetInputs, "bt:" + address, channels);
+  const int base = net_.claim_channels(ST_HELLO_ANY_CHANNEL, "bt:" + address, channels);
   if (base < 0) {
     return fail("no " + std::to_string(channels) + " adjacent network channels are free",
                 -EBUSY);

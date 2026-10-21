@@ -19,18 +19,20 @@ inline constexpr unsigned kOutputs = 8;  // CS42448 DAC channels
 // running the soundtester ALSA plugin lands on one of these, and from there it is an input like
 // any other: routable, metered, in the scope, in a freeze, and a valid xcorr operand.
 //
-// Each one costs (ring seconds + analyze seconds) x 384 kB of pinned RAM: about 41 MB at the
-// 87 s ring and the 20 s analyze default, and it also adds one 8192-point FFT per 200 ms to the
-// analysis thread. Twelve channels measure at ~495 MB pinned and a few percent of one Pi 3 core.
-// Raising it further is one line, but check limits.pinned_mb against the board afterwards — and
-// note it lowers the longest Analyze buffer that will still fit.
-inline constexpr unsigned kNetInputs = 6;
+// How many is a setting (net.inputs in config.json, or --net-inputs), read once at startup since
+// it decides the ring's columns. Each one costs (ring seconds + analyze seconds) x 384 kB of pinned
+// RAM: about 37 MB at the 87 s ring and the 10 s analyze default, and it also adds one 8192-point
+// FFT per 200 ms to the analysis thread. Twelve channels measured ~495 MB pinned (20 s analyze), a few
+// percent of one Pi 3 core. When the ring would not fit in RAM, main() shortens it (down to
+// kRingFramesMin), and only past that takes fewer inputs than asked.
+inline constexpr unsigned kNetInputsDefault = 6;
+inline constexpr unsigned kNetInputsMin = 1;
 
 // The most columns the ring can have: what every per-channel array is sized for. How many a run
 // actually has is channels().total() (channel_layout.h), decided once at startup. The telemetry
 // mask is one bit per column in a u32, so this may not pass 32.
-inline constexpr unsigned kMaxInputs = 24;
-static_assert(kInputs + kNetInputs <= kMaxInputs, "the Octo's layout must fit");
+inline constexpr unsigned kMaxInputs = 32;
+static_assert(kInputs + kNetInputsDefault <= kMaxInputs, "the Octo's layout must fit");
 
 // The Octo machine driver raises capture channels_max to 8 while a stream runs
 // (TDM frames carry 8 slots); slots 6..7 hold no ADC data.
@@ -69,6 +71,10 @@ inline constexpr unsigned kReopenDelayS = 5;
 // ~380 MB pinned in total. Raise this exponent only with headroom to spare — 2^24 would be
 // ~760 MB total, too tight on a 1 GB Pi.
 inline constexpr size_t kRingFrames = 1u << 23;
+// The shortest the ring is made to fit more network inputs into RAM: 2^22 = 43.7 s at 96 kHz. On a
+// Pi the freeze is capped at about that by RAM already (CaptureStore), so a ring this long still
+// covers the longest Analyze buffer it can be given.
+inline constexpr size_t kRingFramesMin = 1u << 22;
 
 // Freeze copies the ring minus a safety margin, so the copy has room to finish before the
 // writer can lap its oldest sample. The margin is max(this many periods, kRingFrames/32):
@@ -81,7 +87,7 @@ inline constexpr size_t kCaptureMinFrames = 4096;
 
 // Default analyze/snapshot length on startup — a freeze grabs this much unless the config API
 // changes it. Well under the ceiling so a fresh freeze is quick; raise it per-session as needed.
-inline constexpr double kCaptureDefaultSeconds = 20.0;
+inline constexpr double kCaptureDefaultSeconds = 10.0;
 
 // The scope's envelope: 200 min/max columns per second of capture, 480 frames each at 96 kHz, and
 // 60 s of history. Counted in seconds rather than frames so that every rate gets the same history.
@@ -135,9 +141,10 @@ inline constexpr size_t kPingLogEntries = 64;
 // writes it into a per-channel timeline at exactly that index. Ordering and duplication sort
 // themselves out; loss is a hole; a packet that misses its slot is dropped and counted.
 inline constexpr uint16_t kNetPort = ST_DEFAULT_PORT;
-// The base port, clamped so that base + kNetInputs, the last per-channel port, still exists.
+// The base port, clamped so that base + the most network inputs a run can have, the last
+// per-channel port, still exists.
 inline constexpr int kNetPortMin = 1;
-inline constexpr int kNetPortMax = 65535 - static_cast<int>(kNetInputs);
+inline constexpr int kNetPortMax = 65535 - static_cast<int>(kMaxInputs);
 inline constexpr uint32_t kNetProtoVersion = ST_NET_PROTO_VERSION;
 
 // Every local capture frame is held back by this much before entering the ring, so that ring

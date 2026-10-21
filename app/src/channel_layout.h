@@ -18,7 +18,7 @@ namespace st {
 struct ChannelLayout {
   unsigned local = kInputs;    // the engine card's inputs
   unsigned outputs = kOutputs; // the engine card's outputs
-  unsigned net = kNetInputs;
+  unsigned net = kNetInputsDefault;
   unsigned device = 0;         // columns for device inputs
 
   unsigned total() const { return local + net + device; }

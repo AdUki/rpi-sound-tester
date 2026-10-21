@@ -81,8 +81,10 @@ Concurrency rules that matter when editing:
   32-bit ARM for NEON. Never `-ffast-math`: the analysis code relies on NaN/Inf guards.
 - An unopenable card/device is never fatal: threads retry and report the error in `/api/state`.
 - Channel counts are runtime (`channel_layout.h`, `channels()`, set once in main before any
-  thread): `[engine card's inputs (6 or 0) | NET 6 | device inputs (board.json)]`. Arrays are
-  sized by `kMaxInputs`; loops and strides use `channels().total()`.
+  thread): `[engine card's inputs (6 or 0) | NET n | device inputs (board.json)]`, n = `net.inputs`
+  (config.json, default 6; changed only across a daemon restart, `Config::remap_columns` moves saved
+  per-column settings). Arrays are sized by `kMaxInputs` (32); loops and strides use
+  `channels().total()`.
 
 Web UI: `app/www/` (`app.js`, `index.html`, `style.css`), no build step. The console feature-detects
 daemon capabilities via `limits.*` in `/api/state` and builds one section per entry of `sinks`;

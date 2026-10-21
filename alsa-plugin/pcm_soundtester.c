@@ -3,6 +3,7 @@
  *
  *   aplay -D soundtester:192.168.1.42 tone.wav
  *   pcm.bench { type soundtester; host soundtester.local }
+ *   pcm.notif { type soundtester; host soundtester.local; name notif }
  *
  * A drop-in for `hw`: it advertises the usual rates and S16/S24/S32/float, and the device
  * converts and resamples whatever arrives.
@@ -72,6 +73,7 @@ typedef struct {
   snd_pcm_ioplug_t io;
 
   char *host;
+  char *stream;    /* the `name` setting: which of this machine's outputs this is, or NULL */
   long port;
   long want_channel;
   long channels;   /* each becomes its own input on the device */
@@ -266,7 +268,7 @@ static int link_connect(st_pcm_t *st, unsigned int *rate, uint64_t *max_lead, ch
   name[sizeof(name) - 1] = '\0';
   uint32_t nlen = (uint32_t)strlen(name);
 
-  uint8_t hello[ST_HELLO_FIXED + ST_NET_MAX_NAME];
+  uint8_t hello[ST_HELLO_FIXED + ST_NET_MAX_NAME + 4 + ST_NET_MAX_STREAM_NAME];
   memset(hello, 0, sizeof(hello));
   st_put_u32(hello + ST_HELLO_O_MAGIC, ST_NET_MAGIC);
   st_put_u32(hello + ST_HELLO_O_PROTO, ST_NET_PROTO_VERSION);
@@ -278,11 +280,14 @@ static int link_connect(st_pcm_t *st, unsigned int *rate, uint64_t *max_lead, ch
              st->want_channel < 0 ? ST_HELLO_ANY_CHANNEL : (uint16_t)st->want_channel);
   st_put_u32(hello + ST_HELLO_O_NAME_LEN, nlen);
   memcpy(hello + ST_HELLO_FIXED, name, nlen);
+  /* Optional, after the hostname: a device that predates it reads no further. */
+  uint32_t hlen = ST_HELLO_FIXED + nlen;
+  hlen += st_put_trailing_str(hello + hlen, st->stream);
 
   uint8_t ack[ST_HELLO_ACK_BYTES];
   uint32_t len = 0;
   int type = -1;
-  if (st_send_msg(fd, ST_MSG_HELLO, hello, ST_HELLO_FIXED + nlen, ACK_TIMEOUT_MS) == 0)
+  if (st_send_msg(fd, ST_MSG_HELLO, hello, hlen, ACK_TIMEOUT_MS) == 0)
     type = st_read_msg(fd, ack, sizeof(ack), &len, ACK_TIMEOUT_MS);
   if (type != ST_MSG_HELLO_ACK || len != ST_HELLO_ACK_BYTES) {
     snprintf(why, why_n, "%s did not complete the handshake", st->host);
@@ -635,6 +640,7 @@ static int st_close(snd_pcm_ioplug_t *io) {
   if (st->timer_fd >= 0) close(st->timer_fd);
   if (st->wake_fd >= 0) close(st->wake_fd);
   free(st->host);
+  free(st->stream);
   free(st);
   return 0;
 }
@@ -688,6 +694,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(soundtester) {
   static const char *const T = "soundtester";
   snd_config_iterator_t i, next;
   const char *host = "localhost";
+  const char *sname = NULL;
   long port = ST_DEFAULT_PORT;
   long channel = -1;
   long channels = 1;
@@ -706,6 +713,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(soundtester) {
 
     err = 0;
     if (st_cfg_str(id, "host", n, T, &host, &err) || st_cfg_int(id, "port", n, T, &port, &err) ||
+        st_cfg_str(id, "name", n, T, &sname, &err) ||
         st_cfg_int(id, "channel", n, T, &channel, &err) ||
         st_cfg_int(id, "channels", n, T, &channels, &err) ||
         st_cfg_real(id, "quality", n, T, &quality, &err) ||
@@ -720,6 +728,10 @@ SND_PCM_PLUGIN_DEFINE_FUNC(soundtester) {
 
   if (channels < 1 || channels > (long)ST_MAX_STREAM_CHANNELS) {
     SNDERR("%s: channels must be 1..%u", T, ST_MAX_STREAM_CHANNELS);
+    return -EINVAL;
+  }
+  if (sname && strlen(sname) > ST_NET_MAX_STREAM_NAME) {
+    SNDERR("%s: name must be at most %u characters", T, ST_NET_MAX_STREAM_NAME);
     return -EINVAL;
   }
   if (enc && strcmp(enc, "pcm")) {
@@ -756,7 +768,10 @@ SND_PCM_PLUGIN_DEFINE_FUNC(soundtester) {
   atomic_init(&st->want_link, 1);
   atomic_init(&st->quit, 0);
   st->host = strdup(host);
-  if (!st->host) {
+  st->stream = sname && *sname ? strdup(sname) : NULL;
+  if (!st->host || (sname && *sname && !st->stream)) {
+    free(st->host);
+    free(st->stream);
     free(st);
     return -ENOMEM;
   }
@@ -796,6 +811,7 @@ err_out:
   if (st->timer_fd >= 0) close(st->timer_fd);
   if (st->wake_fd >= 0) close(st->wake_fd);
   free(st->host);
+  free(st->stream);
   free(st);
   return err;
 }

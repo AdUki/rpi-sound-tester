@@ -9,7 +9,8 @@
  * it pushes ST_MSG_MIX whenever anything moves.
  *
  * With no `channel` the device picks by address and keeps re-resolving, so the volume widens with
- * a stereo stream that starts later. A stream from a PCM with `mixer off` is not volume-controlled
+ * a stereo stream that starts later. `name` picks one of the machine's named streams (the PCM's
+ * own `name`), for a machine that sends several. A stream from a PCM with `mixer off` is not volume-controlled
  * at all, and both elements go INACTIVE.
  */
 
@@ -226,17 +227,19 @@ static const snd_ctl_ext_callback_t st_callback = {
 
 /* ---- open ------------------------------------------------------------------------------- */
 
-static int connect_ctl(st_ctl_t *c, const char *host, long port, long channel) {
+static int connect_ctl(st_ctl_t *c, const char *host, long port, long channel,
+                       const char *stream) {
   int fd = st_connect(host, port, "soundtester ctl", 3000, -1);
   if (fd < 0) return fd;
   c->fd = fd;
 
-  uint8_t hello[ST_CTL_HELLO_BYTES];
+  uint8_t hello[ST_CTL_HELLO_BYTES + 4 + ST_NET_MAX_STREAM_NAME];
   memset(hello, 0, sizeof(hello));
   st_put_u32(hello + ST_CTLH_O_MAGIC, ST_NET_MAGIC);
   st_put_u32(hello + ST_CTLH_O_PROTO, ST_NET_PROTO_VERSION);
   st_put_u16(hello + ST_CTLH_O_CHANNEL, channel < 0 ? ST_CTL_ANY_CHANNEL : (uint16_t)channel);
-  if (st_send_msg(fd, ST_MSG_CTL_HELLO, hello, sizeof(hello), 3000) < 0) return -EIO;
+  const uint32_t hlen = ST_CTL_HELLO_BYTES + st_put_trailing_str(hello + ST_CTL_HELLO_BYTES, stream);
+  if (st_send_msg(fd, ST_MSG_CTL_HELLO, hello, hlen, 3000) < 0) return -EIO;
 
   uint8_t ack[ST_CTL_ACK_BYTES];
   uint32_t len = 0;
@@ -264,6 +267,7 @@ SND_CTL_PLUGIN_DEFINE_FUNC(soundtester) {
   static const char *const T = "soundtester ctl";
   snd_config_iterator_t i, next;
   const char *host = "localhost";
+  const char *stream = NULL;
   long port = ST_DEFAULT_PORT;
   long channel = -1;
   st_ctl_t *c;
@@ -277,6 +281,7 @@ SND_CTL_PLUGIN_DEFINE_FUNC(soundtester) {
 
     err = 0;
     if (st_cfg_str(id, "host", n, T, &host, &err) || st_cfg_int(id, "port", n, T, &port, &err) ||
+        st_cfg_str(id, "name", n, T, &stream, &err) ||
         st_cfg_int(id, "channel", n, T, &channel, &err)) {
       if (err < 0) return err;
     } else {
@@ -285,10 +290,15 @@ SND_CTL_PLUGIN_DEFINE_FUNC(soundtester) {
     }
   }
 
+  if (stream && strlen(stream) > ST_NET_MAX_STREAM_NAME) {
+    SNDERR("%s: name must be at most %u characters", T, ST_NET_MAX_STREAM_NAME);
+    return -EINVAL;
+  }
+
   c = calloc(1, sizeof(*c));
   if (!c) return -ENOMEM;
   c->fd = -1;
-  if ((err = connect_ctl(c, host, port, channel)) < 0) {
+  if ((err = connect_ctl(c, host, port, channel, stream)) < 0) {
     if (c->fd >= 0) close(c->fd);
     free(c);
     return err;

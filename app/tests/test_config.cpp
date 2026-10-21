@@ -323,9 +323,11 @@ void test_old_sink_keys_are_read() {
 // in 5.1. It was written once by that code and is never regenerated, so it is what every Pi that
 // saved its settings has on /data. It must still load to the same routing.
 //
-// tests/data/pi-config-v2.json is what this code writes for it, and is pinned the same way: a
-// change that alters a single byte of what a Pi reads or writes fails here rather than on a Pi.
-// Like the file a save leaves on /data, neither ends in a newline.
+// tests/data/pi-config-v2.json is what the code wrote for it until the network input count became a
+// setting; pi-config-v3.json is what this code writes, with net.inputs and the ring columns the
+// per-input arrays are laid out for. Both are pinned the same way: a change that alters a single
+// byte of what a Pi reads or writes fails here rather than on a Pi. Like the file a save leaves on
+// /data, none ends in a newline.
 void check_pi_config(const Config& c) {
   CHECK_EQ(c.outputs[0].source_index, std::string("3"));
   CHECK_EQ(c.outputs[0].gain_db, -6.0f);
@@ -356,21 +358,24 @@ void check_pi_config(const Config& c) {
 void test_the_pi_config_file_still_loads() {
   const std::string v1 = read_file(ST_TEST_DATA_DIR "/pi-config-v1.json");
   const std::string v2 = read_file(ST_TEST_DATA_DIR "/pi-config-v2.json");
-  CHECK(!v1.empty() && !v2.empty());
-  if (v1.empty() || v2.empty()) return;
+  const std::string v3 = read_file(ST_TEST_DATA_DIR "/pi-config-v3.json");
+  CHECK(!v1.empty() && !v2.empty() && !v3.empty());
+  if (v1.empty() || v2.empty() || v3.empty()) return;
 
   Config c;
   std::string err;
   CHECK(Config::from_json(v1, &c, &err));
   if (!err.empty()) std::cout << "  parse error: " << err << "\n";
   check_pi_config(c);
-  CHECK(same_bytes(c.to_json(), v2));
+  CHECK(same_bytes(c.to_json(), v3));
 
-  // The new file reads back to the same, and writes the same.
-  Config d;
-  CHECK(Config::from_json(v2, &d, &err));
-  check_pi_config(d);
-  CHECK(same_bytes(d.to_json(), v2));
+  // The older files read to the same, and every one writes the newest.
+  for (const std::string* text : {&v2, &v3}) {
+    Config d;
+    CHECK(Config::from_json(*text, &d, &err));
+    check_pi_config(d);
+    CHECK(same_bytes(d.to_json(), v3));
+  }
 
   // And the way a Pi does both: loaded as the boot defaults, saved again.
   const char* tmp = getenv("TMPDIR");
@@ -379,7 +384,7 @@ void test_the_pi_config_file_still_loads() {
   ConfigStore store(ST_TEST_DATA_DIR "/pi-config-v1.json", dir);
   const Config loaded = store.load();
   CHECK(store.save(loaded, &err));
-  CHECK(same_bytes(read_file(store.saved_path()), v2));
+  CHECK(same_bytes(read_file(store.saved_path()), v3));
   unlink(store.saved_path().c_str());
   rmdir(dir.c_str());
 }
@@ -457,6 +462,60 @@ void test_garbage_is_rejected() {
   CHECK(!err.empty());
 }
 
+// The network input count is a setting, and the device inputs sit after the network ones: a
+// saved config has to follow its inputs to their new columns, not stay on the old numbers.
+void test_inputs_follow_their_columns_when_the_net_count_changes() {
+  ChannelLayout six;  // the Octo's 6 ADCs, 6 network inputs, 2 device inputs: columns 0..13
+  six.device = 2;
+  ChannelLayout eight = six;
+  eight.net = 8;
+  ChannelLayout four = six;
+  four.net = 4;
+
+  Config c;
+  c.columns = six;
+  c.has_columns = true;
+  c.inputs[2].gain_db = 6.0f;        // an ADC
+  c.input_names[7] = "laptop";       // NET 2
+  c.inputs[12].gain_db = 12.0f;      // the first device input
+  c.input_names[13] = "usb right";   // the second
+  c.outputs[0].source_type = "input";
+  c.outputs[0].source_index = "13";
+  c.outputs[1].source_type = "input";
+  c.outputs[1].source_index = "11";  // NET 6
+  c.sinks["b1,0"].outputs[2].source_type = "input";
+  c.sinks["b1,0"].outputs[2].source_index = "12";
+
+  // Through the file, the way a Pi meets it at the next start.
+  Config d;
+  std::string err;
+  CHECK(Config::from_json(c.to_json(), &d, &err));
+  d.remap_columns(eight);
+  CHECK_EQ(d.inputs[2].gain_db, 6.0f);
+  CHECK_EQ(d.input_names[7], std::string("laptop"));
+  CHECK_EQ(d.inputs[14].gain_db, 12.0f);
+  CHECK_EQ(d.inputs[12].gain_db, 0.0f);  // a new network input starts clean
+  CHECK_EQ(d.input_names[15], std::string("usb right"));
+  CHECK_EQ(d.outputs[0].source_index, std::string("15"));
+  CHECK_EQ(d.outputs[1].source_index, std::string("11"));
+  CHECK_EQ(d.sinks["b1,0"].outputs[2].source_index, std::string("14"));
+
+  // Fewer: NET 6 is gone, so what played it falls silent rather than playing another input.
+  Config e = c;
+  e.remap_columns(four);
+  CHECK_EQ(e.inputs[10].gain_db, 12.0f);
+  CHECK_EQ(e.input_names[11], std::string("usb right"));
+  CHECK_EQ(e.outputs[0].source_index, std::string("11"));
+  CHECK_EQ(e.outputs[1].source_type, std::string("silence"));
+  CHECK_EQ(e.sinks["b1,0"].outputs[2].source_index, std::string("10"));
+
+  // A file from before the count was a setting had the default count.
+  Config f = c;
+  f.has_columns = false;
+  f.remap_columns(eight);
+  CHECK_EQ(f.outputs[0].source_index, std::string("15"));
+}
+
 }  // namespace
 
 int main() {
@@ -473,5 +532,6 @@ int main() {
   test_the_pi_config_file_still_loads();
   test_bluetooth_round_trip();
   test_capture_delay_follows_the_bluetooth_input_too();
+  test_inputs_follow_their_columns_when_the_net_count_changes();
   return report("config");
 }

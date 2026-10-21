@@ -569,7 +569,11 @@ void WebServer::install_routes() {
     auto input_name = [&](unsigned i) -> std::string {
       if (!in_names[i].empty() || !layout.is_net(i)) return in_names[i];
       const NetChannelStatus& c = net[i - layout.net_base()];
-      const std::string who = c.device.empty() ? c.last_device : c.device;
+      std::string who = c.device.empty() ? c.last_device : c.device;
+      // A named stream ("main", "notif") says more than the machine does, and two of them from
+      // one machine would otherwise read the same.
+      const std::string& stream = c.connected ? c.stream : c.last_stream;
+      if (!stream.empty()) who = who.empty() ? stream : stream + " · " + who;
       if (who.empty() || c.stream_count <= 1) return who;
       // A stereo sender puts the same name on two cards; say which half each one is.
       return who + " (" + std::to_string(c.stream_index) + "/" + std::to_string(c.stream_count) +
@@ -676,7 +680,11 @@ void WebServer::install_routes() {
           {"channel_map", layout.local > 0},
           {"sync_watch", layout.local > 0},
           {"sinks_max", kMaxSinks},
-          {"net_inputs", kNetInputs},
+          {"net_inputs", layout.net},
+          {"net_inputs_configured", d_.ctl.net.inputs.load()},
+          {"net_inputs_min", kNetInputsMin},
+          {"net_inputs_max", opt_.net_inputs_max},
+          {"restart", opt_.allow_reboot},
           {"net_port", d_.net.port()},
           {"net_delay_ms", d_.ctl.net.delay_ms.load()},
           {"net_delay_min_ms", kNetDelayMinMs},
@@ -1199,6 +1207,8 @@ void WebServer::install_routes() {
                        {"connected", c.connected},
                        {"peer", c.peer},
                        {"name", c.name},
+                       {"stream", c.stream},
+                       {"last_stream", c.last_stream},
                        {"host", c.host},
                        {"device", c.device},
                        {"last_device", c.last_device},
@@ -1230,6 +1240,9 @@ void WebServer::install_routes() {
                         {"n_now", d_.ring.counter()},
                         {"lead_seconds", delay / rate},
                         {"error", d_.net.last_error()},
+                        {"inputs", d_.net.count()},
+                        {"inputs_configured", d_.ctl.net.inputs.load()},
+                        {"inputs_max", opt_.net_inputs_max},
                         {"channels", chans}});
   });
 
@@ -1240,6 +1253,15 @@ void WebServer::install_routes() {
     const double rate = d_.engine.rate();
 
     // Checked before anything is applied, so a rejected body changes nothing.
+    unsigned want_inputs = d_.ctl.net.inputs.load();
+    if (j.contains("inputs")) {
+      const int n = j["inputs"].get<int>();
+      if (n < static_cast<int>(kNetInputsMin) || n > static_cast<int>(opt_.net_inputs_max)) {
+        return send_error(res, 400, "inputs must be " + std::to_string(kNetInputsMin) + ".." +
+                                        std::to_string(opt_.net_inputs_max));
+      }
+      want_inputs = static_cast<unsigned>(n);
+    }
     int want_port = d_.net.port();
     if (j.contains("port")) {
       want_port = j["port"].get<int>();
@@ -1257,6 +1279,19 @@ void WebServer::install_routes() {
     }
     std::lock_guard<std::mutex> lk(delay_m_);
     if (j.contains("enabled")) d_.ctl.net.enabled.store(j["enabled"].get<bool>());
+
+    // The count only means anything at the next start, which reads the saved config: so it goes
+    // straight there, and nothing else of the saved config changes with it.
+    std::string inputs_error;
+    if (want_inputs != d_.ctl.net.inputs.load()) {
+      Config saved = d_.store.load();
+      saved.remap_columns(channels());
+      saved.net_inputs = want_inputs;
+      if (d_.store.save(saved, &inputs_error)) {
+        d_.ctl.net.inputs.store(want_inputs);
+        LOG_INFO("net: {} network inputs from the next start", want_inputs);
+      }
+    }
 
     // Derived in exactly one expression, shared with Config::apply_to and the Bluetooth input, so
     // the paths cannot drift: zero unless something that lands on a network channel is on.
@@ -1277,7 +1312,10 @@ void WebServer::install_routes() {
                         {"port", d_.net.port()},
                         {"delay_ms", d_.ctl.net.delay_ms.load()},
                         {"delay_frames", d_.ctl.net.delay_frames.load()},
-                        {"error", d_.net.last_error()}});
+                        {"inputs", d_.net.count()},
+                        {"inputs_configured", d_.ctl.net.inputs.load()},
+                        {"inputs_max", opt_.net_inputs_max},
+                        {"error", !inputs_error.empty() ? inputs_error : d_.net.last_error()}});
   }));
 
   // Takes a channel nobody is sending on off the console. Its ring column keeps whatever audio
@@ -1285,7 +1323,7 @@ void WebServer::install_routes() {
   svr.Delete("/api/net/channels/:n", [this](const httplib::Request& req,
                                            httplib::Response& res) {
     unsigned c;
-    if (!parse_index(req, "n", kNetInputs, &c)) return send_error(res, 404, "no such channel");
+    if (!parse_index(req, "n", d_.net.count(), &c)) return send_error(res, 404, "no such channel");
     if (!d_.net.forget_channel(c)) return send_error(res, 409, "a sender is on this channel");
     send_ok(res);
   });
@@ -1591,6 +1629,9 @@ void WebServer::install_routes() {
   };
   power_route("/api/system/reboot", "reboot", "systemctl reboot");
   power_route("/api/system/shutdown", "shutdown", "systemctl poweroff");
+  // Only the daemon: systemd starts it again (Restart=always), with what the board was booted with
+  // and the saved config — which is how a new network input count takes effect.
+  power_route("/api/system/restart", "restart", "systemctl --no-block restart soundtesterd");
 
   // Test hook for the sync-error banner; harmless in production.
   svr.Post("/api/system/inject-kmsg", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1842,7 +1883,7 @@ void WebServer::run_publisher() {
         const EngineStats es = d_.engine.stats();
         json net_active = json::array();
         json net_connected = json::array();
-        for (unsigned c = 0; c < kNetInputs; ++c) {
+        for (unsigned c = 0; c < d_.net.count(); ++c) {
           net_active.push_back(d_.net.channel_in_use(c));
           net_connected.push_back(d_.net.channel_connected(c));
         }

@@ -62,6 +62,10 @@ struct NetChannelStatus {
   bool connected = false;
   std::string peer;   // ip:port of the live connection
   std::string name;   // what the sender called itself in its HELLO
+  // Which of the sender's outputs this is ("main", "notif"): the PCM's `name` setting, empty when
+  // it has none. last_stream is kept past the disconnect, like last_device.
+  std::string stream;
+  std::string last_stream;
   std::string host;   // reverse-resolved hostname, when the network can supply one
   // "net" for a sender on the LAN, "bluetooth" for the Bluetooth input. Kept after a disconnect,
   // with last_device, so the console can still say what kind of thing the channel was used by.
@@ -130,25 +134,31 @@ class NetAudioServer {
 
   std::vector<NetChannelStatus> status() const;
 
+  // How many network channels this run has: channels().net when the server was built.
+  unsigned count() const { return static_cast<unsigned>(chans_.size()); }
+
   // Claims `count` ADJACENT channels for `ip` and returns the first, or -1 if the run will not
   // fit. Adjacent because a stereo sender's two channels should read as one source — NET 3+4, not
   // NET 3 and NET 6 — and all-or-nothing, because a half-claimed run would strand one channel of
-  // a pair owned by nobody. `want` < kNetInputs pins the run explicitly; anything else prefers
-  // wherever this address was last time, so routing survives a reconnect.
-  int claim_channels(unsigned want, const std::string& ip, unsigned count);
+  // a pair owned by nobody. `want` < count() pins the run explicitly; anything else prefers
+  // wherever this address and `stream` were last time, so routing survives a reconnect and two
+  // named streams from one machine keep to their own channels.
+  int claim_channels(unsigned want, const std::string& ip, unsigned count,
+                     const std::string& stream = {});
   void release_channels(unsigned base, unsigned count);
 
   // The run of channels one mixer connection drives: the whole of whatever `ip` is streaming.
   //
   // Call it again rather than caching the answer. alsamixer is normally opened before anything
   // plays, when the address owns one channel; a mixer still holding that answer once a stereo
-  // sender has taken NET 1+2 would turn down only the left. `want` < kNetInputs pins a channel
-  // explicitly (a `channel` argument or a per-channel port); anything else follows the sender.
+  // sender has taken NET 1+2 would turn down only the left. `want` < count() pins a channel
+  // explicitly (a `channel` argument or a per-channel port); anything else follows the sender,
+  // and its stream called `stream` when the mixer names one.
   struct MixRun {
     unsigned base = 0;
     unsigned count = 1;
   };
-  MixRun mixer_run(const std::string& ip, uint16_t want) const;
+  MixRun mixer_run(const std::string& ip, uint16_t want, const std::string& stream = {}) const;
 
   // Names a run claimed by a sender that lives in this process (the Bluetooth input), as a HELLO
   // names a network one: `peer` is its address, `name` what it is called, `transport` what it came
@@ -236,6 +246,7 @@ class NetAudioServer {
     NetAudioServer& srv;
     int fd = -1;
     std::string ip, peer;
+    std::string stream;      // the stream name from the HELLO, or empty
     int port_channel = -1;   // channel implied by the port the sender chose, or -1
 
     int base = -1;           // first channel of the claimed run, or -1
@@ -268,8 +279,8 @@ class NetAudioServer {
   void serve(int fd, sockaddr_in peer, int port_channel);
   // A mixer connection. Deliberately not a claim on the channel: opening alsamixer must not cost
   // a network input slot, and closing it must not take the audio down with it.
-  void serve_ctl(int fd, const std::string& ip, uint16_t want);
-  int ctl_channel_for(const std::string& ip, uint16_t want) const;
+  void serve_ctl(int fd, const std::string& ip, uint16_t want, const std::string& stream);
+  int ctl_channel_for(const std::string& ip, uint16_t want, const std::string& stream) const;
   void set_error(const std::string& e);
 
   Control& ctl_;

@@ -252,6 +252,12 @@
     <label>Alignment delay <input id="netdelay" type="number" min="0" max="2000" step="50"> ms</label>
     <label>Port <input id="netport" type="number" min="1" max="65535" step="1"></label>
     <span id="netmsg" class="muted small"></span>
+    <div class="btrow">
+      <label title="How many network inputs there are. Each one keeps its own stretch of the capture ring in RAM whether or not anything is sent to it, so the count is fixed when the tester starts.">Network inputs
+        <input id="netcount" type="number" min="1" max="24" step="1"></label>
+      <button id="netrestart" hidden title="Restart the tester's software (not the board) so the new count takes effect">Restart to apply</button>
+      <span id="netcountmsg" class="muted small"></span>
+    </div>
     <p id="netna" class="muted small" hidden>This device's firmware has no network input —
       reflash to enable it.</p>
   </div>

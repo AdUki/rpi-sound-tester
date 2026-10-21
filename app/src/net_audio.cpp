@@ -174,6 +174,9 @@ struct NetAudioServer::Channel {
   // what lets the console still say whose channel this is while the machine is switched off.
   std::string last_ip;
   std::string last_device;
+  // The stream name the run was last claimed for ("main", "notif", or none): with last_ip, what a
+  // returning sender is matched on.
+  std::string last_stream;
   // The run this channel belongs to, remembered past the disconnect so a returning sender is
   // offered the same block and a mixer knows how many channels its one volume covers.
   unsigned stream_base = 0;
@@ -200,10 +203,10 @@ size_t timeline_frames(double rate) {
 NetAudioServer::NetAudioServer(Control& ctl, double rate, unsigned period, Clock& clock)
     : ctl_(ctl), rate_(rate), guard_frames_(2ull * period), clock_(clock) {
   const size_t frames = timeline_frames(rate);
-  chans_.reserve(kNetInputs);
-  for (unsigned c = 0; c < kNetInputs; ++c) chans_.push_back(std::make_unique<Channel>(frames));
-  LOG_INFO("net: {} channels, {} frame timelines ({:.1f} s each)", kNetInputs, frames,
-           frames / rate);
+  const unsigned n = st::channels().net;
+  chans_.reserve(n);
+  for (unsigned c = 0; c < n; ++c) chans_.push_back(std::make_unique<Channel>(frames));
+  LOG_INFO("net: {} channels, {} frame timelines ({:.1f} s each)", n, frames, frames / rate);
 }
 
 NetAudioServer::~NetAudioServer() { stop(); }
@@ -239,18 +242,18 @@ bool NetAudioServer::start(uint16_t port) {
   // The per-channel ports are a convenience, not the service: if one is taken, say so and carry
   // on rather than refusing to accept audio at all.
   unsigned pinned = 0;
-  for (unsigned c = 0; c < kNetInputs; ++c) {
+  for (unsigned c = 0; c < count(); ++c) {
     if (bind_one(static_cast<uint16_t>(port + 1 + c), static_cast<int>(c))) ++pinned;
   }
-  if (pinned != kNetInputs) {
-    LOG_WARN("net: only {} of {} per-channel ports could be bound", pinned, kNetInputs);
+  if (pinned != count()) {
+    LOG_WARN("net: only {} of {} per-channel ports could be bound", pinned, count());
   }
 
   set_error({});
   listening_.store(true);
   running_.store(true);
   LOG_INFO("net: listening on {} (any channel) and {}..{} (NET 1..{})", port, port + 1,
-           port + kNetInputs, kNetInputs);
+           port + count(), count());
   accept_thread_ = std::thread([this] { accept_loop(); });
   return true;
 }
@@ -292,13 +295,15 @@ unsigned NetAudioServer::connected_count() const {
   return n;
 }
 
-int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigned count) {
-  if (count == 0 || count > kNetInputs) return -1;
+int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigned count,
+                                   const std::string& stream) {
+  const unsigned total = this->count();
+  if (count == 0 || count > total) return -1;
 
   // Takes the whole run or nothing: a half-claimed stereo sender would leave one channel of a
   // pair stranded and claimed by no one.
   auto try_run = [&](unsigned base) -> bool {
-    if (base + count > kNetInputs) return false;
+    if (base + count > total) return false;
     for (unsigned i = 0; i < count; ++i) {
       bool expected = false;
       if (!chans_[base + i]->claimed.compare_exchange_strong(expected, true)) {
@@ -318,6 +323,7 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
       Channel& c = *chans_[b + i];
       std::lock_guard<std::mutex> lock(c.m);
       c.last_ip = ip;
+      c.last_stream = stream;
       c.stream_base = b;
       c.stream_count = count;
       c.stream_index = i + 1;
@@ -327,18 +333,20 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
 
   // An explicit `channel N` (or a per-channel port) always wins — that is how you pin two streams
   // from one machine, which the address alone cannot tell apart.
-  if (want < kNetInputs) return try_run(want) ? took(want) : -1;
+  if (want < total) return try_run(want) ? took(want) : -1;
 
-  // Otherwise put a returning sender back where it was, provided the run still fits there.
-  for (unsigned c = 0; c < kNetInputs; ++c) {
+  // Otherwise put a returning sender back where it was, provided the run still fits there. The
+  // stream name is part of whose it is: a machine's "main" and "notif" are two senders.
+  for (unsigned c = 0; c < total; ++c) {
     bool mine;
     {
       std::lock_guard<std::mutex> lock(chans_[c]->m);
-      mine = chans_[c]->last_ip == ip && chans_[c]->stream_base == c;
+      mine = chans_[c]->last_ip == ip && chans_[c]->last_stream == stream &&
+             chans_[c]->stream_base == c;
     }
     if (mine && try_run(c)) return took(c);
   }
-  for (unsigned c = 0; c + count <= kNetInputs; ++c)
+  for (unsigned c = 0; c + count <= total; ++c)
     if (try_run(c)) return took(c);
   return -1;
 }
@@ -366,7 +374,7 @@ void NetAudioServer::release_channels(unsigned base, unsigned count) {
 
 void NetAudioServer::label_channels(unsigned base, unsigned count, const std::string& peer,
                                     const std::string& name, const std::string& transport) {
-  for (unsigned i = 0; i < count && base + i < kNetInputs; ++i) {
+  for (unsigned i = 0; i < count && base + i < this->count(); ++i) {
     Channel& c = *chans_[base + i];
     {
       std::lock_guard<std::mutex> lock(c.m);
@@ -452,26 +460,32 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
       }
       const uint16_t ch_count = st_get_u16(p + ST_HELLO_O_CHANNELS);
       if (st_get_u32(p + ST_HELLO_O_FORMAT) != ST_FMT_S32_LE || ch_count == 0 ||
-          ch_count > kNetInputs) {
+          ch_count > srv.count()) {
         reject(ST_HELLO_BAD_FORMAT);
         return false;
       }
       channels = ch_count;
 
+      std::string name;
+      const uint32_t nlen = st_get_u32(p + ST_HELLO_O_NAME_LEN);
+      if (nlen && nlen <= len - ST_HELLO_FIXED) {
+        name.assign(reinterpret_cast<const char*>(p + ST_HELLO_FIXED),
+                    std::min<uint32_t>(nlen, ST_NET_MAX_NAME));
+        // Before the claim: which stream this is decides where a returning one is put.
+        char sname[ST_NET_MAX_STREAM_NAME + 1];
+        if (st_get_trailing_str(p, len, ST_HELLO_FIXED + nlen, sname, sizeof(sname)))
+          stream = sname;
+      }
+
       const uint16_t want = port_channel >= 0
                                 ? static_cast<uint16_t>(port_channel)
                                 : st_get_u16(p + ST_HELLO_O_WANT_CH);
-      base = srv.claim_channels(want, ip, channels);
+      base = srv.claim_channels(want, ip, channels, stream);
       if (base < 0) {
         reject(ST_HELLO_BUSY);
         return false;
       }
 
-      std::string name;
-      const uint32_t nlen = st_get_u32(p + ST_HELLO_O_NAME_LEN);
-      if (nlen && ST_HELLO_FIXED + nlen <= len)
-        name.assign(reinterpret_cast<const char*>(p + ST_HELLO_FIXED),
-                    std::min<uint32_t>(nlen, ST_NET_MAX_NAME));
       for (unsigned i = 0; i < channels; ++i) {
         NetAudioServer::Channel& c = *srv.chans_[base + i];
         {
@@ -496,9 +510,9 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
       st_put_u32(ack + ST_ACK_O_COUNT, channels);
       if (!send_msg(fd, ST_MSG_HELLO_ACK, ack, sizeof(ack))) return false;
 
-      LOG_INFO("net: {} ({}) took {} channel(s) from {} — input{} {}", peer,
-               name.empty() ? "anonymous" : name, channels, base, channels > 1 ? "s" : "",
-               st::channels().net_base() + base);
+      LOG_INFO("net: {} ({}{}{}) took {} channel(s) from {} — input{} {}", peer,
+               name.empty() ? "anonymous" : name, stream.empty() ? "" : ", stream ", stream,
+               channels, base, channels > 1 ? "s" : "", st::channels().net_base() + base);
 
       // Only now, with the handshake already answered, ask who this address belongs to. A
       // resolver with nothing to talk to blocks for seconds, and the sender is waiting.
@@ -836,8 +850,12 @@ void NetAudioServer::serve(int fd, sockaddr_in addr, int port_channel) {
           st_get_u32(p + ST_CTLH_O_PROTO) != kNetProtoVersion) {
         break;
       }
-      serve_ctl(fd, s.ip, port_channel >= 0 ? static_cast<uint16_t>(port_channel)
-                                            : st_get_u16(p + ST_CTLH_O_CHANNEL));
+      char sname[ST_NET_MAX_STREAM_NAME + 1];
+      st_get_trailing_str(p, len, ST_CTL_HELLO_BYTES, sname, sizeof(sname));
+      serve_ctl(fd, s.ip,
+                port_channel >= 0 ? static_cast<uint16_t>(port_channel)
+                                  : st_get_u16(p + ST_CTLH_O_CHANNEL),
+                sname);
       ::close(fd);
       return;
     }
@@ -875,7 +893,7 @@ void NetAudioServer::read_block(uint64_t n, size_t frames, uint64_t delay, float
   // past the point where it would have been emitted, whatever the ring is still catching up on.
   reader_n_.store(n, std::memory_order_release);
 
-  for (unsigned c = 0; c < kNetInputs; ++c) {
+  for (unsigned c = 0; c < count(); ++c) {
     Channel& ch = *chans_[c];
     float* lp = live + (st::channels().net_base() + c);
     float* rp = ring + (st::channels().net_base() + c);
@@ -907,20 +925,26 @@ void NetAudioServer::read_block(uint64_t n, size_t frames, uint64_t delay, float
   }
 }
 
-int NetAudioServer::ctl_channel_for(const std::string& ip, uint16_t want) const {
-  if (want < kNetInputs) return static_cast<int>(want);
+int NetAudioServer::ctl_channel_for(const std::string& ip, uint16_t want,
+                                    const std::string& stream) const {
+  if (want < count()) return static_cast<int>(want);
   // No channel asked for: control whichever one this machine is streaming on, or last streamed
   // on. That is the same address memory the audio side uses to hand a channel back, so a mixer
-  // and its PCM end up on the same channel without either being told which.
-  for (unsigned c = 0; c < kNetInputs; ++c) {
-    std::lock_guard<std::mutex> lock(chans_[c]->m);
-    if (chans_[c]->last_ip == ip) return static_cast<int>(c);
+  // and its PCM end up on the same channel without either being told which. A mixer that names a
+  // stream wants that one; until it has played, any of the machine's will do.
+  for (int pass = stream.empty() ? 1 : 0; pass < 2; ++pass) {
+    for (unsigned c = 0; c < count(); ++c) {
+      std::lock_guard<std::mutex> lock(chans_[c]->m);
+      if (chans_[c]->last_ip == ip && (pass == 1 || chans_[c]->last_stream == stream))
+        return static_cast<int>(c);
+    }
   }
   return 0;  // nothing known about this machine yet; the ack says which channel it got
 }
 
-NetAudioServer::MixRun NetAudioServer::mixer_run(const std::string& ip, uint16_t want) const {
-  const int ch = ctl_channel_for(ip, want);
+NetAudioServer::MixRun NetAudioServer::mixer_run(const std::string& ip, uint16_t want,
+                                                 const std::string& stream) const {
+  const int ch = ctl_channel_for(ip, want, stream);
   MixRun r;
   {
     std::lock_guard<std::mutex> lock(chans_[ch]->m);
@@ -930,15 +954,16 @@ NetAudioServer::MixRun NetAudioServer::mixer_run(const std::string& ip, uint16_t
   // A channel that is not inside the run it names has never been part of one — an untouched
   // channel still carries the {0, 1} its Channel was built with — so it is a run of its own.
   const unsigned c = static_cast<unsigned>(ch);
-  if (r.count == 0 || r.base + r.count > kNetInputs || c < r.base || c >= r.base + r.count) {
+  if (r.count == 0 || r.base + r.count > count() || c < r.base || c >= r.base + r.count) {
     r.base = c;
     r.count = 1;
   }
   return r;
 }
 
-void NetAudioServer::serve_ctl(int fd, const std::string& ip, uint16_t want) {
-  MixRun run = mixer_run(ip, want);
+void NetAudioServer::serve_ctl(int fd, const std::string& ip, uint16_t want,
+                               const std::string& stream) {
+  MixRun run = mixer_run(ip, want, stream);
 
   // The run's first channel is the reference. Everything below reads and writes through `run`,
   // which moves under it.
@@ -1000,7 +1025,7 @@ void NetAudioServer::serve_ctl(int fd, const std::string& ip, uint16_t want) {
     // that machine takes a stereo run the one volume has to cover both. The value it is showing
     // goes to the channels that just joined, or the pair comes apart at the moment it starts
     // playing — the mixer's -20 dB on NET 1 while NET 2 runs at full scale.
-    const MixRun now = mixer_run(ip, want);
+    const MixRun now = mixer_run(ip, want, stream);
     if (now.base != run.base || now.count != run.count) {
       const float db = gain_db();
       const bool m = muted();
@@ -1030,18 +1055,18 @@ void NetAudioServer::serve_ctl(int fd, const std::string& ip, uint16_t want) {
 }
 
 bool NetAudioServer::channel_in_use(unsigned c) const {
-  if (c >= kNetInputs) return false;
+  if (c >= count()) return false;
   const Channel& ch = *chans_[c];
   return ch.claimed.load(std::memory_order_relaxed) ||
          ch.frames_received.load(std::memory_order_relaxed) != 0;
 }
 
 bool NetAudioServer::channel_connected(unsigned c) const {
-  return c < kNetInputs && chans_[c]->claimed.load(std::memory_order_relaxed);
+  return c < count() && chans_[c]->claimed.load(std::memory_order_relaxed);
 }
 
 bool NetAudioServer::forget_channel(unsigned c) {
-  if (c >= kNetInputs) return false;
+  if (c >= count()) return false;
   Channel& ch = *chans_[c];
   // Held as a claim while it is cleared, so a sender arriving meanwhile is given another channel
   // rather than one being wiped under it.
@@ -1065,6 +1090,7 @@ bool NetAudioServer::forget_channel(unsigned c) {
     ch.transport = "net";
     ch.last_ip.clear();
     ch.last_device.clear();
+    ch.last_stream.clear();
     ch.stream_base = 0;
     ch.stream_count = 1;
     ch.stream_index = 1;
@@ -1075,8 +1101,8 @@ bool NetAudioServer::forget_channel(unsigned c) {
 
 std::vector<NetChannelStatus> NetAudioServer::status() const {
   std::vector<NetChannelStatus> out;
-  out.reserve(kNetInputs);
-  for (unsigned c = 0; c < kNetInputs; ++c) {
+  out.reserve(count());
+  for (unsigned c = 0; c < count(); ++c) {
     const Channel& ch = *chans_[c];
     NetChannelStatus s;
     s.channel = c;
@@ -1104,6 +1130,8 @@ std::vector<NetChannelStatus> NetAudioServer::status() const {
       s.stream_index = ch.stream_index;
       s.stream_count = ch.stream_count;
       s.last_device = ch.last_device;
+      s.stream = s.connected ? ch.last_stream : std::string{};
+      s.last_stream = ch.last_stream;
       s.transport = ch.transport;
     }
     out.push_back(std::move(s));

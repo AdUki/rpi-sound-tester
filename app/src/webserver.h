@@ -32,6 +32,9 @@ struct WebOptions {
   std::string host = "0.0.0.0";
   int port = 80;
   bool allow_reboot = true;
+  // The most network inputs a restart may be asked for: what the ring's columns and this
+  // machine's RAM leave room for.
+  unsigned net_inputs_max = kMaxInputs;
 };
 
 struct Deps {

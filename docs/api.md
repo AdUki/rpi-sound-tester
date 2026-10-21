@@ -64,14 +64,15 @@ stream).
   `available` is false elsewhere), `sync_errors`, `hostname`, `ips`, `has_saved_config`,
   `data_persistent`, `listen_streams` (open listen streams), `loopback_offset_samples` (set in
   `config.json` only).
-- `limits`: counts: `inputs_total`, `inputs_local`, `inputs_device`, `outputs`, `net_inputs`,
-  `sinks_max`; gain ranges: `input_gain_min_db`, `input_gain_max_db`, `net_gain_min_db`; capture:
+- `limits`: counts: `inputs_total`, `inputs_local`, `inputs_device`, `outputs`, `net_inputs`
+  (running), `net_inputs_configured` (what the next start has, see `PUT /api/net`),
+  `net_inputs_min`, `net_inputs_max`, `sinks_max`; gain ranges: `input_gain_min_db`, `input_gain_max_db`, `net_gain_min_db`; capture:
   `capture_max_frames`, `env_column_frames` (frames per scope envelope column), `pinned_mb` (memory
   locked for the ring, the snapshot and the sinks); listening: `listen_codecs`,
   `listen_default_codec`, `listen_bitrate_kbps`, `listen_bitrate_min_kbps`,
   `listen_bitrate_max_kbps`, `opus_rate`; network input: `net_port`, `net_delay_ms`,
   `net_delay_min_ms`, `net_delay_max_ms`; feature flags: `channel_map`, `sync_watch` and `bluetooth`
-  as above; `capture_config`, `input_mute`, `telemetry_mask`, `net` and `net_forget` are always true, so a console
+  as above, `restart` (`POST /api/system/restart` is allowed); `capture_config`, `input_mute`, `telemetry_mask`, `net` and `net_forget` are always true, so a console
   can tell an older daemon by their absence.
 
 ## Inputs
@@ -417,7 +418,7 @@ if it changed, the timeline has a gap. `status` also returns `live_now` (write h
 How much the next freeze copies. `{"seconds": N}` or `{"frames": N}`, clamped to
 [4096, `limits.capture_max_frames`]. The reply says what took effect: `analyze_frames`,
 `analyze_seconds`, `max_frames`, `max_seconds`, `pinned_mb`. 507 when the snapshot cannot be
-allocated that large. Resets to 20 s on restart.
+allocated that large. Resets to 10 s on restart.
 
 ### `GET /api/capture/window?ch=&start=&len=&cols=`
 The scope. `ch` is required; `len` defaults to 96000, `start` to the last `len` frames and `cols` to
@@ -550,8 +551,10 @@ sender, with `transport: "bluetooth"` and its Bluetooth address as `peer`.
 ```json
 {"enabled": true, "listening": true, "port": 4010, "delay_ms": 1000,
  "delay_frames": 96000, "rate": 96000, "n_now": 1466240, "lead_seconds": 1.0, "error": "",
+ "inputs": 6, "inputs_configured": 6, "inputs_max": 10,
  "channels": [{"channel": 0, "input": 6, "connected": true, "peer": "192.168.1.7:41154",
-               "name": "thinkpad", "host": "thinkpad.lan", "device": "thinkpad",
+               "name": "thinkpad", "stream": "main", "last_stream": "main",
+               "host": "thinkpad.lan", "device": "thinkpad",
                "last_device": "thinkpad", "transport": "net",
                "stream_index": 1, "stream_count": 1, "frames_received": 874496,
                "late_drops": 0, "range_drops": 0, "underruns": 0, "resyncs": 0,
@@ -563,7 +566,10 @@ sender, with `transport: "bluetooth"` and its Bluetooth address as `peer`.
 `{"source": {"type": "input", "index": 6}}`, or measure it with `?ch_a=0&ch_b=6`. `name` is what
 the sender calls itself (the plugin sends its hostname), `host` its address resolved to a name when
 the network can, and `device` the one to show: `name`, else `host`, else the address. `last_device`
-keeps it after the sender disconnects. `transport`
+keeps it after the sender disconnects. `stream` is which of the machine's outputs this is — the
+PCM's `name` setting, empty without one — and `last_stream` keeps it like `last_device`; the
+channel's name in `GET /api/state` reads `main · thinkpad`. `inputs` is how many network channels
+there are, `inputs_configured` how many the next start will have. `transport`
 is `net`, or `bluetooth` for a phone. `lead_error_ms` is `lead_frames` against
 `target_lead_frames` in milliseconds, meaningful while `lead_valid`.
 
@@ -573,13 +579,13 @@ one thing this device must not do. A steady count means the network cannot keep 
 — raise it. `range_drops` means the sender aimed outside the buffer entirely, and `underruns` means
 the sender stopped supplying audio before its slot came round.
 
-### `DELETE /api/net/channels/{0-5}`
+### `DELETE /api/net/channels/{n}`
 Forgets a channel no sender is on: `active` goes false, its counters and `last_device` are cleared,
 and a returning sender is no longer steered back to it. Its routing is left as it is, and so is the
 audio already in its ring column. A sender on the channel is a 409; check `limits.net_forget`.
 
 ### Rates, formats and multi-channel senders
-A sender asks for `channels` (default 1, at most 6) and gets that many **adjacent** inputs — a
+A sender asks for `channels` (default 1, at most 8 and at most `inputs`) and gets that many **adjacent** inputs — a
 stereo source becomes NET 1 + NET 2, not NET 1 and NET 5 — so a pair reads as one source. All of its
 channels travel in the same packet and through one converter, which keeps them sample-identical even
 while the stream is being resampled: they cannot come apart because they are never handled apart.
@@ -594,20 +600,36 @@ The device listens on the base port for *any* channel, and on **base + 1 + N for
 channel, so it wins over the `channel` argument in the sender's config.
 
 With neither, a returning sender is given **the channel it used last time**, matched on its
-address. Routing set up against NET 3 therefore keeps meaning that machine across a reconnect, and
-a channel goes on saying whose it was while the machine is switched off. Two streams from one
-machine cannot be told apart by address — pin those with a port or a channel.
+address and its stream name. Routing set up against NET 3 therefore keeps meaning that machine
+across a reconnect, and a channel goes on saying whose it was while the machine is switched off.
+Two streams from one machine are told apart by `name` (`main`, `notif`): each is a sender of its
+own and comes back to its own run. Unnamed, they cannot be told apart by address — pin those with
+a port or a channel. The memory lasts as long as the daemon runs.
 
 ### `PUT /api/net`
 ```json
-{"enabled": true, "delay_ms": 1000, "port": 4010}
+{"enabled": true, "delay_ms": 1000, "port": 4010, "inputs": 8}
 ```
-`port` is 1–65529, so the six per-channel ports above it exist too. Changing it rebinds the
+`port` is 1–65503, so a per-channel port for every network input there can be exists too. Changing it rebinds the
 listener and drops any connected sender; with network input off it is only remembered, for the
 next enable. Either way `config/save` keeps it; a port outside that range is a 400. `delay_ms`
 clamps to `limits.net_delay_min_ms`…`limits.net_delay_max_ms` (0–2000). Answers `{"enabled",
-"listening", "port", "delay_ms", "delay_frames", "error"}`; a bind that fails still answers 200 —
-check `listening` and `error`.
+"listening", "port", "delay_ms", "delay_frames", "inputs", "inputs_configured", "inputs_max",
+"error"}`; a bind that fails still answers 200 — check `listening` and `error`.
+
+`inputs` is how many network inputs the device has, `limits.net_inputs_min`…`net_inputs_max`
+(else 400). Each is a column of the capture ring, pinned in RAM whether or not anything is sent to
+it (`limits.pinned_mb` grows by roughly 37 MB per input at 96 kHz, 20 MB once the ring is shortened), so the count is fixed when the
+daemon starts: a new one is written straight into the saved config (`net.inputs`) — only that
+value; nothing else is saved with it — and takes effect at the next start, `POST
+/api/system/restart`. `inputs_configured` is the saved value, `inputs` the running one. A save that
+fails (no data partition) says why in `error`. The daemon also takes `--net-inputs N`, which wins
+over the config. When the capture ring would not fit in the RAM available at startup, it is first
+shortened from 87 s to 43.7 s at 96 kHz (the longest Analyze buffer a Pi can be given is shorter
+than that anyway; `limits.capture_max_frames` says what is left), and only past that are fewer
+inputs taken than asked, never below 6. `limits.net_inputs_max` is the most that fit. Inputs keep their gain, name and routing across a change: device inputs,
+which sit after the network ones, move with them, and an output routed to a network input that is
+gone falls silent.
 
 ### On the sending machine
 ```sh
@@ -616,6 +638,7 @@ aplay -D soundtester:192.168.1.42 tone.wav
 aplay -D 'plug:"soundtester:192.168.1.42"' any.wav
 aplay -D soundtester:HOST=192.168.1.42,PORT=4013 tone.wav   # pin this machine to NET 3
 aplay -D soundtester:HOST=192.168.1.42,CHANNELS=2 st.wav    # stereo -> two adjacent inputs
+aplay -D soundtester:HOST=192.168.1.42,NAME=notif ding.wav  # shown as "notif" on its channel
 aplay -D soundtester:HOST=192.168.1.42,ENCODING=vorbis f.wav # compress on the way
 alsamixer -D soundtester:192.168.1.42                       # volume and mute
 ```
@@ -628,8 +651,10 @@ other way about.
 With no `channel` it follows the same address memory the audio side uses, and keeps following it:
 alsamixer is normally open before anything plays, when that machine's run is one channel wide, and
 the volume widens to cover both when its stereo stream takes NET 1+2. A pinned `CHANNEL` or port
-stays where it was put, still covering the whole run that channel belongs to. The mixer takes
-`HOST`, `PORT` and `CHANNEL`; the PCM also `CHANNELS`, `ENCODING`, `QUALITY` and `MIXER`. Both take
+stays where it was put, still covering the whole run that channel belongs to. A mixer with a `NAME`
+drives that named stream of the machine (until it has played, whichever of the machine's it finds).
+The mixer takes `HOST`, `PORT`, `CHANNEL` and `NAME`; the PCM also `CHANNELS`, `ENCODING`,
+`QUALITY` and `MIXER`. `NAME` is optional, up to 32 characters, and an older device ignores it. Both take
 them positional or named: `soundtester:HOST=bench.local,CHANNELS=2`.
 
 `alsa-plugin/examples/` has a working `/etc/asound.conf` that makes the tester a machine's default
@@ -780,8 +805,9 @@ if `/data` did not mount the save is refused with a 500 (`data_persistent: false
 Deletes the saved file; the next boot uses the image defaults. Bluetooth pairings stay. Answers
 `{"ok": true}` also when nothing was saved, 500 when the file could not be removed.
 
-### `POST /api/system/reboot` · `POST /api/system/shutdown`
-Answers `{"ok":true}`, then runs `systemctl reboot` / `poweroff`. Disabled in a simulated run and
+### `POST /api/system/reboot` · `POST /api/system/shutdown` · `POST /api/system/restart`
+Answers `{"ok":true}`, then runs `systemctl reboot` / `poweroff`, or restarts only the daemon
+(`systemctl restart soundtesterd`, which is how a new network input count takes effect). Disabled in a simulated run and
 on a desktop (board.json's `desktop`, as on a PC): 403.
 Shutdown exists because a power cut during a `/data` save can corrupt the card.
 

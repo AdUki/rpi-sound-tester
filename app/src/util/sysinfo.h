@@ -70,4 +70,8 @@ class CpuSampler {
 // cpu_cores are left empty — fill them in from a CpuSampler owned by the caller.
 SysInfo sample_sysinfo();
 
+// One field of /proc/meminfo ("MemAvailable:"), in bytes. Zero when it cannot be read, which
+// callers treat as "no opinion" rather than as "no memory".
+uint64_t meminfo_bytes(const char* field);
+
 }  // namespace st

@@ -188,6 +188,9 @@ struct NetControl {
   std::atomic<uint32_t> delay_ms{kNetDelayDefaultMs};
   std::atomic<uint32_t> delay_frames{0};
   std::atomic<uint16_t> port{kNetPort};
+  // How many network inputs the NEXT start gives the ring (net.inputs). Read by a save and the
+  // API only: the running count is channels().net, fixed at startup.
+  std::atomic<uint32_t> inputs{kNetInputsDefault};
 };
 
 // The delay_frames that the switches and delay_ms above imply. There is one expression for it, here,

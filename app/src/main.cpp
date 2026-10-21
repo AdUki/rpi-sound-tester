@@ -2,6 +2,7 @@
 #include <alsa/asoundlib.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -28,6 +29,7 @@
 #include "kmsg_watch.h"
 #include "ring_buffer.h"
 #include "util/log.h"
+#include "util/sysinfo.h"
 #include "webserver.h"
 
 namespace {
@@ -69,6 +71,31 @@ void start_shutdown_watchdog() {
     std::_Exit(0);
   }).detach();
 }
+// The longest ring, kRingFramesMin..kRingFrames, whose `columns` this machine has the RAM for, or
+// 0 if not even the shortest fits. Every column is pinned whether or not anything is ever sent to
+// it, and a freeze copies each one too, so a column costs the ring's frames plus a default analyze
+// buffer's, and something has to be left over for everything else. `avail` 0 (no /proc/meminfo)
+// is no opinion: the full ring.
+size_t ring_frames_for(unsigned columns, unsigned rate, uint64_t avail) {
+  constexpr uint64_t kKeepFree = 128ull * 1024 * 1024;
+  if (avail == 0) return st::kRingFrames;
+  const uint64_t analyze = static_cast<uint64_t>(st::kCaptureDefaultSeconds * rate);
+  for (size_t frames = st::kRingFrames; frames >= st::kRingFramesMin; frames >>= 1) {
+    const uint64_t need = uint64_t{columns} * (frames + analyze) * sizeof(float) + kKeepFree;
+    if (need <= avail) return frames;
+  }
+  return 0;
+}
+
+// The most network inputs this machine has the RAM for, at the shortest ring. Never fewer than the
+// default count, which every supported board has always run with: this only stops a raised count
+// from pinning the board into the OOM killer.
+unsigned net_inputs_that_fit(const st::ChannelLayout& l, unsigned rate, uint64_t avail) {
+  const unsigned fixed = l.local + l.device;
+  unsigned fit = st::kNetInputsDefault;
+  while (fixed + fit < st::kMaxInputs && ring_frames_for(fixed + fit + 1, rate, avail)) ++fit;
+  return fit;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -85,6 +112,7 @@ int main(int argc, char** argv) {
   unsigned period = 0;
   int port = 80;
   int net_port = 0;  // 0 = whatever the config says
+  unsigned net_inputs = 0;  // 0 = whatever the config says
   std::vector<std::string> extra_sinks;
   std::vector<std::string> extra_inputs;
   std::string bt_adapter;
@@ -105,6 +133,8 @@ int main(int argc, char** argv) {
   app.add_option("--period", period, "Period size in frames (default board.json's)");
   app.add_option("--port", port, "HTTP port (default 80)");
   app.add_option("--net-port", net_port, "TCP port for network audio input (default 4010)");
+  app.add_option("--net-inputs", net_inputs,
+                 "How many network inputs to have (default config.json's net.inputs, 6)");
   app.add_option("--sink", extra_sinks,
                  "Also offer this ALSA device as a sink, e.g. default to hear it through a "
                  "desktop's speakers (repeatable; hardware devices are found without it)");
@@ -155,23 +185,38 @@ int main(int argc, char** argv) {
   eopt.capture_channels = board.capture_channels;
   eopt.sim_stagger = sim_stagger;
 
+  // Before the layout: how many network inputs there are is a setting.
+  st::ConfigStore store(config_path, data_dir);
+  st::Config cfg = store.load();
+
   // The ring's columns, fixed from here on: the engine card's own channels, if it has one (the
-  // simulator is an Octo), then the network inputs.
+  // simulator is an Octo), then the network inputs, then the device inputs.
   st::ChannelLayout layout;
   if (eopt.timer() && !sim) {
     layout.local = 0;
     layout.outputs = 0;
   }
-  layout.device = std::min(board.device_inputs, st::kMaxInputs - layout.local - layout.net);
+  layout.device =
+      std::min(board.device_inputs, st::kMaxInputs - layout.local - st::kNetInputsMin);
+  const unsigned net_max = st::kMaxInputs - layout.local - layout.device;
+  const unsigned net_want =
+      std::clamp(net_inputs ? net_inputs : cfg.net_inputs, st::kNetInputsMin, net_max);
+  const uint64_t mem_avail = st::meminfo_bytes("MemAvailable:");
+  const unsigned net_fit = net_inputs_that_fit(layout, eopt.rate, mem_avail);
+  layout.net = std::min(net_want, net_fit);
+  if (layout.net < net_want) {
+    LOG_WARN("{} network inputs asked for, {} fit in this machine's RAM: running with {}",
+             net_want, net_fit, layout.net);
+  }
   st::set_channels(layout);
   LOG_INFO("board: {}; {} Hz, period {}; {} local inputs, {} outputs, {} network inputs, {} for "
            "device inputs",
            sim ? std::string("simulated Octo")
                : eopt.device.empty() ? std::string("no engine card") : eopt.device,
            eopt.rate, eopt.period, layout.local, layout.outputs, layout.net, layout.device);
-
-  st::ConfigStore store(config_path, data_dir);
-  st::Config cfg = store.load();
+  // Saved gains, names and routes follow their inputs to wherever this layout put them.
+  cfg.remap_columns(layout);
+  if (net_inputs) cfg.net_inputs = net_inputs;
 
   // A tmpfs on /data means the real partition never mounted. The box still runs and stays
   // reachable, but nothing can be saved — say so at startup rather than letting the first
@@ -192,7 +237,15 @@ int main(int argc, char** argv) {
   st::Control ctl;
   cfg.apply_to(ctl, eopt.rate);
 
-  st::RingBuffer ring(st::kRingFrames, layout.total(), 2ull * eopt.period);
+  // As long as RAM allows with these columns: the full ring unless more network inputs were asked
+  // for than it leaves room for. The default layout always gets the full one, as it always has.
+  size_t ring_frames = ring_frames_for(layout.total(), eopt.rate, mem_avail);
+  if (ring_frames == 0 || layout.net <= st::kNetInputsDefault) ring_frames = st::kRingFrames;
+  if (ring_frames < st::kRingFrames) {
+    LOG_INFO("ring shortened to {:.1f} s to fit {} inputs in RAM", ring_frames / double(eopt.rate),
+             layout.total());
+  }
+  st::RingBuffer ring(ring_frames, layout.total(), 2ull * eopt.period);
   st::AudioEngine engine(ctl, ring, eopt);
 
   // Wired in before start(), so the audio thread never sees a half-constructed server. A bind
@@ -294,6 +347,7 @@ int main(int argc, char** argv) {
   // A simulated run, or any run on a desktop, is someone's workstation: its reboot/shutdown
   // buttons must not systemctl the host.
   wopt.allow_reboot = !sim && !board.desktop;
+  wopt.net_inputs_max = std::min(net_max, net_fit);
 
   st::Deps deps{ctl, net, devices, bt, bt_in, ring, engine, analysis, capture, kmsg, store, cfg};
   st::WebServer server(deps, wopt);

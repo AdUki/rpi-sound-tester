@@ -1462,6 +1462,22 @@ function buildNet() {
   $('netdelay').min = state.limits.net_delay_min_ms;
   $('netdelay').max = state.limits.net_delay_max_ms;
 
+  // The count is fixed when the daemon starts (an older one has no say in it at all): a new one is
+  // saved for the next start, which the button brings about.
+  const haveCount = state.limits.net_inputs_max !== undefined;
+  $('netcount').closest('.btrow').hidden = !haveCount;
+  if (haveCount) {
+    $('netcount').min = state.limits.net_inputs_min;
+    $('netcount').max = state.limits.net_inputs_max;
+    $('netcount').onchange = () => {
+      put('/net', {inputs: parseInt($('netcount').value, 10)}).then(r => {
+        netState = Object.assign(netState || {}, r);
+        renderNetCount(r.error);
+      }).catch(e => { renderNetCount(e.message); });
+    };
+    $('netrestart').onclick = restartForNetCount;
+  }
+
   const push = () => {
     put('/net', {
       enabled: $('neten').checked,
@@ -1483,6 +1499,39 @@ function buildNet() {
   refreshNet();
 }
 
+// Says whether the count in the box is the one running, and offers the restart that applies it.
+function renderNetCount(err) {
+  if (!netState || netState.inputs_configured === undefined) return;
+  const running = netState.inputs, next = netState.inputs_configured;
+  if (document.activeElement !== $('netcount')) $('netcount').value = next;
+  const pending = running !== next;
+  $('netrestart').hidden = !pending || !state.limits.restart;
+  $('netcountmsg').textContent = err ? err
+    : !pending ? `${running} running`
+    : state.limits.restart ? `${running} running, ${next} after a restart`
+    : `${running} running, ${next} once the daemon is restarted`;
+}
+
+// The page is built for the daemon's channel count, so once the restarted one answers with the
+// new count it is loaded afresh.
+function restartForNetCount() {
+  const want = netState && netState.inputs_configured;
+  if (!confirm(`Restart the tester's software to have ${want} network inputs? Audio stops for a few seconds and every sender reconnects.`)) return;
+  post('/system/restart').then(() => {
+    $('netrestart').disabled = true;
+    $('netcountmsg').textContent = 'restarting…';
+    const t0 = Date.now();
+    const poll = () => api('/state').then(s => {
+      if (s.limits && s.limits.net_inputs === want) location.reload();
+      else throw new Error('not yet');
+    }).catch(() => {
+      if (Date.now() - t0 < 60000) setTimeout(poll, 1000);
+      else { $('netrestart').disabled = false; $('netcountmsg').textContent = 'the daemon did not come back with the new count'; }
+    });
+    setTimeout(poll, 1500);
+  }).catch(e => { $('netcountmsg').textContent = e.message; });
+}
+
 function renderNetSnippet() {
   const host = location.hostname || 'soundtester.local';
   const port = netState && netState.port ? netState.port : 4010;
@@ -1493,9 +1542,10 @@ function renderNetSnippet() {
     `alsamixer -D soundtester:${host}${extra}          # volume and mute\n\n` +
     `# port ${port} takes any free channel; ${port + 1}..${port + (netState ? netState.channels.length : 6)} pin NET 1..${netState ? netState.channels.length : 6}\n` +
     `aplay -D soundtester:HOST=${host},PORT=${port + 3} tone.wav   # always NET 3\n` +
-    `aplay -D soundtester:HOST=${host},CHANNELS=2 stereo.wav    # two adjacent inputs\n\n` +
-    `# or in ~/.asoundrc\n` +
-    `pcm.bench {\n  type soundtester\n  host ${host}\n  port ${port}\n}`;
+    `aplay -D soundtester:HOST=${host},CHANNELS=2 stereo.wav    # two adjacent inputs\n` +
+    `aplay -D soundtester:HOST=${host},NAME=notif ding.wav       # shown as "notif"\n\n` +
+    `# or in ~/.asoundrc: one PCM per output, told apart by name\n` +
+    `pcm.bench {\n  type soundtester\n  host ${host}\n  port ${port}\n  name "main"\n}`;
 }
 
 function refreshNet() {
@@ -1505,6 +1555,7 @@ function refreshNet() {
     if (document.activeElement !== $('neten')) $('neten').checked = n.enabled;
     if (document.activeElement !== $('netdelay')) $('netdelay').value = n.delay_ms;
     if (document.activeElement !== $('netport')) $('netport').value = n.port;
+    renderNetCount();
     if (!$('netmsg').textContent || netPollOwnsMsg) {
       netPollOwnsMsg = true;
       $('netmsg').textContent = n.error ? n.error : n.enabled ? `listening on ${n.port}` : 'off';
@@ -1519,10 +1570,13 @@ function refreshNet() {
       const part = c.stream_count > 1 ? ` <span class="muted">${c.stream_index}/${c.stream_count}</span>` : '';
       // A Bluetooth phone is a sender too; its peer is its Bluetooth address.
       const via = c.transport === 'bluetooth' ? 'Bluetooth ' : '';
+      // A named stream ("main", "notif") is which of the machine's outputs this is.
+      const stream = c.stream ? `<strong>${esc(c.stream)}</strong> · ` : '';
+      const lastStream = c.last_stream ? `${esc(c.last_stream)} · ` : '';
       const state_ = c.connected
-        ? `<strong>${esc(c.device) || 'unidentified'}</strong>${part} <span class="mono muted">${via}${esc(c.peer)}</span>`
+        ? `${stream}<strong>${esc(c.device) || 'unidentified'}</strong>${part} <span class="mono muted">${via}${esc(c.peer)}</span>`
         : c.last_device
-          ? `<span class="muted">no sender — last used by ${esc(c.last_device)}</span>`
+          ? `<span class="muted">no sender — last used by ${lastStream}${esc(c.last_device)}</span>`
           : '<span class="muted">free</span>';
       // Drops are the number that matters: frames arriving after their slot has played cannot be
       // placed anywhere truthful, so they are discarded rather than shifted.
@@ -2049,7 +2103,7 @@ let frozenReturnLen = null;
 // Scope tab has been drawn once, and a freeze from another browser can land before that.
 const scopeCols = () => Math.min(2048, Math.max(64, $('scopecanvas').clientWidth || 1024));
 
-// The frozen snapshot is a fixed span — the configured Analyze buffer (default 20 s, up to the
+// The frozen snapshot is a fixed span — the configured Analyze buffer (default 10 s, up to the
 // ~85 s maximum), often less — and its window endpoint 400s outright for any request that
 // reaches past [valid_start, valid_end). Keep the frozen view inside that span: never zoom out
 // wider than the snapshot, never pan off its ends. Without this, widening the scope to 300 s

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 namespace st {
@@ -153,6 +154,20 @@ SysInfo sample_sysinfo() {
     freeifaddrs(ifa);
   }
   return s;
+}
+
+uint64_t meminfo_bytes(const char* field) {
+  std::ifstream f("/proc/meminfo");
+  std::string key;
+  uint64_t kb = 0;
+  while (f >> key) {
+    if (key == field) {
+      f >> kb;
+      return kb * 1024ull;
+    }
+    f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+  }
+  return 0;
 }
 
 }  // namespace st

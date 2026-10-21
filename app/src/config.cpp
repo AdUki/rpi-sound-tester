@@ -118,7 +118,9 @@ OutputConfig output_from_control(const OutputControl& oc) {
 }
 
 std::string Config::to_json() const {
-  const unsigned total = channels().total();
+  // A config holds its per-column arrays in the layout it says, and is written out in that one.
+  const ChannelLayout cols = has_columns ? columns : channels();
+  const unsigned total = std::min(cols.total(), kMaxInputs);
   json j;
   j["inputs"] = json::array();
   for (unsigned c = 0; c < total; ++c)
@@ -140,7 +142,13 @@ std::string Config::to_json() const {
   j["output_names"] = output_names;
   j["loopback_offset_samples"] = loopback_offset_samples;
   j["listen"] = {{"codec", listen_codec}, {"bitrate_kbps", listen_bitrate_kbps}};
-  j["net"] = {{"enabled", net_enabled}, {"port", net_port}, {"delay_ms", net_delay_ms}};
+  j["net"] = {{"enabled", net_enabled},
+              {"port", net_port},
+              {"delay_ms", net_delay_ms},
+              {"inputs", net_inputs}};
+  // What the per-column arrays above are laid out as: the running layout, which is not
+  // necessarily net.inputs' (a count changed and saved, but not yet restarted into).
+  j["columns"] = {{"local", cols.local}, {"net", cols.net}, {"device", cols.device}};
   j["sinks"] = json::object();
   for (const auto& [id, sc] : sinks) j["sinks"][id] = sink_to_json(sc);
   j["bluetooth"] = {{"enabled", bluetooth.enabled},
@@ -203,6 +211,14 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
       c.net_enabled = j["net"].value("enabled", c.net_enabled);
       c.net_port = j["net"].value("port", c.net_port);
       c.net_delay_ms = j["net"].value("delay_ms", c.net_delay_ms);
+      c.net_inputs = j["net"].value("inputs", c.net_inputs);
+    }
+    if (j.contains("columns")) {
+      const json& l = j.at("columns");
+      c.columns.local = l.value("local", 0u);
+      c.columns.net = l.value("net", 0u);
+      c.columns.device = l.value("device", 0u);
+      c.has_columns = c.columns.total() <= kMaxInputs;
     }
     if (j.contains("listen")) {
       c.listen_codec = j["listen"].value("codec", c.listen_codec);
@@ -284,6 +300,7 @@ void Config::apply_to(Control& ctl, unsigned rate) const {
   ctl.net.port.store(static_cast<uint16_t>(std::clamp(net_port, kNetPortMin, kNetPortMax)));
   ctl.net.delay_ms.store(dms);
   ctl.net.delay_frames.store(net_delay_frames(ctl.net, rate));
+  ctl.net.inputs.store(net_inputs);
 
   // A saved map that is not a permutation (see is_slot_permutation) is rejected wholesale.
   if (is_slot_permutation(input_map, kTdmSlots)) {
@@ -299,6 +316,57 @@ void Config::apply_to(Control& ctl, unsigned rate) const {
     LOG_WARN("output_map is not a permutation — falling back to identity");
     for (unsigned i = 0; i < kOutputs; ++i) ctl.output_map[i].store(static_cast<uint8_t>(i));
   }
+}
+
+void Config::remap_columns(const ChannelLayout& to) {
+  ChannelLayout from = to;
+  if (has_columns) {
+    from = columns;
+  } else {
+    from.net = kNetInputsDefault;
+  }
+  columns = to;
+  has_columns = true;
+  if (from.local == to.local && from.net == to.net && from.device == to.device) return;
+
+  // Where column `c` of `from` lands in `to`, or -1: the same section, the same place in it.
+  auto map = [&](unsigned c) -> int {
+    if (c < from.local) return c < to.local ? static_cast<int>(c) : -1;
+    if (from.is_net(c)) {
+      const unsigned k = c - from.net_base();
+      return k < to.net ? static_cast<int>(to.net_base() + k) : -1;
+    }
+    const unsigned k = c - from.device_base();
+    return k < to.device ? static_cast<int>(to.device_base() + k) : -1;
+  };
+
+  const std::array<InputConfig, kMaxInputs> old_inputs = inputs;
+  const std::vector<std::string> old_names = input_names;
+  inputs = {};
+  std::fill(input_names.begin(), input_names.end(), std::string());
+  for (unsigned c = 0; c < from.total() && c < kMaxInputs; ++c) {
+    const int n = map(c);
+    if (n < 0) continue;
+    inputs[n] = old_inputs[c];
+    if (c < old_names.size()) input_names[n] = old_names[c];
+  }
+
+  auto reroute = [&](OutputConfig& o) {
+    if (o.source_type != "input") return;
+    const int c = std::atoi(o.source_index.c_str());
+    const int n = c >= 0 && static_cast<unsigned>(c) < from.total() ? map(c) : -1;
+    if (n < 0) {
+      o.source_type = "silence";
+      o.source_index.clear();
+    } else {
+      o.source_index = std::to_string(n);
+    }
+  };
+  for (OutputConfig& o : outputs) reroute(o);
+  for (auto& [id, sc] : sinks)
+    for (OutputConfig& o : sc.outputs) reroute(o);
+  LOG_INFO("config: inputs moved from {} local + {} net + {} device columns to {} + {} + {}",
+           from.local, from.net, from.device, to.local, to.net, to.device);
 }
 
 Config Config::from_control(const Control& ctl, const Config& base) {
@@ -328,6 +396,7 @@ Config Config::from_control(const Control& ctl, const Config& base) {
   c.net_enabled = ctl.net.enabled.load();
   c.net_port = ctl.net.port.load();
   c.net_delay_ms = static_cast<int>(ctl.net.delay_ms.load());
+  c.net_inputs = ctl.net.inputs.load();
   return c;
 }
 

@@ -79,6 +79,7 @@ static inline unsigned st_fmt_bytes(unsigned fmt) {
 }
 
 #define ST_NET_MAX_NAME 64u
+#define ST_NET_MAX_STREAM_NAME 32u /* the optional stream name; see HELLO */
 
 /* ---- little-endian primitives ------------------------------------------------------------ */
 
@@ -131,6 +132,38 @@ static inline float st_sample_to_float(const uint8_t *p, unsigned fmt) {
   }
 }
 
+/* Reads the optional [u32 len][bytes] string that starts at `off` in a payload of `len` bytes into
+   `out` (NUL-terminated, at most `cap` - 1 bytes kept). Returns the bytes kept: 0 when there is no
+   such field, which is what an older sender's message looks like. Control characters are dropped,
+   since the string ends up in logs and on a web page. */
+static inline unsigned st_get_trailing_str(const uint8_t *p, uint32_t len, uint32_t off, char *out,
+                                           unsigned cap) {
+  unsigned n = 0;
+  if (cap == 0) return 0;
+  if (off <= len && len - off >= 4u) {
+    uint32_t slen = st_get_u32(p + off);
+    if (slen <= len - off - 4u) {
+      for (uint32_t i = 0; i < slen && n + 1 < cap; i++) {
+        uint8_t ch = p[off + 4u + i];
+        if (ch >= 0x20 && ch != 0x7f) out[n++] = (char)ch;
+      }
+    }
+  }
+  out[n] = '\0';
+  return n;
+}
+
+/* Writes `str` as that optional field at `p` and returns the bytes written: none for an empty or
+   absent string, so a message without one is exactly what an older sender would have sent. */
+static inline uint32_t st_put_trailing_str(uint8_t *p, const char *str) {
+  size_t n = str ? strlen(str) : 0;
+  if (n == 0) return 0;
+  if (n > ST_NET_MAX_STREAM_NAME) n = ST_NET_MAX_STREAM_NAME;
+  st_put_u32(p, (uint32_t)n);
+  memcpy(p + 4, str, n);
+  return 4u + (uint32_t)n;
+}
+
 /* ---- framing ----------------------------------------------------------------------------- */
 
 /* [u8 type][u8 flags][u16 reserved][u32 payload_len] */
@@ -157,6 +190,15 @@ static inline uint32_t st_header_len(const uint8_t* p) { return st_get_u32(p + 4
 #define ST_HELLO_O_WANT_CH 18u   /* u16; 0xffff = "any free channel" */
 #define ST_HELLO_O_NAME_LEN 20u  /* u32, name bytes follow */
 #define ST_HELLO_ANY_CHANNEL 0xffffu
+
+/* Optional, after name[]: [u32 stream_len][stream name]. `name` says which machine is sending (its
+   hostname); the stream name says which of its outputs this is — "main", "notif" — when the PCM
+   was given one (`name` in its .asoundrc). The device shows it on the channel and hands the same
+   run back to the same machine AND stream, so two named streams from one host keep their channels
+   apart without pinning them. A trailing field rather than a new version: a device that predates
+   it never reads past name[], and a sender that predates it sends none. CTL_HELLO carries the
+   same trailer, so a mixer can follow one named stream of a machine that sends several. At most
+   ST_NET_MAX_STREAM_NAME bytes. */
 
 /* HELLO_ACK: proto, status, rate, granted_channel, max_lead_frames, granted_channels.
    `granted_channel` is the FIRST of `granted_channels` adjacent inputs — a multi-channel sender
@@ -234,6 +276,7 @@ static inline uint32_t st_header_len(const uint8_t* p) { return st_get_u32(p + 4
 #define ST_CTLH_O_PROTO 4u
 #define ST_CTLH_O_CHANNEL 8u /* u16 */
 #define ST_CTL_ANY_CHANNEL 0xffffu
+/* Then, optionally, [u32 stream_len][stream name] as in HELLO: the mixer drives that stream. */
 
 /* CTL_ACK: proto, status, channel, gain_min, gain_max, gain, mute, count, flags.
    One volume covers a sender's whole run, so the ack says how many channels that is. The run is

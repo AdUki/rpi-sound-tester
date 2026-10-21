@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "channel_layout.h"
 #include "constants.h"
 #include "control.h"
 
@@ -86,12 +87,26 @@ struct Config {
   bool net_enabled = true;
   int net_port = kNetPort;
   int net_delay_ms = static_cast<int>(kNetDelayDefaultMs);
+  // How many network inputs the ring is built with. Read once at startup (main), since it decides
+  // the ring's columns: a change takes effect at the next start.
+  unsigned net_inputs = kNetInputsDefault;
+
+  // The columns that `inputs`, `input_names` and every output's input source were written for.
+  // A file from before the network input count was a setting has none: it was the running layout
+  // with kNetInputsDefault network inputs.
+  ChannelLayout columns;
+  bool has_columns = false;
 
   // Every sink ever configured, by device id ("b1,0"), whether or not it is plugged in now: a USB
   // interface gets its routing back when it returns.
   std::map<std::string, SinkConfig> sinks;
 
   BtConfig bluetooth;
+
+  // Moves everything indexed by ring column from the layout it was written for onto `to`, so a
+  // device input keeps its gain, name and routes when the network inputs before it grow or
+  // shrink. A column `to` does not have is dropped, and an output routed from it falls silent.
+  void remap_columns(const ChannelLayout& to);
 
   std::string to_json() const;
   static bool from_json(const std::string& text, Config* out, std::string* err);

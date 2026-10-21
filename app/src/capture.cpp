@@ -11,6 +11,7 @@
 #include <new>
 
 #include "util/log.h"
+#include "util/sysinfo.h"
 
 namespace st {
 
@@ -20,22 +21,6 @@ size_t next_pow2(size_t n) {
   size_t p = 1;
   while (p < n) p <<= 1;
   return p;
-}
-
-// One field of /proc/meminfo, in bytes. Zero when it cannot be read, which callers treat as
-// "no opinion" rather than as "no memory".
-uint64_t meminfo_bytes(const char* field) {
-  std::ifstream f("/proc/meminfo");
-  std::string key;
-  uint64_t kb = 0;
-  while (f >> key) {
-    if (key == field) {
-      f >> kb;
-      return kb * 1024ull;
-    }
-    f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-  }
-  return 0;
 }
 
 // Never leave the box with less than this much room, whatever the operator asks for.
@@ -78,7 +63,7 @@ CaptureStore::CaptureStore(const RingBuffer& ring, double rate, unsigned period)
   pending_frames_ = analyze_frames_;
   // The snapshot is sized to the analyze length, not to max_frames_. Pinning the ceiling here
   // regardless of the setting made the console's "longer means more RAM" promise a fiction and
-  // cost ~150 MB that the default 20 s window never touches.
+  // cost ~150 MB that the default 10 s window never touches.
   std::string err;
   if (!resize_snapshot(analyze_frames_, &err)) {
     LOG_ERROR("capture: cannot pin the snapshot buffer: {}", err);
