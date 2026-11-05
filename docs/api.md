@@ -699,8 +699,9 @@ While it runs, its inputs report `"bypass": true` and the mixer's elements go **
 
 The plugin behaves like a sound card rather than a file copier. Frames leave it at a steady rate
 measured against the sender's own monotonic clock — audio flows, it is never queued up and then
-flushed — so the sending application sees its buffer drain as it would from hardware, and the
-network sees an even packet flow. The position follows that clock rather than the plugin's poll
+flushed — so the sending application sees its buffer drain as it would from hardware. On the network
+they travel in bursts of whole application periods, at least 40 ms, so a slow board on Wi-Fi is not
+paying for a packet per position query. The position follows that clock rather than the plugin's poll
 descriptors, so a client that schedules on its own timer drives it too: PipeWire's default `tsched`
 needs no `api.alsa.disable-tsched`.
 

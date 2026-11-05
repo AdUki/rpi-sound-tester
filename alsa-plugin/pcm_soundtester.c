@@ -48,16 +48,28 @@
 #define FD_TIMER 0
 #define FD_COUNT 1
 
-/* Release interval: the application's own period, bounded. One timer does the job of both the
- * period interrupt and the DMA, and whatever a tick releases leaves in one burst — 20 ms is as
- * bursty as the device's alignment tolerates. */
+/* Timer interval: the application's own period, bounded. One timer does the job of the period
+ * interrupt, so a polling client wakes once per period. */
 #define TICK_MIN_NS (5 * 1000 * 1000L)
-#define TICK_MAX_NS (20 * 1000 * 1000L)
+#define TICK_MAX_NS (40 * 1000 * 1000L)
+
+/* Audio leaves in bursts of whole application periods, at least this long. A radio link costs per
+ * packet as much as per byte, and a slow board feels that. The position does not wait for a burst,
+ * it follows the clock on every query, and the device's alignment delay is far longer than this. */
+#define BURST_MIN_NS (40 * 1000 * 1000L)
 
 /* After a stall, pay back at most this much in one go — the rest is left to the device's
  * converter. The real limit is two of the application's own periods (`catchup_ns`): a client that
  * asks for the position once per period is keeping its cadence, not stalling. */
 #define MIN_CATCHUP_NS (4 * TICK_MIN_NS)
+
+/* Most frames one AUDIO message carries, which is the most the device accepts (kNetMaxPacketFrames).
+ * A burst goes out as one message, so one send() and full-sized TCP segments. */
+#define MAX_BURST_FRAMES 4096u
+
+/* Room for a Wi-Fi stall to pass without losing the link, against the device's alignment delay of
+ * about a second. The kernel doubles this and caps it at net.core.wmem_max. */
+#define SEND_BUFFER_BYTES (256 * 1024)
 
 /* How long a send may wait on the far end before the link counts as gone. Bounded: this runs on
  * the application's audio path. */
@@ -106,6 +118,8 @@ typedef struct {
   uint64_t max_lead;      /* most the device accepts in one go */
 
   uint64_t last_tick_ns;
+  uint64_t tick_ns;       /* the timer's interval */
+  uint64_t rx_next_ns;    /* soonest the socket is read again */
   uint64_t catchup_ns;    /* most one advance() may release, in elapsed time */
   double frac;            /* sub-frame remainder, so the average release rate is exact */
 
@@ -129,7 +143,10 @@ typedef struct {
 
   uint8_t rx[RXBUF];
   size_t rx_len;
-  uint8_t tx[ST_AUDIO_FIXED + 4 * ST_PACKET_FRAMES * ST_MAX_STREAM_CHANNELS];
+  unsigned int burst_frames; /* the frames that make up one message */
+  unsigned int tx_frames;    /* released and waiting in tx for the rest of the burst */
+  uint64_t tx_pos;           /* stream position of the first of them */
+  uint8_t tx[ST_NET_HEADER_BYTES + ST_AUDIO_FIXED + 4 * MAX_BURST_FRAMES * ST_MAX_STREAM_CHANNELS];
 } st_pcm_t;
 
 /* ---- helpers -------------------------------------------------------------------------- */
@@ -225,13 +242,31 @@ static int encode_and_send(st_pcm_t *st, const uint8_t *src, unsigned int frames
 #endif
 }
 
-static int send_pcm(st_pcm_t *st, const uint8_t *src, unsigned int frames) {
+/* Whatever is waiting in tx, as one message in one send(): with TCP_NODELAY a separate header would
+ * be a segment of its own. */
+static int flush_pcm(st_pcm_t *st) {
+  if (st->tx_frames == 0) return 0;
   const size_t frame_bytes = (size_t)st->sample_bytes * (size_t)st->channels;
-  st_put_u64(st->tx + ST_AUDIO_O_POS, st->sent_pcm);
-  st_put_u32(st->tx + ST_AUDIO_O_FRAMES, frames);
-  memcpy(st->tx + ST_AUDIO_FIXED, src, (size_t)frames * frame_bytes);
-  return st_send_msg(st->sk_fd, ST_MSG_AUDIO, st->tx,
-                     (uint32_t)(ST_AUDIO_FIXED + (size_t)frames * frame_bytes), SEND_TIMEOUT_MS);
+  const uint32_t len = (uint32_t)(ST_AUDIO_FIXED + (size_t)st->tx_frames * frame_bytes);
+  uint8_t *msg = st->tx + ST_NET_HEADER_BYTES;
+  st_put_header(st->tx, ST_MSG_AUDIO, len);
+  st_put_u64(msg + ST_AUDIO_O_POS, st->tx_pos);
+  st_put_u32(msg + ST_AUDIO_O_FRAMES, st->tx_frames);
+  st->tx_frames = 0;
+  return st_write_all(st->sk_fd, st->tx, ST_NET_HEADER_BYTES + (size_t)len, SEND_TIMEOUT_MS);
+}
+
+/* Copies released frames out of the ring at once, since the application may overwrite them from
+ * now on, and sends them when the burst is complete. The very first frames of a stream go straight
+ * away: the device anchors the stream where its first packet lands. */
+static int queue_pcm(st_pcm_t *st, const uint8_t *src, unsigned int frames) {
+  const size_t frame_bytes = (size_t)st->sample_bytes * (size_t)st->channels;
+  if (st->tx_frames == 0) st->tx_pos = st->sent_pcm;
+  memcpy(st->tx + ST_NET_HEADER_BYTES + ST_AUDIO_FIXED + (size_t)st->tx_frames * frame_bytes, src,
+         (size_t)frames * frame_bytes);
+  st->tx_frames += frames;
+  if (st->tx_pos == 0 || st->tx_frames >= st->burst_frames) return flush_pcm(st);
+  return 0;
 }
 
 /* ---- the link -------------------------------------------------------------------------- */
@@ -291,6 +326,9 @@ static int link_connect(st_pcm_t *st, unsigned int *rate, uint64_t *max_lead, ch
     snprintf(why, why_n, "%s:%ld is not answering", st->host, st->port);
     return fd;
   }
+
+  int sndbuf = SEND_BUFFER_BYTES;
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
   /* Names this machine in the device's console; it falls back to a reverse lookup, then the
    * address. */
@@ -405,6 +443,7 @@ static void link_drop(st_pcm_t *st) {
   st->declared = 0;
   st->lead_frames = 0;
   st->rx_len = 0;
+  st->tx_frames = 0;
   atomic_store(&st->want_link, 1);
   link_wake(st);
 }
@@ -479,6 +518,7 @@ static void link_service(st_pcm_t *st) {
     st->sent_pcm = 0;
     st->lead_frames = 0;
     st->rx_len = 0;
+    st->tx_frames = 0;
     st->declared = 0;
   }
   if (st->sk_fd >= 0 && !st->declared && st->pcm_rate && declare(st) < 0) link_drop(st);
@@ -503,7 +543,13 @@ static void advance(st_pcm_t *st, uint64_t now) {
   snd_pcm_ioplug_t *io = &st->io;
 
   link_service(st);
-  if (st->sk_fd >= 0 && pump_rx(st) < 0) link_drop(st);
+
+  /* A client can ask for its position hundreds of times a second, and an answer must not cost a
+   * system call each. What the device reports changes slowly: once a tick is plenty. */
+  if (st->sk_fd >= 0 && now >= st->rx_next_ns) {
+    st->rx_next_ns = now + st->tick_ns;
+    if (pump_rx(st) < 0) link_drop(st);
+  }
 
   if (!st->started || !st->areas) {
     st->last_tick_ns = now;
@@ -532,7 +578,11 @@ static void advance(st_pcm_t *st, uint64_t now) {
 
   const snd_pcm_channel_area_t *a = st->areas;
   while (want > 0) {
-    unsigned int chunk = want > ST_PACKET_FRAMES ? ST_PACKET_FRAMES : (unsigned int)want;
+    /* Vorbis keeps its small steps: the encoder's output has to fit enc_buf. */
+    const unsigned long most = st->encoding == ST_ENC_VORBIS || st->sk_fd < 0
+                                   ? ST_PACKET_FRAMES
+                                   : st->burst_frames - st->tx_frames;
+    unsigned int chunk = want > most ? (unsigned int)most : (unsigned int)want;
     snd_pcm_uframes_t off = st->hw_ptr % io->buffer_size;
     if (off + chunk > io->buffer_size) chunk = (unsigned int)(io->buffer_size - off);
 
@@ -541,7 +591,7 @@ static void advance(st_pcm_t *st, uint64_t now) {
 
     if (st->sk_fd >= 0) {
       const int err = st->encoding == ST_ENC_VORBIS ? encode_and_send(st, src, chunk)
-                                                    : send_pcm(st, src, chunk);
+                                                    : queue_pcm(st, src, chunk);
       if (err < 0) link_drop(st);
     }
 
@@ -560,6 +610,19 @@ static snd_pcm_sframes_t st_pointer(snd_pcm_ioplug_t *io) {
   return (snd_pcm_sframes_t)(st->boundary ? st->hw_ptr % st->boundary : st->hw_ptr);
 }
 
+/* The smallest whole number of the application's periods that reaches BURST_MIN_NS and fits one
+ * message. A period too long to fit is not worth keeping whole. */
+static unsigned int burst_frames(const st_pcm_t *st) {
+  const uint64_t period = st->io.period_size;
+  const uint64_t least = (uint64_t)st->pcm_rate * BURST_MIN_NS / 1000000000ull;
+  uint64_t frames = (least + period - 1) / period * period;
+  if (frames > MAX_BURST_FRAMES) {
+    frames = period <= MAX_BURST_FRAMES ? MAX_BURST_FRAMES / period * period
+                                        : (least < MAX_BURST_FRAMES ? least : MAX_BURST_FRAMES);
+  }
+  return (unsigned int)frames;
+}
+
 static int st_start(snd_pcm_ioplug_t *io) {
   st_pcm_t *st = io->private_data;
   long tick = (long)(1000000000ll * (long long)io->period_size / (long long)st->pcm_rate);
@@ -572,6 +635,9 @@ static int st_start(snd_pcm_ioplug_t *io) {
   its.it_value.tv_nsec = tick;
   if (timerfd_settime(st->timer_fd, 0, &its, NULL) < 0) return -errno;
 
+  st->tick_ns = (uint64_t)tick;
+  st->burst_frames = burst_frames(st);
+
   /* Pace from now, or the first tick bills us for however long prepare() took. */
   st->last_tick_ns = mono_ns();
   st->frac = 0.0;
@@ -581,6 +647,8 @@ static int st_start(snd_pcm_ioplug_t *io) {
 
 static int st_stop(snd_pcm_ioplug_t *io) {
   st_pcm_t *st = io->private_data;
+  /* The tail of the stream, which would otherwise wait for a burst that never fills. */
+  if (st->sk_fd >= 0 && flush_pcm(st) < 0) link_drop(st);
   struct itimerspec its;
   memset(&its, 0, sizeof(its));
   timerfd_settime(st->timer_fd, 0, &its, NULL); /* must be safe on a never-started stream */
@@ -591,6 +659,7 @@ static int st_stop(snd_pcm_ioplug_t *io) {
 static int st_prepare(snd_pcm_ioplug_t *io) {
   st_pcm_t *st = io->private_data;
   st->areas = snd_pcm_ioplug_mmap_areas(io);
+  st->tx_frames = 0;
   st->hw_ptr = 0;
   st->xrun = 0;
   st->started = 0;
