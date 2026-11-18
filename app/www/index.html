@@ -69,21 +69,6 @@
 <main>
 
 <section id="dash" class="panel active">
-  <h2>Inputs <label class="allbox" title="Enable or disable every input in this section"><input
-    type="checkbox" id="inputsall"> all</label></h2>
-  <p class="muted small">
-    <strong>Listen L</strong> / <strong>Listen R</strong> send an input to that ear — press both
-    to hear it centred, none to stop it. Inputs sharing an ear are summed at unity, so several
-    loud ones can clip the browser's output; that is the monitor mix only and changes nothing
-    that is measured. Whatever is playing stays sample-aligned across channels.
-  </p>
-  <p id="gainnote" class="muted small hidden">
-    Gain is digital make-up gain applied the moment the samples arrive, for devices too quiet to
-    read: the meters, spectrum, THD+N, scope, listen streams and anything routed to an output all
-    show the amplified signal. It cannot recover a signal the ADC already clipped, and pushing it
-    past full scale clamps — the peak meter parks at 0.0 dBFS and the scope flat-tops.
-  </p>
-
   <div class="monitor">
     <span class="mlabel">Monitor volume</span>
     <input type="range" id="monvol" step="0.5">
@@ -127,6 +112,8 @@
     </span>
   </div>
 
+  <h2>Inputs <label class="allbox" title="Enable or disable every input in this section"><input
+    type="checkbox" id="inputsall"> all</label></h2>
   <div id="inputs" class="grid"></div>
 
   <!-- Its own section rather than more cards in the grid above: these arrive over the network

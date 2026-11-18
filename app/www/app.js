@@ -799,7 +799,6 @@ function buildInputs() {
   const hasGain = state.inputs.length && state.inputs[0].gain_db !== undefined;
   const hasMute = !!(state.limits && state.limits.input_mute);
   const canForget = !!(state.limits && state.limits.net_forget);
-  $('gainnote').classList.toggle('hidden', !hasGain);
 
   // Rendered for every ring channel, then shown or hidden by applyNetAvailability(); an unused
   // network channel is present in the DOM but out of sight. Network channels render into their
@@ -1069,7 +1068,7 @@ function buildSinks() {
   sinks = list.map(sinkDesc);
   $('sinks').innerHTML = sinks.map(k => `
     <div id="${k.k}sec">
-      <h2>${k.title} <span class="muted small mono">${esc(k.id)}</span>
+      <h2 title="${esc(k.id)}">${k.title} outputs
         <label class="allbox" title="Mute or unmute every channel of this output"><input
           type="checkbox" id="${k.k}outsall"> mute all</label></h2>
       <div class="socbar">
