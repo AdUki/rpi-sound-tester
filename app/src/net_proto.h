@@ -43,7 +43,8 @@
    stay spoken for so a future message cannot quietly reuse them. */
 #define ST_MSG_AUDIO 5u     /* C->S */
 #define ST_MSG_STATUS 6u    /* S->C */
-#define ST_MSG_BYE 7u       /* both  */
+#define ST_MSG_BYE 7u       /* both; from the device: the stream sent nothing for half an hour, so
+                               its inputs are freed — come back when there is audio */
 #define ST_MSG_CTL_HELLO 8u /* C->S */
 #define ST_MSG_CTL_ACK 9u   /* S->C */
 #define ST_MSG_SET_MIX 10u  /* C->S */
@@ -58,6 +59,7 @@
 #define ST_HELLO_BAD_FORMAT 3u
 #define ST_HELLO_BAD_PROTO 4u
 #define ST_HELLO_DISABLED 5u /* network input is switched off on the device */
+#define ST_HELLO_TAKEN 6u    /* a newer open of this same output (MAC and stream name) holds its run */
 
 /* Sample formats on the wire. The device works in float internally and has to convert whatever
    arrives, so carrying the sender's own format costs nothing and saves converting twice — and
@@ -198,8 +200,8 @@ static inline uint32_t st_header_len(const uint8_t* p) { return st_get_u32(p + 4
    apart without pinning them. A trailing field rather than a new version: a device that predates
    it never reads past name[], and a sender that predates it sends none. CTL_HELLO carries the
    same trailer, so a mixer can follow one named stream of a machine that sends several. At most
-   ST_NET_MAX_STREAM_NAME bytes. The plugin names every stream: without a `name` setting, after its
-   ALSA PCM ("bench"), or for the bare `soundtester:HOST` the program playing ("aplay").
+   ST_NET_MAX_STREAM_NAME bytes. A PCM with no `name` sends none: it is the machine's one unnamed
+   output, known by the MAC alone.
 
    Optional, after the stream field: [u64 instance], random per PCM open and the same for every
    reconnection of it, never 0. A sender that has dropped its link and comes back with the same id
@@ -212,9 +214,11 @@ static inline uint32_t st_header_len(const uint8_t* p) { return st_get_u32(p + 4
    Optional, after the instance id: [u8 mac[6]], the hardware address of the sender's interface
    that reaches the device; all zero when it has none (loopback). It is what the device knows a
    machine by — an address a DHCP lease can change, the MAC it cannot — and a stream with the MAC
-   and stream name of a run that is still held is that machine's same output reopened: the device
-   closes the old connection and hands the run over, whatever its instance id. Absent, the
-   machine is known by its address, as before. */
+   and stream name of a run that is still held is that machine's same output opened again: the
+   device closes the old connection, whether or not it is alive, and hands the same run over. The
+   stream that was closed gets ST_HELLO_TAKEN when it tries to come back, for as long as the newer
+   one holds the run. Absent, the machine is known by its address, and only the instance id takes
+   a run over. */
 #define ST_HELLO_INSTANCE_BYTES 8u
 #define ST_HELLO_MAC_BYTES 6u
 

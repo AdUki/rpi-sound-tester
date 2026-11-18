@@ -35,6 +35,7 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
@@ -95,10 +96,12 @@ typedef struct {
   long encoding;   /* ST_ENC_PCM or ST_ENC_VORBIS */
   double quality;  /* Vorbis VBR quality, -0.1 .. 1.0 */
   int mixer;       /* 0: the device leaves this stream's level alone (see `mixer` in the conf) */
+  int parked;        /* the device closed the idle link; reconnect when audio flows again */
   uint64_t instance; /* this open, across its reconnections: the HELLO's instance id */
 
   int sk_fd;       /* the live link, or -1. Owned by the audio path once adopted. */
   int timer_fd;
+  int lock_fd;     /* holds this output on this machine for as long as the PCM is open; see below */
   int wake_fd;     /* eventfd: nudges the connector to retry, or to quit */
 
   pthread_t link_th;
@@ -106,6 +109,7 @@ typedef struct {
   atomic_int handoff_fd;  /* connector -> audio path: a finished socket, or -1 */
   unsigned int handoff_rate;
   uint64_t handoff_max_lead;
+  atomic_int taken;       /* connector -> audio path: a newer open of this output holds its inputs */
   atomic_int want_link;   /* audio path -> connector: nothing is connected */
   atomic_int quit;
 
@@ -164,6 +168,7 @@ static void apply_status(st_pcm_t *st, const uint8_t *p) {
 }
 
 /* Runs on the audio path, so it must not block. -1 means the far end has gone. */
+/* 0, -1 when the link is gone, or 1 when the device closed it for being idle. */
 static int pump_rx(st_pcm_t *st) {
   for (;;) {
     if (st->rx_len == sizeof(st->rx)) st->rx_len = 0; /* desynchronised; resynchronise cheaply */
@@ -186,6 +191,7 @@ static int pump_rx(st_pcm_t *st) {
       if (st->rx_len - off < ST_NET_HEADER_BYTES + len) break;
       const uint8_t *pl = h + ST_NET_HEADER_BYTES;
       if (st_header_type(h) == ST_MSG_STATUS && len >= ST_STATUS_BYTES) apply_status(st, pl);
+      if (st_header_type(h) == ST_MSG_BYE) return 1; /* idle too long: the device let us go */
       off += ST_NET_HEADER_BYTES + len;
     }
     if (off) {
@@ -380,7 +386,12 @@ static int link_connect(st_pcm_t *st, unsigned int *rate, uint64_t *max_lead, ch
     *max_lead = st_get_u32(ack + ST_ACK_O_MAX_LEAD);
     return fd;
   }
-  if (status == ST_HELLO_BUSY)
+  if (status == ST_HELLO_TAKEN) {
+    snprintf(why, why_n, "this output is in use on %s: it was opened again%s%s and that took its input",
+             st->host, st->stream ? " as " : "", st->stream ? st->stream : "");
+    close(fd);
+    return -EBUSY;
+  } else if (status == ST_HELLO_BUSY)
     snprintf(why, why_n, "every network input on %s is already in use", st->host);
   else if (status == ST_HELLO_DISABLED)
     snprintf(why, why_n, "network input is switched off on %s (enable it in Configuration)",
@@ -412,10 +423,15 @@ static void *link_thread(void *arg) {
       break;
     }
     if (fd < 0) {
-      if (!said) {
-        SNDERR("soundtester: %s — the stream plays on, still trying", why);
+      /* Not a network fault: the output is someone else's now, and the application is told so, as
+       * a hw PCM that is already open would tell it. Still tried, for when that one closes. */
+      const int taken = fd == -EBUSY;
+      if (!said || taken != atomic_load(&st->taken)) {
+        if (taken) SNDERR("soundtester: %s", why);
+        else SNDERR("soundtester: %s — the stream plays on, still trying", why);
         said = 1;
       }
+      atomic_store(&st->taken, taken);
       link_nap(st, RETRY_MS);
       continue;
     }
@@ -423,6 +439,7 @@ static void *link_thread(void *arg) {
     said = 0;
     ever_up = 1;
 
+    atomic_store(&st->taken, 0);
     /* Read by the audio path only after the release store below hands it the socket. */
     st->handoff_rate = rate;
     st->handoff_max_lead = max_lead;
@@ -446,6 +463,19 @@ static void link_drop(st_pcm_t *st) {
   st->tx_frames = 0;
   atomic_store(&st->want_link, 1);
   link_wake(st);
+}
+
+/* The device closed a link that had carried no audio for half an hour, and freed its inputs. Stay
+ * away until there is audio to send: reconnecting at once would only take them again. */
+static void link_park(st_pcm_t *st) {
+  SNDERR("soundtester: %s closed the idle link — reconnecting when audio plays", st->host);
+  close(st->sk_fd);
+  st->sk_fd = -1;
+  st->declared = 0;
+  st->lead_frames = 0;
+  st->rx_len = 0;
+  st->tx_frames = 0;
+  st->parked = 1;
 }
 
 #ifdef ST_HAVE_VORBIS
@@ -548,7 +578,9 @@ static void advance(st_pcm_t *st, uint64_t now) {
    * system call each. What the device reports changes slowly: once a tick is plenty. */
   if (st->sk_fd >= 0 && now >= st->rx_next_ns) {
     st->rx_next_ns = now + st->tick_ns;
-    if (pump_rx(st) < 0) link_drop(st);
+    const int rx = pump_rx(st);
+    if (rx < 0) link_drop(st);
+    else if (rx > 0) link_park(st);
   }
 
   if (!st->started || !st->areas) {
@@ -574,6 +606,13 @@ static void advance(st_pcm_t *st, uint64_t now) {
     if (io->state == SND_PCM_STATE_RUNNING) st->xrun = 1;
     want = avail;
     if (want == 0) return;
+  }
+
+  /* Audio again: the link the device closed for being idle is wanted back. */
+  if (st->parked) {
+    st->parked = 0;
+    atomic_store(&st->want_link, 1);
+    link_wake(st);
   }
 
   const snd_pcm_channel_area_t *a = st->areas;
@@ -606,6 +645,8 @@ static void advance(st_pcm_t *st, uint64_t now) {
 static snd_pcm_sframes_t st_pointer(snd_pcm_ioplug_t *io) {
   st_pcm_t *st = io->private_data;
   advance(st, mono_ns());
+  /* ioplug stops the stream on any error here; the prepare that follows is what says EBUSY. */
+  if (atomic_load(&st->taken)) return -EBUSY;
   if (st->xrun) return -EPIPE;
   return (snd_pcm_sframes_t)(st->boundary ? st->hw_ptr % st->boundary : st->hw_ptr);
 }
@@ -625,6 +666,7 @@ static unsigned int burst_frames(const st_pcm_t *st) {
 
 static int st_start(snd_pcm_ioplug_t *io) {
   st_pcm_t *st = io->private_data;
+  if (atomic_load(&st->taken)) return -EBUSY;
   long tick = (long)(1000000000ll * (long long)io->period_size / (long long)st->pcm_rate);
   if (tick < TICK_MIN_NS) tick = TICK_MIN_NS;
   if (tick > TICK_MAX_NS) tick = TICK_MAX_NS;
@@ -658,6 +700,9 @@ static int st_stop(snd_pcm_ioplug_t *io) {
 
 static int st_prepare(snd_pcm_ioplug_t *io) {
   st_pcm_t *st = io->private_data;
+  /* A newer open of this output took its inputs: in use, as a hw PCM opened twice is. Not for
+   * good — the connector keeps trying, and a prepare after the other has closed succeeds. */
+  if (atomic_load(&st->taken)) return -EBUSY;
   st->areas = snd_pcm_ioplug_mmap_areas(io);
   st->tx_frames = 0;
   st->hw_ptr = 0;
@@ -719,6 +764,11 @@ static int st_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd, unsigned in
     }
   }
   advance(st, mono_ns());
+  /* Wake the application into a call that fails: POLLERR alone would read as a bare EIO. */
+  if (atomic_load(&st->taken)) {
+    *revents = POLLOUT;
+    return 0;
+  }
 
   /* A tick says nothing about the PCM having room: POLLOUT only once avail_min is free. */
   if (snd_pcm_ioplug_avail(io, st->hw_ptr, io->appl_ptr) >= st->min_avail) *revents |= POLLOUT;
@@ -749,6 +799,7 @@ static int st_close(snd_pcm_ioplug_t *io) {
   }
   if (st->timer_fd >= 0) close(st->timer_fd);
   if (st->wake_fd >= 0) close(st->wake_fd);
+  if (st->lock_fd >= 0) close(st->lock_fd);
   free(st->host);
   free(st->stream);
   free(st);
@@ -817,21 +868,31 @@ static uint64_t new_instance_id(const void *salt) {
   return id ? id : 1;
 }
 
-/* The stream name when the conf gives none, so that every stream is told apart from this machine's
- * others and shows as something: the ALSA PCM's own name ("bench", "default"), or for the bare
- * `soundtester:HOST`, which names no output of its own, the program playing ("aplay"). */
-static void default_stream_name(const char *pcm, char *out, size_t n) {
-  out[0] = '\0';
-  const size_t len = pcm ? strcspn(pcm, ":") : 0;
-  if (len && !(len == strlen("soundtester") && !strncmp(pcm, "soundtester", len))) {
-    snprintf(out, n, "%.*s", (int)len, pcm);
-    return;
-  }
-  FILE *f = fopen("/proc/self/comm", "re");
-  if (!f) return;
-  if (fgets(out, (int)n, f)) out[strcspn(out, "\n")] = '\0';
-  else out[0] = '\0';
-  fclose(f);
+/* One open of an output at a time on this machine, decided here and not by the device, so the
+ * answer comes at open and cannot be out of step with a connection the device has not yet seen
+ * come or go. The lock is a socket bound to an abstract name: taken atomically, seen by every user
+ * and process of the machine, needing no writable directory, and let go by the kernel the moment
+ * its holder closes the PCM or dies — there is no stale lock to clean up.
+ *
+ * The name is the output as the device tells outputs apart: the stream name and the pin, on that
+ * host. Returns the fd, -EBUSY when another open holds it, or -1 when there is no lock to be had
+ * (then the device's takeover is all there is, as before). */
+static int output_lock(const char *host, long port, long channel, const char *stream) {
+  struct sockaddr_un sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sun_family = AF_UNIX;
+  /* sun_path[0] stays 0: abstract. The host goes last, so a long one cannot push the rest out. */
+  int n = snprintf(sa.sun_path + 1, sizeof(sa.sun_path) - 1, "soundtester-pcm:%s:%ld:%ld:%s",
+                   stream ? stream : "", channel, port, host);
+  if (n < 0) return -1;
+  if ((size_t)n > sizeof(sa.sun_path) - 1) n = (int)sizeof(sa.sun_path) - 1;
+  const int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) return -1;
+  if (bind(fd, (struct sockaddr *)&sa, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n)) == 0)
+    return fd;
+  const int busy = errno == EADDRINUSE;
+  close(fd);
+  return busy ? -EBUSY : -1;
 }
 
 SND_PCM_PLUGIN_DEFINE_FUNC(soundtester) {
@@ -896,8 +957,18 @@ SND_PCM_PLUGIN_DEFINE_FUNC(soundtester) {
     return -EINVAL;
   }
 
+  if (sname && !*sname) sname = NULL;
+  /* Already open on this machine: in use, as a hw PCM would be. Silently — a program that probes
+   * its devices should not fill a log — the error code says it. */
+  const int lock_fd = output_lock(host, port, channel, sname);
+  if (lock_fd == -EBUSY) return -EBUSY;
+
   st = calloc(1, sizeof(*st));
-  if (!st) return -ENOMEM;
+  if (!st) {
+    if (lock_fd >= 0) close(lock_fd);
+    return -ENOMEM;
+  }
+  st->lock_fd = lock_fd;
   st->sk_fd = -1;
   st->timer_fd = -1;
   st->wake_fd = -1;
@@ -910,16 +981,14 @@ SND_PCM_PLUGIN_DEFINE_FUNC(soundtester) {
   st->port = port;
   st->max_lead = ASSUMED_MAX_LEAD;
   atomic_init(&st->handoff_fd, -1);
+  atomic_init(&st->taken, 0);
   atomic_init(&st->want_link, 1);
   atomic_init(&st->quit, 0);
-  char dname[ST_NET_MAX_STREAM_NAME + 1];
-  if (!sname || !*sname) {
-    default_stream_name(name, dname, sizeof(dname));
-    sname = dname;
-  }
+  /* No `name`: this machine's one unnamed output, which the device knows by the MAC alone. */
   st->host = strdup(host);
-  st->stream = *sname ? strdup(sname) : NULL;
-  if (!st->host || (*sname && !st->stream)) {
+  st->stream = sname ? strdup(sname) : NULL;
+  if (!st->host || (sname && !st->stream)) {
+    if (st->lock_fd >= 0) close(st->lock_fd);
     free(st->host);
     free(st->stream);
     free(st);
@@ -960,6 +1029,7 @@ err_out:
   /* Before ioplug_create succeeds nothing will ever call close() for us. */
   if (st->timer_fd >= 0) close(st->timer_fd);
   if (st->wake_fd >= 0) close(st->wake_fd);
+  if (st->lock_fd >= 0) close(st->lock_fd);
   free(st->host);
   free(st->stream);
   free(st);

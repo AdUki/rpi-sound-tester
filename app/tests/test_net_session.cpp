@@ -37,6 +37,14 @@ struct NetTestAccess {
                          uint64_t max_lead) {
     s.feed.distribute(src, frames, at, reader, max_lead);
   }
+  // A real connection thread on `fd`, with the idle time cut to `idle_ms`.
+  static void serve_idle(NetAudioServer& net, uint64_t idle_ms) {
+    net.idle_drop_ns_.store(idle_ms * 1000000ull);
+    net.running_.store(true);
+  }
+  static void serve(NetAudioServer& net, int fd, const sockaddr_in& addr) {
+    net.serve(fd, addr, -1);
+  }
 };
 
 }  // namespace st
@@ -276,8 +284,8 @@ void test_a_reopened_output_takes_its_run_over_by_mac_and_stream() {
 }
 
 // One PCM really open twice at once: the second takes the run, and the first — alive, so its plugin
-// reconnects — gets a channel of its own instead of taking the run back, and so on for ever.
-void test_a_displaced_stream_does_not_take_its_run_back() {
+// reconnects — is refused for as long as the second holds it, then gets its run back.
+void test_a_displaced_stream_is_refused_while_its_run_is_held() {
   Control ctl;
   NetAudioServer net(ctl, kRate, kTestPeriod);
   int a_fds[2], b_fds[2];
@@ -292,15 +300,91 @@ void test_a_displaced_stream_does_not_take_its_run_back() {
   a.join();
   std::thread b = stale_session(net, b_fds[0], 0, 1);
 
-  // The first player reconnects with its own id: a channel of its own, and b keeps its socket.
-  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "bench", 111, -1, kMac), 1);
+  // The first player reconnects with its own id: no second channel, and b keeps its socket.
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "bench", 111, -1, kMac),
+           NetAudioServer::kClaimTaken);
   CHECK(net.channel_connected(0));
+  CHECK(!net.channel_connected(1));
   CHECK_EQ(::send(b_fds[1], "x", 1, MSG_NOSIGNAL), 1);
 
   ::close(b_fds[1]);
   b.join();
   CHECK(!net.channel_connected(0));
+  // The newer open has gone: the first is an ordinary sender again, back on its run.
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 1, "bench", 111, -1, kMac), 0);
   ::close(a_fds[1]);
+}
+
+// A PCM with no `name` is the machine's one unnamed output, known by the MAC alone: whatever opens
+// it next takes the same inputs over, and a stereo run stays where it was.
+void test_an_unnamed_output_is_taken_over_by_mac_alone() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  int old_fds[2], new_fds[2];
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, old_fds), 0);
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, new_fds), 0);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", 1), 0);
+
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2, "", 111, old_fds[0], kMac), 1);
+  std::thread old_session = stale_session(net, old_fds[0], 1, 2);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.7", 2, "", 222, new_fds[0], kMac), 1);
+  old_session.join();
+  CHECK(!net.channel_connected(3));
+  net.release_channels(1, 2);
+  for (int fd : {old_fds[1], new_fds[0], new_fds[1]}) ::close(fd);
+}
+
+// Two streams pinned to different channels are two outputs, named or not.
+void test_streams_pinned_apart_leave_each_other_alone() {
+  Control ctl;
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  int fds[2];
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  CHECK_EQ(net.claim_channels(2, "10.0.0.7", 1, "", 111, fds[0], kMac), 2);
+  CHECK_EQ(net.claim_channels(4, "10.0.0.7", 1, "", 222, -1, kMac), 4);
+  CHECK(net.channel_connected(2));
+  CHECK_EQ(::send(fds[1], "x", 1, MSG_NOSIGNAL), 1);  // not shut down
+  ::close(fds[0]);
+  ::close(fds[1]);
+}
+
+// A link that carries no audio is dropped after the idle time, with a BYE, and its run freed.
+void test_an_idle_link_is_dropped() {
+  Control ctl;
+  ctl.net.enabled.store(true);
+  NetAudioServer net(ctl, kRate, kTestPeriod);
+  NetTestAccess::serve_idle(net, 50);
+  int fds[2];
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  std::thread th([&] { NetTestAccess::serve(net, fds[0], addr); });
+
+  uint8_t msg[ST_NET_HEADER_BYTES + ST_HELLO_FIXED + 1] = {0};
+  st_put_header(msg, ST_MSG_HELLO, ST_HELLO_FIXED + 1);
+  uint8_t* h = msg + ST_NET_HEADER_BYTES;
+  st_put_u32(h + ST_HELLO_O_MAGIC, ST_NET_MAGIC);
+  st_put_u32(h + ST_HELLO_O_PROTO, ST_NET_PROTO_VERSION);
+  st_put_u32(h + ST_HELLO_O_FORMAT, ST_FMT_S32_LE);
+  st_put_u16(h + ST_HELLO_O_CHANNELS, 1);
+  st_put_u16(h + ST_HELLO_O_WANT_CH, ST_HELLO_ANY_CHANNEL);
+  st_put_u32(h + ST_HELLO_O_NAME_LEN, 1);
+  h[ST_HELLO_FIXED] = 'x';
+  CHECK_EQ(::send(fds[1], msg, sizeof(msg), MSG_NOSIGNAL), static_cast<ssize_t>(sizeof(msg)));
+
+  uint8_t in[ST_NET_HEADER_BYTES + ST_HELLO_ACK_BYTES];
+  CHECK_EQ(::recv(fds[1], in, sizeof(in), MSG_WAITALL), static_cast<ssize_t>(sizeof(in)));
+  CHECK_EQ(st_get_u32(in + ST_NET_HEADER_BYTES + ST_ACK_O_STATUS), ST_HELLO_OK);
+  CHECK(net.channel_connected(0));
+
+  uint8_t bye[ST_NET_HEADER_BYTES];
+  CHECK_EQ(::recv(fds[1], bye, sizeof(bye), MSG_WAITALL), static_cast<ssize_t>(sizeof(bye)));
+  CHECK_EQ(st_header_type(bye), ST_MSG_BYE);
+  CHECK_EQ(::recv(fds[1], bye, 1, 0), 0);  // and then it hangs up
+  th.join();
+  CHECK(!net.channel_connected(0));
+  ::close(fds[1]);
 }
 
 // The machine's other outputs are other senders: a different stream name, or a different machine
@@ -836,7 +920,10 @@ int main() {
   test_a_reconnecting_pcm_takes_its_run_back_from_the_stale_connection();
   test_without_a_mac_a_different_instance_never_takes_over();
   test_a_reopened_output_takes_its_run_over_by_mac_and_stream();
-  test_a_displaced_stream_does_not_take_its_run_back();
+  test_a_displaced_stream_is_refused_while_its_run_is_held();
+  test_an_unnamed_output_is_taken_over_by_mac_alone();
+  test_streams_pinned_apart_leave_each_other_alone();
+  test_an_idle_link_is_dropped();
   test_another_output_of_the_machine_is_left_alone();
   test_a_machine_is_known_by_its_mac_across_a_new_address();
   test_named_streams_keep_their_own_channels();

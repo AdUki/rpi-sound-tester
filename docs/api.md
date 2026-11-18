@@ -567,8 +567,7 @@ sender, with `transport: "bluetooth"` and its Bluetooth address as `peer`.
 the sender calls itself (the plugin sends its hostname), `host` its address resolved to a name when
 the network can, and `device` the one to show: `name`, else `host`, else the address. `last_device`
 keeps it after the sender disconnects. `stream` is which of the machine's outputs this is — the
-PCM's `name` setting, or without one the plugin's default: the ALSA PCM's own name (`bench`), or
-for a bare `soundtester:HOST` the program playing (`aplay`); empty only from an older plugin — and
+PCM's `name` setting, empty for a PCM without one — and
 `last_stream` keeps it like `last_device`; the channel's name in `GET /api/state` reads
 `main · thinkpad`. `mac` is the hardware address of the sender's interface that reaches the
 device, kept past the disconnect; empty from an older plugin, and for a phone (its address is
@@ -607,22 +606,42 @@ With neither, a returning sender is given **the channel it used last time**, mat
 machine — its MAC, or its address from a plugin that sends none — and its stream name. Routing set
 up against NET 3 therefore keeps meaning that machine across a reconnect, or a new DHCP lease, and
 a channel goes on saying whose it was while the machine is switched off. Two streams from one
-machine are told apart by `name` (`main`, `notif`, or the default the plugin picks): each is a
-sender of its own and comes back to its own run. Two opens of one PCM cannot be told apart — pin
-those with a port or a channel. The memory lasts as long as the daemon runs.
+machine are told apart by `name` (`main`, `notif`): each is a sender of its own and comes back to
+its own run. Without a `name` a PCM is the machine's one unnamed output. The memory lasts as long
+as the daemon runs.
 
 A sender with no channel of its own takes one nobody remembers first (never used, or removed in
 the console), and only then the one let go longest ago — so it does not land on the place of a
 machine that is merely switched off.
 
-A stream whose run is still held never gets a second channel. A PCM whose link dropped reconnects
-before the device has seen its old connection die, and says so with the instance id in its HELLO;
-a machine back from suspend opens its PCM afresh while the connection from before it slept would
-hold on until keepalive ends it, half a minute on — and says so with the same MAC and stream name.
-Either way the device closes the old connection, without asking whether it is still alive, and
-hands the same channel straight back, pinned or not. One PCM really played twice at once from one
-machine therefore moves the first player off its channel once: it comes back to a channel of its
-own and is not allowed to take the run back.
+**One output holds one run, never two.** An output is a machine's MAC and the PCM's `name`, or
+the MAC alone for a PCM without one (two streams pinned to different channels also count as two).
+When a HELLO arrives for an output whose run is still held, the device shuts the old connection
+down — without asking whether it is alive: its socket may well be, with no audio on it and none
+coming — and hands the **same NET inputs** to the new one, so routing and measurements carry on
+against the same link. That covers a machine back from suspend, a player that opens its PCM again
+without closing the last one, and a PCM whose link dropped and reconnected before the device saw
+the old connection die (which it also says with the instance id in its HELLO, the only thing that
+takes a run over from a plugin that sends no MAC).
+
+Two live opens of one output do not normally get that far: the plugin holds a lock on the sending
+machine (an abstract socket named after the stream name, pin and host, released by the kernel when
+the PCM closes or its process dies) and the second `snd_pcm_open()` fails with `EBUSY` there and
+then, as a hw PCM's does — decided locally, so it cannot disagree with what the device has seen of
+the network. The takeover above is for links the sender no longer has.
+
+Should a stream that was shut down be alive after all — the same device under two host names,
+or an older plugin — its plugin
+reconnects and is refused (`ST_HELLO_TAKEN`) for as long as the newer open holds the run, and its
+application gets `EBUSY`, "Device or resource busy", as from a hw PCM that is already open: the
+stream stops, and `snd_pcm_prepare()` fails with it until the newer open has gone.
+If the old session has not let go within a second the new one is refused too and retries, rather
+than being put on a second channel.
+
+A stream that sends **no audio for 30 minutes** is disconnected and its inputs freed (they stay
+remembered as its place). The device says `BYE` first, so the plugin waits until audio plays
+again before it reconnects, to the same inputs; an older plugin reconnects as soon as its
+application next touches the PCM.
 
 ### `PUT /api/net`
 ```json

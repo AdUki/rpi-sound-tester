@@ -155,11 +155,13 @@ class NetAudioServer {
   //
   // `instance` is the HELLO's instance id (0: none), and `holder_fd` the socket of the session
   // making the claim. A claim with the instance of a run still held is that same PCM back on a new
-  // connection while the device still thinks the old one is alive; one with the MAC and stream of
-  // a run still held is that machine's same output reopened (a laptop back from suspend, whose
-  // old connection only keepalive would ever end). Either way the old socket is shut down and the
-  // run handed over, pinned or not. A stream that lost its run that way is not taken for stale in
-  // turn: coming back, it gets a channel of its own instead of taking the run back again.
+  // connection while the device still thinks the old one is alive; one with the MAC and stream
+  // name of a run still held (no name: the MAC alone) is that machine's same output opened again
+  // while its old connection lingers. Either way the old socket is shut down and that same run
+  // handed over: one output never holds two. The stream that lost its run that way is refused
+  // with kClaimTaken for as long as the newer open holds it.
+  static constexpr int kClaimBusy = -1;   // no room, or the pinned channel is taken
+  static constexpr int kClaimTaken = -2;  // a newer open of this very output holds its run
   int claim_channels(unsigned want, const std::string& ip, unsigned count,
                      const std::string& stream = {}, uint64_t instance = 0, int holder_fd = -1,
                      const std::string& mac = {});
@@ -276,10 +278,12 @@ class NetAudioServer {
 
     VorbisDecoder vorbis;
     Feed feed{srv};
+    uint64_t last_audio_ns = 0;  // when audio last arrived, or the run was claimed
     uint64_t expect_pos = 0; // where the sender's next packet should start, in its own frames
     uint64_t last_status_ns = 0;
 
     std::vector<float> in_il;
+    std::thread lookup;  // the reverse lookup of the sender's address; joined by serve()
 
     // Each returns false to close the connection. The protocol is small enough that "this message
     // was wrong" and "hang up" are the same answer.
@@ -314,6 +318,8 @@ class NetAudioServer {
   // newest last. Bounded: an id that has fallen off is one that has long since closed.
   std::mutex displaced_m_;
   std::deque<uint64_t> displaced_;
+  // How long a stream may send no audio before its link is dropped.
+  std::atomic<uint64_t> idle_drop_ns_{kNetIdleDropMs * 1000000ull};
 
   // The base port takes any channel; base + 1 + c is a direct line to channel c, so a sender can
   // be pinned by the one setting its .asoundrc already had. One socket each, all in one poll.

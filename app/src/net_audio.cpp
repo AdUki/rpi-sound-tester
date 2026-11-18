@@ -197,6 +197,8 @@ struct NetAudioServer::Channel {
   // closed only after, so whoever reads it under m while it is set has a live socket.
   uint64_t instance = 0;
   int holder_fd = -1;
+  // The channel the claim pinned the run to (`channel N`, or a per-channel port), or -1.
+  int pin = -1;
   // release_seq_ when the channel was last let go: the lower, the longer it has been free.
   uint64_t released_seq = 0;
 
@@ -316,7 +318,8 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
                                    const std::string& stream, uint64_t instance, int holder_fd,
                                    const std::string& mac) {
   const unsigned total = this->count();
-  if (count == 0 || count > total) return -1;
+  if (count == 0 || count > total) return kClaimBusy;
+  const int pin = want < total ? static_cast<int>(want) : -1;
 
   // Takes the whole run or nothing: a half-claimed stereo sender would leave one channel of a
   // pair stranded and claimed by no one.
@@ -348,6 +351,7 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
       c.stream_index = i + 1;
       c.instance = instance;
       c.holder_fd = holder_fd;
+      c.pin = pin;
     }
     return static_cast<int>(b);
   };
@@ -359,17 +363,20 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
     return ch.last_ip == ip;
   };
 
-  // A run still held by this very stream, whose old connection the device has not seen die. The
-  // same PCM back on a new connection (its instance id): the plugin drops a link that stalls and
-  // reconnects at once, long before the device has read the old socket's backlog to its end. Or
-  // the same output of the same machine opened again (its MAC and stream name): a laptop back from
-  // suspend reopens its PCM, and the connection from before it slept ends only when keepalive
-  // gives up on it, half a minute on. Either way the run reads as taken and the stream would be
-  // handed a second channel. So shut our end of the old connection down, without asking whether
-  // it is still alive, and take the run when its session lets go — pinned or not. The stream that
-  // loses its run that way may be alive after all (one PCM opened twice), so it is remembered and
-  // is not allowed the same back: the two would take the run from each other for as long as both
-  // played. It gets a channel of its own instead.
+  // A run still held by this very stream. The same PCM back on a new connection (its instance
+  // id): the plugin drops a link that stalls and reconnects at once, long before the device has
+  // read the old socket's backlog to its end. Or the same output of the same machine opened again
+  // (its MAC and stream name, which is empty for a PCM with no `name`: then the MAC alone): a
+  // laptop back from suspend, or a player that opens its PCM again without closing the last one,
+  // whose connection stays up and silent. Either way one output never holds two runs: our end of
+  // the old connection is shut down without asking whether it is still alive, and this claim gets
+  // that very run — the same NET inputs — when its session lets go. Two streams pinned to
+  // different channels are told apart by that, as two that are named differently are.
+  //
+  // The stream that loses its run that way may be alive after all (one PCM open twice), and its
+  // plugin reconnects. It is remembered, and for as long as the newer open holds the run it is
+  // refused rather than given a second one, or the run back: the two would take it from each
+  // other for as long as both played.
   if (instance != 0 || !mac.empty()) {
     bool displaced = false;
     if (instance != 0) {
@@ -378,6 +385,7 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
     }
     int back = -1;  // the run to take over; -1: wait for the old ones to go, then place as usual
     bool back_same_open = false;
+    bool taken = false;  // a newer open of this output holds its run
     std::vector<std::pair<unsigned, unsigned>> stale;  // every run shut down: base, count
     std::string from;
     for (unsigned c = 0; c < total; ++c) {
@@ -385,9 +393,13 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
       std::lock_guard<std::mutex> lock(ch.m);
       if (ch.stream_base != c || ch.holder_fd < 0) continue;
       const bool same_open = instance != 0 && ch.instance == instance;
-      const bool same_output =
-          !displaced && !mac.empty() && ch.last_mac == mac && ch.last_stream == stream;
+      const bool same_output = !mac.empty() && ch.last_mac == mac && ch.last_stream == stream &&
+                               (ch.pin < 0 || pin < 0 || ch.pin == pin);
       if (!same_open && !same_output) continue;
+      if (!same_open && displaced) {
+        taken = true;
+        continue;
+      }
       if (!same_open && ch.instance != 0) {
         std::lock_guard<std::mutex> dlock(displaced_m_);
         displaced_.push_back(ch.instance);
@@ -402,6 +414,13 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
         back = static_cast<int>(c);
         back_same_open = same_open;
       }
+    }
+    if (taken) return kClaimTaken;
+    if (displaced) {
+      // The open that displaced it has gone: an ordinary sender again, back to its own run.
+      std::lock_guard<std::mutex> lock(displaced_m_);
+      displaced_.erase(std::remove(displaced_.begin(), displaced_.end(), instance),
+                       displaced_.end());
     }
 
     // Its session wakes on the shutdown at once; the bound is for one still busy elsewhere (its
@@ -421,12 +440,16 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
       gone = back < 0 && let_go();
       if (!gone) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (!gone) LOG_WARN("net: {} would not let go; {} goes elsewhere", from, ip);
+    // Never a second run for one output: refused, and the sender's next try finds the run free.
+    if (!gone) {
+      LOG_WARN("net: {} would not let go; {} is refused until it does", from, ip);
+      return kClaimBusy;
+    }
   }
 
   // An explicit `channel N` (or a per-channel port) always wins — that is how you pin two streams
   // from one machine, which the address alone cannot tell apart.
-  if (want < total) return try_run(want) ? took(want) : -1;
+  if (want < total) return try_run(want) ? took(want) : kClaimBusy;
 
   // Otherwise put a returning sender back where it was, provided the run still fits there. The
   // stream name is part of whose it is: a machine's "main" and "notif" are two senders.
@@ -472,7 +495,7 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
   // Claimed in that order: one taken meanwhile by another sender just fails its CAS.
   for (const Free& f : spare)
     if (try_run(f.base)) return took(f.base);
-  return -1;
+  return kClaimBusy;
 }
 
 void NetAudioServer::release_channels(unsigned base, unsigned count) {
@@ -614,9 +637,11 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
                                 : st_get_u16(p + ST_HELLO_O_WANT_CH);
       base = srv.claim_channels(want, ip, channels, stream, instance, fd, mac);
       if (base < 0) {
-        reject(ST_HELLO_BUSY);
+        reject(base == kClaimTaken ? ST_HELLO_TAKEN : ST_HELLO_BUSY);
+        base = -1;
         return false;
       }
+      last_audio_ns = srv.clock_.now_ns();
 
       for (unsigned i = 0; i < channels; ++i) {
         NetAudioServer::Channel& c = *srv.chans_[base + i];
@@ -647,15 +672,19 @@ bool NetAudioServer::Session::hello(const uint8_t* p, uint32_t len, const sockad
                mac.empty() ? "" : ", ", mac, channels, base, channels > 1 ? "s" : "",
                st::channels().net_base() + base);
 
-      // Only now, with the handshake already answered, ask who this address belongs to. A
-      // resolver with nothing to talk to blocks for seconds, and the sender is waiting.
-      const std::string host = reverse_lookup(addr);
-      if (!host.empty()) {
+      // Ask who this address belongs to on a thread of its own. A resolver with nothing to talk
+      // to blocks for seconds, and for all of them this session would not notice its socket being
+      // shut down: a reopened output would wait on the run, or be refused it. The fd is closed only
+      // after this thread is joined, so while it is still the run's holder the run is still ours.
+      lookup = std::thread([this, addr] {
+        const std::string host = reverse_lookup(addr);
+        if (host.empty()) return;
         for (unsigned i = 0; i < channels; ++i) {
-          std::lock_guard<std::mutex> lock(srv.chans_[base + i]->m);
-          srv.chans_[base + i]->host = host;
+          NetAudioServer::Channel& c = *srv.chans_[base + i];
+          std::lock_guard<std::mutex> lock(c.m);
+          if (c.holder_fd == fd) c.host = host;
         }
-      }
+      });
       return true;
 }
 
@@ -796,6 +825,7 @@ bool NetAudioServer::Session::audio(const uint8_t* p, uint32_t len) {
       // timer off them is both simple and reliable — no extra thread, and it stops on its own the
       // moment a sender goes quiet, which is when there is nothing to report anyway.
       const uint64_t now = srv.clock_.now_ns();
+      last_audio_ns = now;
       if (now - last_status_ns >= ST_STATUS_INTERVAL_MS * 1000000ull) {
         last_status_ns = now;
         if (!status()) return false;
@@ -963,6 +993,24 @@ void NetAudioServer::serve(int fd, sockaddr_in addr, int port_channel) {
 
   std::vector<uint8_t> payload;
   while (running_.load()) {
+    // A stream that has sent no audio for half an hour gives its inputs up: a player that keeps
+    // its PCM open and silent for good would otherwise hold them until it exits. The BYE tells the
+    // plugin to stay away until it has audio again; its place is remembered, as for any sender
+    // that has gone.
+    bool idle = false;
+    while (running_.load() && s.base >= 0) {
+      pollfd pfd{fd, POLLIN, 0};
+      if (poll(&pfd, 1, 250) != 0) break;
+      idle = clock_.now_ns() - s.last_audio_ns >= idle_drop_ns_.load();
+      if (idle) break;
+    }
+    if (idle) {
+      LOG_INFO("net: {} sent nothing for {} s — dropping the link", s.peer,
+               idle_drop_ns_.load() / 1000000000ull);
+      send_msg(fd, ST_MSG_BYE, nullptr, 0);
+      break;
+    }
+
     uint8_t hdr[ST_NET_HEADER_BYTES];
     if (!read_exact(fd, hdr, sizeof(hdr), running_)) break;
     const uint8_t type = st_header_type(hdr);
@@ -1017,6 +1065,8 @@ void NetAudioServer::serve(int fd, sockaddr_in addr, int port_channel) {
     LOG_INFO("net: {} released {} channel(s) from {}", s.peer, s.channels, s.base);
     release_channels(static_cast<unsigned>(s.base), s.channels);
   }
+  // After the release, so a slow resolver never holds the run; before the close, see hello().
+  if (s.lookup.joinable()) s.lookup.join();
   ::close(fd);
 }
 
