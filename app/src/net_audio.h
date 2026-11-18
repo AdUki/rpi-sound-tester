@@ -83,6 +83,14 @@ struct NetChannelStatus {
   // ordinary mono case; a stereo sender's pair reads 1/2 and 2/2.
   unsigned stream_index = 1;
   unsigned stream_count = 1;
+  // "streaming" while audio is arriving, "connected" with a sender that is silent on the wire (its
+  // PCM open and not playing), "disconnected" once it has gone, "" on a channel never used.
+  std::string state;
+  // What the sender declared, while it is connected: its own rate (0 until it has said), the
+  // sample format on the wire ("S16_LE"), and how it is carried ("pcm", "vorbis").
+  unsigned rate = 0;
+  std::string format;
+  std::string encoding;
   uint64_t frames_received = 0;
   uint64_t late_drops = 0;
   uint64_t range_drops = 0;
@@ -183,6 +191,10 @@ class NetAudioServer {
   // Names a run claimed by a sender that lives in this process (the Bluetooth input), as a HELLO
   // names a network one: `peer` is its address, `name` what it is called, `transport` what it came
   // over. claim_channels() keys the run's stickiness on whatever it was given as `ip`.
+  // What a run's audio is, for the console: the sample format ("S16_LE") and the encoding ("pcm").
+  // The rate comes from the Feed.
+  void describe_channels(unsigned base, unsigned count, const std::string& format,
+                         const std::string& encoding);
   void label_channels(unsigned base, unsigned count, const std::string& peer,
                       const std::string& name, const std::string& transport);
 

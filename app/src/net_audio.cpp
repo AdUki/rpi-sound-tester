@@ -197,6 +197,11 @@ struct NetAudioServer::Channel {
   // closed only after, so whoever reads it under m while it is set has a live socket.
   uint64_t instance = 0;
   int holder_fd = -1;
+  // What the stream on it is, declared by its sender and cleared with the claim: the rate of its
+  // Feed, and under m the format and encoding. And when audio last arrived, for "streaming".
+  std::atomic<unsigned> src_rate{0};
+  std::atomic<uint64_t> last_audio_ns{0};
+  std::string format, encoding;
   // The channel the claim pinned the run to (`channel N`, or a per-channel port), or -1.
   int pin = -1;
   // release_seq_ when the channel was last let go: the lower, the longer it has been free.
@@ -511,6 +516,8 @@ void NetAudioServer::release_channels(unsigned base, unsigned count) {
     {
       std::lock_guard<std::mutex> lock(c.m);
       c.last_device = c.device_locked();  // remembered for the console and for the next claim
+      c.format.clear();
+      c.encoding.clear();
       c.peer.clear();
       c.name.clear();
       c.host.clear();
@@ -518,7 +525,19 @@ void NetAudioServer::release_channels(unsigned base, unsigned count) {
       c.holder_fd = -1;
       c.released_seq = release_seq_.fetch_add(1) + 1;
     }
+    c.src_rate.store(0);
+    c.last_audio_ns.store(0);
     c.claimed.store(false);
+  }
+}
+
+void NetAudioServer::describe_channels(unsigned base, unsigned count, const std::string& format,
+                                       const std::string& encoding) {
+  for (unsigned i = 0; i < count && base + i < this->count(); ++i) {
+    Channel& c = *chans_[base + i];
+    std::lock_guard<std::mutex> lock(c.m);
+    c.format = format;
+    c.encoding = encoding;
   }
 }
 
@@ -715,6 +734,9 @@ bool NetAudioServer::Session::format(const uint8_t* p, uint32_t len) {
         return false;
       }
       expect_pos = 0;
+      static const char* const kFmtNames[] = {"S32_LE", "S16_LE", "S24_3LE", "FLOAT_LE"};
+      srv.describe_channels(static_cast<unsigned>(base), channels, f < 4 ? kFmtNames[f] : "",
+                            encoding == ST_ENC_VORBIS ? "vorbis" : "pcm");
 
       // In FORMAT rather than the HELLO: it is a property of the stream, and one machine may
       // offer a volume-controlled PCM and an un-mixable one.
@@ -841,6 +863,8 @@ bool NetAudioServer::Feed::configure(int base, unsigned channels, unsigned src_r
   base_ = base;
   channels_ = channels;
   src_rate_ = src_rate;
+  for (unsigned i = 0; i < channels; ++i)
+    srv_.chans_[static_cast<unsigned>(base) + i]->src_rate.store(src_rate);
   restart();
   return true;
 }
@@ -858,6 +882,10 @@ bool NetAudioServer::Feed::behind() const {
 
 void NetAudioServer::Feed::push(const float* il, size_t frames, bool jumped) {
   if (base_ < 0 || channels_ == 0 || frames == 0) return;
+  const uint64_t arrived = srv_.clock_.now_ns();
+  for (unsigned i = 0; i < channels_; ++i)
+    srv_.chans_[static_cast<unsigned>(base_) + i]->last_audio_ns.store(
+        arrived, std::memory_order_relaxed);
 
   const uint64_t reader = srv_.reader_n_.load();
   const uint64_t max_lead = static_cast<uint64_t>(srv_.rate_ * kNetTimelineMs / 2000.0);
@@ -1287,6 +1315,7 @@ bool NetAudioServer::forget_channel(unsigned c) {
 std::vector<NetChannelStatus> NetAudioServer::status() const {
   std::vector<NetChannelStatus> out;
   out.reserve(count());
+  const uint64_t now = clock_.now_ns();
   for (unsigned c = 0; c < count(); ++c) {
     const Channel& ch = *chans_[c];
     NetChannelStatus s;
@@ -1303,8 +1332,16 @@ std::vector<NetChannelStatus> NetAudioServer::status() const {
     s.lead_valid = ch.lead_valid.load();
     s.target_lead_frames = ctl_.net.delay_frames.load();
     s.peak = ch.peak_milli.load() / 1000.0f;
+    s.rate = ch.src_rate.load();
+    const uint64_t heard = ch.last_audio_ns.load();
+    const bool streaming = s.connected && heard != 0 && now - heard < kNetStreamingNs;
     {
       std::lock_guard<std::mutex> lock(ch.m);
+      s.format = ch.format;
+      s.encoding = ch.encoding;
+      s.state = streaming ? "streaming"
+                : s.connected ? "connected"
+                : !ch.last_ip.empty() || s.frames_received ? "disconnected" : "";
       s.peer = ch.peer;
       s.name = ch.name;
       s.host = ch.host;

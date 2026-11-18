@@ -162,6 +162,8 @@ inline constexpr unsigned kNetGuardPeriod = 1024;
 // Longest a reconnecting sender waits for the stale connection holding its run to let go, once that
 // connection has been shut down. Well inside the plugin's 2 s wait for its HELLO_ACK.
 inline constexpr int kNetTakeBackMs = 1000;
+// A connected stream reads as "streaming" while its last audio is no older than this.
+inline constexpr uint64_t kNetStreamingNs = 1000000000ull;
 // A stream that has sent no audio for this long is disconnected and its inputs freed.
 inline constexpr uint64_t kNetIdleDropMs = 30ull * 60 * 1000;
 // How many displaced streams (live ones whose run a newer open took over) are remembered.

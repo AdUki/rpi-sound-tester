@@ -168,6 +168,7 @@ bool BtInput::record(const std::string& address, const std::string& name, unsign
                 -EBUSY);
   }
   net_.label_channels(static_cast<unsigned>(base), channels, address, name, "bluetooth");
+  net_.describe_channels(static_cast<unsigned>(base), channels, snd_pcm_format_name(fmt), {});
 
   NetAudioServer::Feed feed(net_);
   feed.set_who("bluetooth: " + name);

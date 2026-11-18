@@ -391,6 +391,28 @@ std::string input_label(const ChannelLayout& layout, const std::vector<Devices::
   return "IN " + std::to_string(c + 1);
 }
 
+// What a network channel is called when config.json gives it no name: its sender.
+std::string net_sender_name(const NetChannelStatus& c) {
+  std::string who = c.device.empty() ? c.last_device : c.device;
+  // A named stream ("main", "notif") says more than the machine does, and two of them from
+  // one machine would otherwise read the same.
+  const std::string& stream = c.connected ? c.stream : c.last_stream;
+  if (!stream.empty()) who = who.empty() ? stream : stream + " · " + who;
+  if (who.empty() || c.stream_count <= 1) return who;
+  // A stereo sender puts the same name on two cards; say which half each one is.
+  return who + " (" + std::to_string(c.stream_index) + "/" + std::to_string(c.stream_count) + ")";
+}
+
+// The link behind a network input, for its dashboard card: who, in what state, sending what.
+json net_link_json(const NetChannelStatus& c, const std::string& name) {
+  return {{"name", name.empty() ? net_sender_name(c) : name},
+          {"state", c.state},
+          {"transport", c.transport},
+          {"rate", c.rate},
+          {"format", c.format},
+          {"encoding", c.encoding}};
+}
+
 json meters_json(const AnalysisSnapshot& s) {
   json rms = json::array(), peak = json::array();
   for (unsigned c = 0; c < channels().total(); ++c) {
@@ -568,16 +590,7 @@ void WebServer::install_routes() {
     const std::vector<NetChannelStatus> net = d_.net.status();
     auto input_name = [&](unsigned i) -> std::string {
       if (!in_names[i].empty() || !layout.is_net(i)) return in_names[i];
-      const NetChannelStatus& c = net[i - layout.net_base()];
-      std::string who = c.device.empty() ? c.last_device : c.device;
-      // A named stream ("main", "notif") says more than the machine does, and two of them from
-      // one machine would otherwise read the same.
-      const std::string& stream = c.connected ? c.stream : c.last_stream;
-      if (!stream.empty()) who = who.empty() ? stream : stream + " · " + who;
-      if (who.empty() || c.stream_count <= 1) return who;
-      // A stereo sender puts the same name on two cards; say which half each one is.
-      return who + " (" + std::to_string(c.stream_index) + "/" + std::to_string(c.stream_count) +
-             ")";
+      return net_sender_name(net[i - layout.net_base()]);
     };
 
     // A device input's columns are shown once a device is on them, and stay, like a network
@@ -595,6 +608,8 @@ void WebServer::install_routes() {
       const bool is_net = layout.is_net(i);
       ins.push_back({{"ch", i},
                      {"name", input_name(i)},
+                     {"net", is_net ? net_link_json(net[i - layout.net_base()], in_names[i])
+                                    : json(nullptr)},
                      {"kind", is_net ? "net" : layout.is_device(i) ? "device" : "local"},
                      {"label", input_label(layout, sources, i)},
                      {"active", input_active(i)},
@@ -1214,6 +1229,10 @@ void WebServer::install_routes() {
                        {"last_device", c.last_device},
                        {"mac", c.mac},
                        {"transport", c.transport},
+                       {"state", c.state},
+                       {"sender_rate", c.rate},
+                       {"format", c.format},
+                       {"encoding", c.encoding},
                        {"stream_index", c.stream_index},
                        {"stream_count", c.stream_count},
                        {"frames_received", c.frames_received},
@@ -1884,13 +1903,24 @@ void WebServer::run_publisher() {
         const EngineStats es = d_.engine.stats();
         json net_active = json::array();
         json net_connected = json::array();
-        for (unsigned c = 0; c < d_.net.count(); ++c) {
-          net_active.push_back(d_.net.channel_in_use(c));
-          net_connected.push_back(d_.net.channel_connected(c));
+        json net_links = json::array();
+        std::vector<std::string> in_names;
+        {
+          std::lock_guard<std::mutex> lk(config_m_);
+          in_names = d_.config.input_names;
+        }
+        const unsigned net_base = channels().net_base();
+        for (const NetChannelStatus& c : d_.net.status()) {
+          net_active.push_back(d_.net.channel_in_use(c.channel));
+          net_connected.push_back(c.connected);
+          net_links.push_back(net_link_json(
+              c, net_base + c.channel < in_names.size() ? in_names[net_base + c.channel]
+                                                        : std::string{}));
         }
         json j{{"type", "system"},
                {"net_active", net_active},
                {"net_connected", net_connected},
+               {"net", net_links},
                {"xruns", es.xruns},
                {"generation", es.generation},
                {"sync_errors", d_.kmsg.sync_errors()},

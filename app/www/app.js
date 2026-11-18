@@ -809,7 +809,7 @@ function buildInputs() {
       <div class="chan-head">
         <label class="en" title="Enable / disable this input"><input type="checkbox" class="secbox"
           id="en${i.ch}" ${inputEnabled[i.ch] ? 'checked' : ''}></label>
-        <span class="chan-name">${inputLabel(i.ch)}${i.name ? ' — ' + esc(i.name) : ''}</span>
+        <span class="chan-name">${inputLabel(i.ch)}${i.name && !i.net ? ' — ' + esc(i.name) : ''}</span>
         <span class="listen-grp">
           ${canForget && isNetInput(i.ch) ? `<button id="netrm${i.ch}" class="lbtn netrm"
             title="Nothing is sending on this channel: take it off the console"
@@ -818,6 +818,8 @@ function buildInputs() {
           <button id="listenR${i.ch}" class="lbtn">Listen R</button>
         </span>
       </div>
+      ${i.net ? `<div class="net-who" id="netwho${i.ch}"></div>
+      <div class="net-link small mono" id="netlink${i.ch}"></div>` : ''}
       <div class="meter"><div class="rms" id="rms${i.ch}"></div><div class="peak" id="pk${i.ch}"></div></div>
       <div class="readout">
         <span id="rmsv${i.ch}" class="mono">     — dBFS</span>
@@ -838,6 +840,7 @@ function buildInputs() {
   $('netinputs').innerHTML = state.inputs.filter(i => isNetInput(i.ch)).map(card).join('');
   syncNetSection();
   syncNetRemove();
+  applyNetLinks(state.inputs.filter(i => i.net).map(i => i.net));
 
   state.inputs.forEach(i => {
     const c = i.ch;
@@ -1401,6 +1404,33 @@ function showNetChannels() {
   syncDelaySelects();          // the xcorr pair pickers follow shownInputs()
   refreshOutputSourceOptions();  // a routable NET source appears or goes
   scopeDirty = true;
+}
+
+// A network input is a digital link, so its card can say what an analog input's cannot: who is
+// on it, whether audio is arriving, and what the sender declared. One entry per network channel,
+// from /api/state and then the 1 Hz system frame. The name has a line of its own, under the head:
+// "notif · stream1955music-501e2d9edc08 (1/2)" never fitted next to the Listen buttons.
+function applyNetLinks(links) {
+  if (!Array.isArray(links)) return;
+  links.forEach((l, i) => {
+    const who = $('netwho' + (NET_BASE + i)), link = $('netlink' + (NET_BASE + i));
+    if (!who || !link) return;
+    setText(who, l.name || '—');
+    setAttr(who, 'title', l.name || '');
+    const what = [];
+    if (l.state === 'streaming' || l.state === 'connected') {
+      if (l.transport === 'bluetooth') what.push('Bluetooth');
+      if (l.rate) what.push(`${+(l.rate / 1000).toFixed(2)} kHz`);
+      if (l.format) what.push(l.format);
+      if (l.encoding && l.encoding !== 'pcm') what.push(l.encoding);
+    }
+    const state = l.state || 'unused';
+    setText(link, [state, ...what].join(' · '));
+    setClass(link, 'net-link small mono ' + state);
+    setAttr(link, 'title', state === 'streaming' ? 'Audio is arriving'
+      : state === 'connected' ? 'The sender has the link open and is sending no audio'
+      : state === 'disconnected' ? 'No sender — the channel remembers who used it last' : '');
+  });
 }
 
 // Which network channels have a sender on them right now, from the 1 Hz system frame. Only a
@@ -3450,6 +3480,7 @@ function onSpectrum(msg) {
 
 function onSystem(s) {
   applyNetAvailability(s.net_active, s.net_connected);
+  applyNetLinks(s.net);
   setText($('xruns'), `xruns ${s.xruns}`);
   setClass($('xruns'), 'pill ' + (s.xruns ? 'warn' : 'good'));
   setText($('cpu'), `cpu ${s.cpu_pct.toFixed(0)}%` + (s.temp_c > 0 ? ` · ${s.temp_c.toFixed(0)}°C` : ''));

@@ -48,6 +48,8 @@ network input with none takes its sender's (`thinkpad`, `thinkpad (1/2)` for hal
 stream).
 
 - `inputs[]`: `ch`, `name`, `kind`, `label`, `active`, `gain_db`, `mute`, `bypass`, `gain_min_db`,
+  `net` (null but on a network input: its link, `{name, state, transport, rate, format, encoding}`,
+  as in `GET /api/net` with `rate` the sender's own, which the dashboard card shows),
   `rms_db`, `peak_db`, `tone` (as in `GET /api/genie/sound`). One per input, `limits.inputs_total`.
 - `outputs[]`: the engine card's outputs, `ch`, `source`, `gain_db`, `mute`, `name`; empty without
   an engine card.
@@ -556,6 +558,7 @@ sender, with `transport: "bluetooth"` and its Bluetooth address as `peer`.
                "name": "thinkpad", "stream": "main", "last_stream": "main",
                "host": "thinkpad.lan", "device": "thinkpad",
                "last_device": "thinkpad", "mac": "3C:7C:3F:12:9A:01", "transport": "net",
+               "state": "streaming", "sender_rate": 48000, "format": "S16_LE", "encoding": "pcm",
                "stream_index": 1, "stream_count": 1, "frames_received": 874496,
                "late_drops": 0, "range_drops": 0, "underruns": 0, "resyncs": 0,
                "last_target": 1562240, "write_end": 1562496,
@@ -571,7 +574,11 @@ PCM's `name` setting, empty for a PCM without one — and
 `last_stream` keeps it like `last_device`; the channel's name in `GET /api/state` reads
 `main · thinkpad`. `mac` is the hardware address of the sender's interface that reaches the
 device, kept past the disconnect; empty from an older plugin, and for a phone (its address is
-`peer`). `inputs` is how many network channels
+`peer`). `state` is the link: `streaming` while audio is arriving, `connected` with a sender that
+has the link open and sends none, `disconnected` once it has gone, empty on a channel never used.
+`sender_rate`, `format` (`S16_LE`, `S24_3LE`, `S32_LE`, `FLOAT_LE`) and `encoding` (`pcm`,
+`vorbis`) are what a connected sender declared: 0 and empty before it has, and without one.
+`inputs` is how many network channels
 there are, `inputs_configured` how many the next start will have. `transport`
 is `net`, or `bluetooth` for a phone. `lead_error_ms` is `lead_frames` against
 `target_lead_frames` in milliseconds, meaningful while `lead_valid`.
@@ -808,7 +815,8 @@ precision. Unlike the meters, the WS spectrum leaves out the inputs `POST /api/t
 turned off.
 
 The `system` message carries `net_active` (one bool per network channel, `active` of
-`GET /api/state`), `net_connected` (one per network channel, `connected` of `GET /api/net`), `xruns`, `generation`, `sync_errors`, `listen_streams`, `engine_running`, the
+`GET /api/state`), `net_connected` (one per network channel, `connected` of `GET /api/net`), `net` (one per network
+channel, the `net` object of its input in `GET /api/state`), `xruns`, `generation`, `sync_errors`, `listen_streams`, `engine_running`, the
 host fields of `system` in `GET /api/state` (`cpu_pct`, `cpu_cores`, `temp_c`, `uptime_s`, `mem`,
 `throttle`), `sinks[]` {`id`, `present`, `enabled`, `playing`, `layout`, `latency_ms`, `trim_ppm`,
 `xruns`, `resyncs`, `error`}, `sources[]` {`id`, `first`, `channels`, `present`, `capturing`,
