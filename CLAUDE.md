@@ -1,166 +1,156 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+User-facing setup, image build, flashing: README.md.
 
-A read-only appliance for bench-testing audio gear: a Raspberry Pi 3 (the only Pi supported; never a
-Pi 5) with an Audio Injector Octo (CS42448, 6 in / 8 out, 96 kHz S32_LE), or a Khadas VIM3L with no
-card of its own. One C++17 daemon, `soundtesterd`, serves a vanilla-JS web console. The Pi's kernel
-is pinned to **5.15.92** because the Octo produces only noise on every 6.x kernel — do not bump it.
+Read-only audio bench tester: Raspberry Pi 3 (only Pi; never Pi 5) + Audio Injector Octo (CS42448,
+6 in / 8 out, 96 kHz S32_LE), or Khadas VIM3L (no card). C++17 daemon `soundtesterd` serves a
+vanilla-JS console. Pi kernel pinned to **5.15.92** (Octo gives only noise on every 6.x): do not
+bump.
 
 ## Commands
 
 ```sh
 make                  # list targets
-make build            # cmake configure (Release) + build into app/build
+make build            # cmake Release build into app/build
 make test             # ctest --test-dir app/build --output-on-failure
-make run              # http://localhost:8080 against the simulated card (--sim); BOARD= picks the profile
-make run DEVICE=hw:audioinjectoroc,0     # real engine card; SINK=default adds a desktop's sound server as an output
-make pc [BT=hci1|<addr>|ask|fake]        # the real daemon on this desktop, next to PipeWire (tools/pc/run; no Yocto)
-make plugin           # the ALSA sender plugin in alsa-plugin/ (built for THIS host, not the Pi; VORBIS=0 drops libvorbis)
-make image [BOARD=rpi3|vim3l] [DEV=1]    # Yocto (plain poky/bitbake, scarthgap); needs `make configure` first
-make bitbake ARGS="soundtesterd" [BOARD=…]   # cross-build just the daemon (ARGS="-e <recipe>" to inspect variables)
-make deploy-www / make deploy-daemon [BOARD=…] [TARGET=root@host]   # push to a running board over ssh, no reflash
+make run              # localhost:8080, simulated card (--sim); BOARD= picks the profile
+make run DEVICE=hw:audioinjectoroc,0     # real engine card; SINK=default adds the desktop sound server
+make pc [BT=hci1|<addr>|ask|fake]        # real daemon beside PipeWire (tools/pc/run; no Yocto)
+make plugin           # alsa-plugin/ for THIS host, not the Pi (VORBIS=0 drops libvorbis)
+make image [BOARD=rpi3|vim3l] [DEV=1]    # Yocto (poky/bitbake, scarthgap); needs `make configure`
+make bitbake ARGS="soundtesterd" [BOARD=…]   # cross-build the daemon; ARGS="-e <recipe>" inspects variables
+make deploy-www / make deploy-daemon [BOARD=…] [TARGET=root@host]   # ssh push to a running board
 ```
 
-Single test: `ctest --test-dir app/build -R test_capture --output-on-failure`, or run the binary
-directly (`app/build/tests/test_capture`). Tests are plain executables using the `CHECK`/`CHECK_EQ`
-macros in `app/tests/check.h` (no framework); add one with `add_st_test(name)` in
-`app/tests/CMakeLists.txt`.
-
-Build prerequisites: submodules (`git submodule update --init`, all header-only under
-`app/third_party/`), and pkg-config packages alsa, opus, ogg, samplerate, vorbis, libsystemd (+
-vorbisenc for `test_net_session`). The build also renders `docs/api.md` → `app/www/api.html`
-(git-ignored) with `tools/md2html`, so editing the API doc is part of changing the API.
-
-Simulator: output c loops back into input c delayed by `period + c*STAGGER` frames (default 137),
-so IN1→IN2 cross-correlation must read exactly 137 samples, IN1→IN3 274. The daemon serves `--www`
-from disk per request, so web edits are live on reload without a restart.
+- One test: `ctest --test-dir app/build -R test_capture --output-on-failure` or
+  `app/build/tests/test_capture`. Plain executables with `CHECK`/`CHECK_EQ` (`app/tests/check.h`);
+  add via `add_st_test(name)` in `app/tests/CMakeLists.txt`.
+- Needs submodules (`git submodule update --init`; header-only, `app/third_party/`) and pkg-config
+  alsa, opus, ogg, samplerate, vorbis, libsystemd (+ vorbisenc for `test_net_session`).
+- Build renders `docs/api.md` → `app/www/api.html` (git-ignored, `tools/md2html`): API changes
+  include that doc.
+- Simulator: output c → input c delayed `period + c*STAGGER` frames (default 137), so IN1→IN2
+  cross-correlation must read exactly 137 samples, IN1→IN3 274.
+- `--www` served from disk per request: web edits live on reload.
 
 ## Architecture
 
-Everything hangs off **one sample clock**: the **engine card** (the Octo: capture and playback
-`snd_pcm_link()`ed, no resampling) or, on a board without one, a `CLOCK_MONOTONIC` timer. Every
-generator is driven from the same absolute sample counter `n` that indexes the capture ring. A
-sample index means the same instant on every channel — preserve this in any change. Every other
-ALSA device follows that clock through an ASRC.
+**One sample clock**: the **engine card** (Octo; capture/playback `snd_pcm_link()`ed, no
+resampling) or a `CLOCK_MONOTONIC` timer. Generators run off the absolute sample counter `n` that
+indexes the capture ring: a sample index is one instant on every channel. Preserve this. Other ALSA
+devices follow via ASRC.
 
-Threads (wired in `app/src/main.cpp`; objects are connected *before* the audio thread starts):
-- **AudioEngine** (`audio_engine.cpp`, SCHED_FIFO 80, mlocked) drives an `AudioBackend`
-  (`AlsaLinkedBackend` = the Octo, `TimerBackend` = no card or `--sim`) and hands each block to
-  **EngineCore** (`engine_core.cpp`): read 8 TDM slots → remap to 6 ADCs → append to `RingBuffer`
-  (float32, ~87 s) → render each output and sink channel via `route_output()` (`output_route.h`,
-  the single routing function) → write.
-- **Devices** (`devices.cpp`, `alsa_devices.cpp`): scans ALSA every 2 s (what `aplay -l` /
-  `arecord -l` list) and binds each device other than the engine card: playback to one of 8 sink
-  slots, capture to device-input ring columns, by device id `<card id>,<dev>`; a USB device
-  unplugged keeps its slot, columns and routing. **DeviceInput** (`device_input.cpp`, one per
-  capture device) places each frame at the ring index it was captured at (engine position minus
-  what the driver still holds) into per-channel `NetTimeline`s, ASRC-trimmed; the audio thread reads
-  them a capture delay behind, and holds that delay at ≥ 150 ms while any is bound.
-  **SinkOutput** (`sink_out.cpp`, one per bound slot) consumes a handoff ring the engine writes at
-  the block's `n`, on the device's clock with ASRC trim; never on the audio thread's path. HDMI
-  sinks offer CEA-861 speaker layouts (`sink_layout.h`), others stereo and their own width.
-- **NetAudioServer** (`net_audio.cpp`): network inputs from the ALSA plugin. Each packet carries the
-  absolute sample index it should play at; `NetTimeline` places it there (the timeline *is* the
-  jitter buffer). Network channels occupy ring slots `[channels().net_base(), device_base())` and
-  are ordinary inputs everywhere else. `net_proto.h` is plain C shared verbatim by the daemon and
-  `alsa-plugin/` — keep it C-only and bump `ST_NET_PROTO_VERSION` on wire changes.
-- **Analysis** (10 Hz meters, FFT spectrum, THD+N, scope envelope), **CaptureStore** (freeze snapshot,
-  windowed reads, FFT cross-correlation; `genie.h` aggregates per-ping delay readings),
-  **KmsgWatch** (flags TDM slot-rotation "I2S SYNC error"s from /dev/kmsg).
-- **WebServer** (`webserver.cpp`, cpp-httplib) + **WsHub**: REST, push-only `/api/ws`, per-channel
-  listen streams (Opus/Ogg via `listen_encoder`/`listen_stream`). API documented in `docs/api.md`.
+Threads (wired in `app/src/main.cpp`, connected *before* the audio thread starts):
+- **AudioEngine** (`audio_engine.cpp`, SCHED_FIFO 80, mlocked) drives `AudioBackend`
+  (`AlsaLinkedBackend` = Octo, `TimerBackend` = no card / `--sim`) → **EngineCore**
+  (`engine_core.cpp`): read 8 TDM slots → remap to 6 ADCs → `RingBuffer` (float32, ~87 s) → render
+  outputs and sink channels via `route_output()` (`output_route.h`, the only routing function) →
+  write.
+- **Devices** (`devices.cpp`, `alsa_devices.cpp`): scans ALSA every 2 s (`aplay -l`/`arecord -l`),
+  binds non-engine devices by id `<card id>,<dev>`: playback → one of 8 sink slots, capture →
+  device-input ring columns. Unplugged USB keeps slot, columns, routing.
+  - **DeviceInput** (`device_input.cpp`, per capture device): each frame goes to the ring index it
+    was captured at (engine position minus driver-held frames) in per-channel `NetTimeline`s,
+    ASRC-trimmed; audio thread reads a capture delay behind, ≥ 150 ms while any is bound.
+  - **SinkOutput** (`sink_out.cpp`, per bound slot): reads a handoff ring the engine writes at the
+    block's `n`, on the device clock with ASRC trim; never on the audio thread's path. HDMI: CEA-861
+    layouts (`sink_layout.h`); others: stereo and their own width.
+- **NetAudioServer** (`net_audio.cpp`): ALSA-plugin inputs. Packets carry their absolute play
+  index; `NetTimeline` places them (it *is* the jitter buffer). Ring slots
+  `[channels().net_base(), device_base())`, ordinary inputs elsewhere. `net_proto.h` is plain C
+  shared verbatim with `alsa-plugin/`: keep it C-only; bump `ST_NET_PROTO_VERSION` on wire changes.
+- **Analysis** (10 Hz meters, FFT, THD+N, scope envelope); **CaptureStore** (freeze, windowed
+  reads, FFT cross-correlation; `genie.h` aggregates per-ping delays); **KmsgWatch** (TDM
+  slot-rotation "I2S SYNC error"s in /dev/kmsg).
+- **WebServer** (`webserver.cpp`, cpp-httplib) + **WsHub**: REST, push-only `/api/ws`, Opus/Ogg
+  listen streams per channel (`listen_encoder`/`listen_stream`). API: `docs/api.md`.
 
-Concurrency rules that matter when editing:
-- The ring is single-writer; every read is **seqlock-style post-validated** (a pre-check alone lets a
+Rules:
+- Ring is single-writer; every read is **seqlock-style post-validated** (a pre-check alone lets a
   stalled reader return stitched audio).
-- Control values live in `control.h` as atomics; compound values (e.g. an output's `{type, index}`
-  source) are **packed into one atomic** so the audio thread can't see a torn pair. Read atomics once
-  per block, never per sample (it defeats vectorization).
-- Release flags are `-O3 -ftree-vectorize -fno-math-errno`, plus `-funsafe-math-optimizations` on
-  32-bit ARM for NEON. Never `-ffast-math`: the analysis code relies on NaN/Inf guards.
-- An unopenable card/device is never fatal: threads retry and report the error in `/api/state`.
-- Channel counts are runtime (`channel_layout.h`, `channels()`, set once in main before any
-  thread): `[engine card's inputs (6 or 0) | NET n | device inputs (board.json)]`, n = `net.inputs`
-  (config.json, default 6; changed only across a daemon restart, `Config::remap_columns` moves saved
-  per-column settings). Arrays are sized by `kMaxInputs` (32); loops and strides use
-  `channels().total()`.
+- Controls: atomics in `control.h`; compound values (e.g. output source `{type, index}`) **packed
+  into one atomic** (no torn pair). Read atomics once per block, not per sample (breaks
+  vectorization).
+- Release: `-O3 -ftree-vectorize -fno-math-errno`, + `-funsafe-math-optimizations` on 32-bit ARM
+  (NEON). Never `-ffast-math`: analysis relies on NaN/Inf guards.
+- Unopenable card/device is never fatal: retry, report in `/api/state`.
+- Channel counts are runtime (`channel_layout.h`, `channels()`, set in main before threads):
+  `[engine inputs (6|0) | NET n | device inputs (board.json)]`, n = `net.inputs` (config.json,
+  default 6, changes only across restart; `Config::remap_columns` moves saved per-column
+  settings). Arrays sized `kMaxInputs` (32); loops/strides use `channels().total()`.
 
-Web UI: `app/www/` (`app.js`, `index.html`, `style.css`), no build step. The console feature-detects
-daemon capabilities via `limits.*` in `/api/state` and builds one section per entry of `sinks`;
-console and daemon API renames must ship together (static files go out with `Cache-Control:
-no-cache`, so a browser picks up a deploy on the next load).
+Web UI `app/www/` (`app.js`, `index.html`, `style.css`), no build step; feature-detects via
+`limits.*` in `/api/state`, one section per `sinks` entry. Ship console and daemon API renames
+together (static files are `Cache-Control: no-cache`).
 
 ## Bluetooth
 
-BlueZ runs the radio, bluez-alsa (meta-multimedia, 4.0.0) carries the audio, and the daemon does the
-rest over sd-bus (`bluetooth.cpp`, `BtManager`: one thread owns the bus; it is also the pairing agent,
-and says yes to everything by request — `bt_agent_policy`). Only where board.json has
-`"bluetooth": true` (the recipe sets it from `SOUNDTESTER_BLUETOOTH`), or with `--bluetooth`; on a
-desktop use `make run BT=fake` (tools/fake-bluez, a private bus) — **never `--bluetooth` on the
-laptop's real bus**, it takes over its adapter and default agent. `make run DEVICE=…` loads a
-board profile that has a radio, so it passes `--no-bluetooth` (`--sim` already leaves it off).
-- **Output** = the sink `bluetooth` (`kBtSinkId`), added with `Devices::add_fixed_sink` since no
-  scan finds a bluez-alsa PCM; `PUT /api/bluetooth/output` retargets it to a speaker. It sets
-  `SinkDevice::local_queue`: bluez-alsa's `snd_pcm_delay` includes the speaker-reported codec/radio
-  delay (150-900 ms, and it changes), which the servo must not hold.
-- **Input** (`bt_input.cpp`) is an in-process *network sender*: `claim_channels("bt:"+addr)`, the
-  shared `NetAudioServer::Feed`, so it needs the net alignment delay (`net_delay_frames()`, on with
-  `net.enabled || net.bt_input`). Re-anchors on `Feed::behind()` (a paused phone).
-- **AVRCP**: a phone's `MediaPlayer1` is carried forward (Position only arrives on change). The
-  tester is a target too (`bt_player.cpp`): an MPRIS player `Media1.RegisterPlayer`ed, title = the
-  BT sink's signal, artist "Sound Tester"; play/pause = unmute/mute, stop = sink off, next/prev
-  cycle Silence/Sine/Noise/Ping/Music. A speaker subscribes when it *connects*, so after a daemon
-  restart it hears nothing until it reconnects. Verify over the air with `btmon` on the board.
-- **Pi 3 B**: needs `dtparam=krnbt=on` (5.15 DT ships the node disabled), and
-  `krnbt_baudrate=921600` under `[board-type=0x8]` (no RTS/CTS: 3 Mbaud overruns, `0x0c14 tx
-  timeout`) — both in `yocto/conf/boards/rpi3.conf`. Every 3 B boots as 43:43:A1:12:1F:AC;
-  `soundtester-bluetooth` sets `B8:27:EB:`+serial^0xAA with `btmgmt public-addr` before bluetoothd
-  (only a cold boot exercises it; `btmgmt info` never exits without a tty). Pairings live on a
-  tmpfs and are mirrored to `/data/bluetooth` (`ConfigStore::save_dir`).
-- Loading the BT modules made the Octo lose a latent probe race on every boot (the machine driver
-  pulses the codec reset for 1.5 s; a cs42xx8 probe inside it got -121 for good): kernel patch 0003
-  defers instead. A manual sysfs `bind` does not exercise the deferred list — test via a module load.
-- Device names are attacker-controlled text from anyone in radio range: `esc()` them in app.js.
+BlueZ = radio, bluez-alsa (meta-multimedia, 4.0.0) = audio; daemon uses sd-bus (`bluetooth.cpp`,
+`BtManager`: one thread owns the bus; also the pairing agent, says yes to everything by request:
+`bt_agent_policy`). On only with board.json `"bluetooth": true` (recipe: `SOUNDTESTER_BLUETOOTH`)
+or `--bluetooth`. Desktop: `make run BT=fake` (tools/fake-bluez, private bus). **Never
+`--bluetooth` on the laptop's real bus** (takes its adapter and default agent). `make run DEVICE=…`
+loads a profile with a radio, so passes `--no-bluetooth`; `--sim` already has it off.
+- **Output**: sink `bluetooth` (`kBtSinkId`) via `Devices::add_fixed_sink` (no scan finds
+  bluez-alsa PCMs); `PUT /api/bluetooth/output` retargets. Sets `SinkDevice::local_queue`:
+  bluez-alsa's `snd_pcm_delay` includes the speaker's varying codec/radio delay (150-900 ms); the
+  servo must not hold it.
+- **Input** (`bt_input.cpp`): in-process *network sender* (`claim_channels("bt:"+addr)`, shared
+  `NetAudioServer::Feed`), so needs `net_delay_frames()` (on with `net.enabled || net.bt_input`).
+  Re-anchors on `Feed::behind()` (paused phone).
+- **AVRCP**: phone's `MediaPlayer1` carried forward (Position only arrives on change). Tester is a
+  target too (`bt_player.cpp`, MPRIS via `Media1.RegisterPlayer`): title = BT sink's signal, artist
+  "Sound Tester"; play/pause = unmute/mute, stop = sink off, next/prev cycle
+  Silence/Sine/Noise/Ping/Music. Speakers subscribe on *connect*: after daemon restart, silent until
+  reconnect. Verify with `btmon` on the board.
+- **Pi 3 B** (`yocto/conf/boards/rpi3.conf`): `dtparam=krnbt=on` (5.15 DT disables the node);
+  `krnbt_baudrate=921600` under `[board-type=0x8]` (no RTS/CTS; 3 Mbaud overruns: `0x0c14 tx
+  timeout`). All 3 B boot as 43:43:A1:12:1F:AC; `soundtester-bluetooth` sets
+  `B8:27:EB:`+serial^0xAA via `btmgmt public-addr` before bluetoothd (only cold boot tests it;
+  `btmgmt info` hangs without a tty). Pairings on tmpfs, mirrored to `/data/bluetooth`
+  (`ConfigStore::save_dir`).
+- BT modules made the Octo lose a probe race every boot (codec reset pulsed 1.5 s; a cs42xx8 probe
+  inside it got -121 for good); kernel patch 0003 defers. Sysfs `bind` skips the deferred list:
+  test via module load.
+- Device names are attacker-controlled (radio range): `esc()` them in app.js.
 
 ## PC (no Yocto)
 
-`make pc` (`tools/pc/run`) builds with the host's compiler and runs on `app/config/boards/pc.json`:
-no engine card (timer), `"desktop": true` (no reboot/shutdown, BT pairings not mirrored to the data
-dir), `"scan": false` (never open a card PipeWire runs; only what `--sink`/`--input` name, by
-default the `pipewire` ALSA PCM both ways). **Do not touch PipeWire's config.** Bluetooth runs on
-one adapter (`--bt-adapter hciN|<addr>`, `bt_pick_adapter`): devices of other adapters are not
-listed and the agent rejects their requests. `make pc-bt-setup` unpacks bluez-alsa under
-`~/.local/share/soundtester/bluez-alsa` (no apt install, no service: the packaged service would take
-every adapter from PipeWire) and installs one D-Bus policy letting the user own `org.bluealsa`;
-`run` starts `bluealsa -i <addr>` as the user and points `ALSA_CONFIG_PATH` at the plugin for the
-daemon alone. `make pc BT=fake` uses tools/fake-bluez with `FAKE_BLUEZ_ADAPTERS=2` (world on hci1).
+`make pc` (`tools/pc/run`), host compiler, `app/config/boards/pc.json`: timer, `"desktop": true`
+(no reboot/shutdown; pairings not mirrored to data dir), `"scan": false` (never opens a PipeWire
+card; only `--sink`/`--input`, default the `pipewire` ALSA PCM both ways). **Do not touch
+PipeWire's config.**
+- BT on one adapter (`--bt-adapter hciN|<addr>`, `bt_pick_adapter`); others' devices unlisted,
+  their agent requests rejected.
+- `make pc-bt-setup`: bluez-alsa in `~/.local/share/soundtester/bluez-alsa` (no apt install, no
+  service: the packaged one takes every adapter from PipeWire) + a D-Bus policy letting the user
+  own `org.bluealsa`. `run` starts `bluealsa -i <addr>` as the user; `ALSA_CONFIG_PATH` points at
+  the plugin for the daemon only.
+- `make pc BT=fake`: fake-bluez, `FAKE_BLUEZ_ADAPTERS=2` (world on hci1).
 
 ## Boards (Yocto)
 
-`BOARD=` (default `rpi3`) selects `yocto/boards/<board>.mk` (MACHINE, BSP layer, daemon profile
-id) and `yocto/conf/boards/<board>.conf` (the board's bitbake settings). The profile id picks
-`app/config/boards/<profile>.json`, installed as `/etc/soundtester/board.json`: the engine card
-(none on the VIM3L) and its `capture_channels`, rate, period and periods (patched from
-`SOUNDTESTER_RATE/PERIOD`), `device_inputs`, `bluetooth`, and optional labels, `hdmi` flags and
-`hidden` flags for device ids — the only per-board data the daemon has. `make run` loads the same
-file with `--board`. Each board builds in `yocto/build-<board>/`; the Makefile writes its
-`bblayers.conf` and an `auto.conf` that sets MACHINE and `require`s the board conf by absolute path. `meta-soundtester` depends only on core;
-BSP-specific recipes live under `dynamic-layers/<collection>/` (the pinned 5.15 Pi kernel under
-`raspberrypi`, VIM3L bits under `meson`).
-
-Bitbake parse order bites here: `soundtester-device.conf` (required from `layer.conf`) is read
-first, then `auto.conf` → board conf → `local.conf`, and the BSP's machine conf last. So board
-values are hard `=`, per-bench overrides go in `local.conf`, and anything a machine conf hard-sets
-(meta-meson sets `WKS_FILE`, `IMAGE_BOOT_FILES`, `IMAGE_NAME_SUFFIX`) must be set at recipe scope.
-Check with `make bitbake BOARD=… ARGS="-e soundtester-image"`.
+`BOARD=` (default `rpi3`) → `yocto/boards/<board>.mk` (MACHINE, BSP layer, profile id) +
+`yocto/conf/boards/<board>.conf` (bitbake settings). Profile → `app/config/boards/<profile>.json`
+→ `/etc/soundtester/board.json`, the daemon's only per-board data: engine card (none on VIM3L),
+`capture_channels`, rate/period/periods (patched from `SOUNDTESTER_RATE/PERIOD`), `device_inputs`,
+`bluetooth`, optional labels, `hdmi`/`hidden` flags per device id. `make run` loads it (`--board`).
+- Builds in `yocto/build-<board>/`; Makefile writes `bblayers.conf` and `auto.conf` (MACHINE,
+  `require` board conf by absolute path).
+- `meta-soundtester` depends only on core; BSP recipes in `dynamic-layers/<collection>/` (pinned
+  5.15 Pi kernel: `raspberrypi`; VIM3L: `meson`).
+- Parse order: `soundtester-device.conf` (from `layer.conf`) → `auto.conf` → board conf →
+  `local.conf` → BSP machine conf. Hence board values hard `=`, per-bench overrides in
+  `local.conf`, and what a machine conf hard-sets (meta-meson: `WKS_FILE`, `IMAGE_BOOT_FILES`,
+  `IMAGE_NAME_SUFFIX`) set at recipe scope. Check: `make bitbake BOARD=… ARGS="-e
+  soundtester-image"`.
 
 ## Config and deployment
 
-- `yocto/meta-soundtester/conf/soundtester-device.conf` (hostname, root password, Wi-Fi) is
-  **untracked** and holds secrets; created by `make configure` from the `.sample`. Never commit it,
-  nor anything under `yocto/build-*/` (rendered Wi-Fi config, `/etc/shadow`).
-- Runtime settings live in RAM; "Save as boot defaults" writes them to a small ext4 partition.
-  Factory defaults: `app/config/default-config.json`.
-- The rootfs is mounted read-only; deploy targets remount rw, copy, sync, remount ro. `deploy-www`
-  needs no restart; `deploy-daemon` needs the bitbake cross-build and restarts the service.
+- `yocto/meta-soundtester/conf/soundtester-device.conf` (hostname, root password, Wi-Fi):
+  untracked secrets, from `make configure` + `.sample`. Never commit it or `yocto/build-*/`
+  (rendered Wi-Fi config, `/etc/shadow`).
+- Runtime settings in RAM; "Save as boot defaults" → small ext4 partition. Factory defaults:
+  `app/config/default-config.json`.
+- Read-only rootfs: deploys remount rw, copy, sync, remount ro. `deploy-www`: no restart;
+  `deploy-daemon`: needs the bitbake cross-build, restarts the service.
