@@ -237,6 +237,8 @@ void test_device_columns() {
   CHECK(l.is_device(12) && l.is_device(13) && !l.is_device(14) && !l.is_device(11));
   CHECK_EQ(l.gain_min_db(12), kInputGainMinDb);
   CHECK_EQ(l.gain_min_db(6), kNetGainMinDb);
+  CHECK_EQ(l.gain_max_db(12), kInputGainMaxDb);
+  CHECK_EQ(l.gain_max_db(6), kNetGainMaxDb);
 }
 
 }  // namespace

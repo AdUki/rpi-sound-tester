@@ -619,6 +619,7 @@ void WebServer::install_routes() {
                      // mute are ignored here and in alsamixer until it disconnects.
                      {"bypass", d_.ctl.inputs[i].bypass.load()},
                      {"gain_min_db", layout.gain_min_db(i)},
+                     {"gain_max_db", layout.gain_max_db(i)},
                      {"rms_db", as.meters[i].rms_db},
                      {"peak_db", as.meters[i].peak_db},
                      {"tone", tone_json(as.tone[i])}});
@@ -678,6 +679,7 @@ void WebServer::install_routes() {
           {"input_gain_min_db", kInputGainMinDb},
           {"input_gain_max_db", kInputGainMaxDb},
           {"net_gain_min_db", kNetGainMinDb},
+          {"net_gain_max_db", kNetGainMaxDb},
           {"input_mute", true},
           {"telemetry_mask", true},
           {"listen_codecs",
@@ -749,7 +751,7 @@ void WebServer::install_routes() {
       [this](unsigned ch, const json& j, const httplib::Request&, httplib::Response&) {
     if (j.contains("gain_db")) {
       d_.ctl.inputs[ch].gain_db.store(
-          std::clamp(j["gain_db"].get<float>(), channels().gain_min_db(ch), kInputGainMaxDb));
+          std::clamp(j["gain_db"].get<float>(), channels().gain_min_db(ch), channels().gain_max_db(ch)));
     }
     if (j.contains("mute")) d_.ctl.inputs[ch].mute.store(j["mute"].get<bool>());
   }));

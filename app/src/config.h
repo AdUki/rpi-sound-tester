@@ -14,8 +14,8 @@
 namespace st {
 
 struct InputConfig {
-  // Make-up gain: 0..+40 dB on an ADC channel, and down to -60 dB on a network one, which has no
-  // ADC to have clipped and so nothing to hide by attenuating.
+  // Make-up gain: 0..+40 dB on an ADC channel; -60..0 dB on a network one, which has no ADC to
+  // have clipped (so nothing to hide by attenuating) and is digital (so unity is full scale).
   float gain_db = 0.0f;
   bool mute = false;
 };

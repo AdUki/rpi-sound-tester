@@ -48,7 +48,10 @@ inline constexpr float kInputGainMaxDb = 40.0f;
 // because attenuating after an ADC has clipped only hides the damage from the meters — and a
 // network channel has no ADC. It is also what gives an ALSA mixer on the sending machine a
 // playback volume worth the name, since a control that cannot go below unity is not one.
+// It never amplifies: the stream is digital, so unity already is full scale, and the sender's
+// ALSA mixer tops out at 0 dB too.
 inline constexpr float kNetGainMinDb = -60.0f;
+inline constexpr float kNetGainMaxDb = 0.0f;
 
 // Shared clamp ranges, enforced both when a config file is applied (config.cpp) and on the
 // live PUT handlers (webserver.cpp) so the two paths cannot drift.

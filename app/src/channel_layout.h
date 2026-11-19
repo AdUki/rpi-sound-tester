@@ -27,9 +27,10 @@ struct ChannelLayout {
   bool is_net(unsigned c) const { return c >= local && c < local + net; }
   bool is_device(unsigned c) const { return c >= device_base() && c < total(); }
 
-  // A network channel may be attenuated as well as amplified; an ADC's make-up gain only
-  // amplifies (see kInputGainMinDb), and a device input is an ADC too.
+  // A network channel is only attenuated; an ADC's make-up gain only amplifies (see
+  // kInputGainMinDb), and a device input is an ADC too.
   float gain_min_db(unsigned c) const { return is_net(c) ? kNetGainMinDb : kInputGainMinDb; }
+  float gain_max_db(unsigned c) const { return is_net(c) ? kNetGainMaxDb : kInputGainMaxDb; }
 };
 
 namespace detail {

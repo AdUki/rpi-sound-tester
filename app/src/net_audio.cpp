@@ -1195,7 +1195,7 @@ void NetAudioServer::serve_ctl(int fd, const std::string& ip, uint16_t want,
   st_put_u32(ack + ST_CTLA_O_STATUS, ST_HELLO_OK);
   st_put_u32(ack + ST_CTLA_O_CHANNEL, run.base);
   st_put_u32(ack + ST_CTLA_O_GAIN_MIN, static_cast<uint32_t>(static_cast<int32_t>(kNetGainMinDb * 100)));
-  st_put_u32(ack + ST_CTLA_O_GAIN_MAX, static_cast<uint32_t>(static_cast<int32_t>(0)));
+  st_put_u32(ack + ST_CTLA_O_GAIN_MAX, static_cast<uint32_t>(static_cast<int32_t>(kNetGainMaxDb * 100)));
   st_put_u32(ack + ST_CTLA_O_GAIN, static_cast<uint32_t>(gain_cdb()));
   st_put_u32(ack + ST_CTLA_O_MUTE, muted() ? 1u : 0u);
   st_put_u32(ack + ST_CTLA_O_COUNT, run.count);
@@ -1227,7 +1227,7 @@ void NetAudioServer::serve_ctl(int fd, const std::string& ip, uint16_t want,
       if (st_header_type(hdr) == ST_MSG_SET_MIX && len >= ST_SET_MIX_BYTES && !bypassed()) {
         const uint32_t mask = st_get_u32(pl.data() + ST_SETMIX_O_MASK);
         const auto cdb = static_cast<int32_t>(st_get_u32(pl.data() + ST_SETMIX_O_GAIN));
-        set_all(mask & ST_MIX_F_GAIN, std::clamp(cdb / 100.0f, kNetGainMinDb, kInputGainMaxDb),
+        set_all(mask & ST_MIX_F_GAIN, std::clamp(cdb / 100.0f, kNetGainMinDb, kNetGainMaxDb),
                 mask & ST_MIX_F_MUTE, st_get_u32(pl.data() + ST_SETMIX_O_MUTE) != 0);
       }
     }

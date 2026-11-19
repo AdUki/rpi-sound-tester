@@ -48,7 +48,7 @@ network input with none takes its sender's (`thinkpad`, `thinkpad (1/2)` for hal
 stream).
 
 - `inputs[]`: `ch`, `name`, `kind`, `label`, `active`, `gain_db`, `mute`, `bypass`, `gain_min_db`,
-  `net` (null but on a network input: its link, `{name, state, transport, rate, format, encoding}`,
+  `gain_max_db`, `net` (null but on a network input: its link, `{name, state, transport, rate, format, encoding}`,
   as in `GET /api/net` with `rate` the sender's own, which the dashboard card shows),
   `rms_db`, `peak_db`, `tone` (as in `GET /api/genie/sound`). One per input, `limits.inputs_total`.
 - `outputs[]`: the engine card's outputs, `ch`, `source`, `gain_db`, `mute`, `name`; empty without
@@ -68,7 +68,7 @@ stream).
   `config.json` only).
 - `limits`: counts: `inputs_total`, `inputs_local`, `inputs_device`, `outputs`, `net_inputs`
   (running), `net_inputs_configured` (what the next start has, see `PUT /api/net`),
-  `net_inputs_min`, `net_inputs_max`, `sinks_max`; gain ranges: `input_gain_min_db`, `input_gain_max_db`, `net_gain_min_db`; capture:
+  `net_inputs_min`, `net_inputs_max`, `sinks_max`; gain ranges: `input_gain_min_db`, `input_gain_max_db`, `net_gain_min_db`, `net_gain_max_db`; capture:
   `capture_max_frames`, `env_column_frames` (frames per scope envelope column), `pinned_mb` (memory
   locked for the ring, the snapshot and the sinks); listening: `listen_codecs`,
   `listen_default_codec`, `listen_bitrate_kbps`, `listen_bitrate_min_kbps`,
@@ -88,8 +88,9 @@ scope, xcorr, listen streams) is post-gain and a muted channel reads as silent e
 
 An ADC channel, the engine card's or a device's, takes 0…+40 dB: it cannot undo clipping that
 already happened in the codec, so attenuating would only hide the damage from the meters. A
-**network** channel has no ADC and takes −60…+40 dB, which is what gives a mixer on the sending
-machine a playback volume worth the name. Each input reports its own floor as `gain_min_db` in `GET
+**network** channel has no ADC and takes −60…0 dB, which is what gives a mixer on the sending
+machine a playback volume worth the name; it never amplifies, since a digital stream at unity
+already is full scale. Each input reports its own range as `gain_min_db`…`gain_max_db` in `GET
 /api/state`.
 
 A sender can put its stream beyond both (`mixer off`, below). That input reports `"bypass": true`

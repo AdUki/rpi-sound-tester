@@ -828,7 +828,7 @@ function buildInputs() {
       </div>
       ${hasGain ? `<label>Gain <input type="range" id="igain${i.ch}"
              min="${i.gain_min_db !== undefined ? i.gain_min_db : gainMinDb}"
-             max="${gainMaxDb}" step="0.5">
+             max="${i.gain_max_db !== undefined ? i.gain_max_db : gainMaxDb}" step="0.5">
         <span id="igainv${i.ch}" class="mono val"></span>
         <span id="igainu${i.ch}"> dB</span></label>` : ''}
       ${hasMute ? `<label><input type="checkbox" id="imute${i.ch}"> Mute</label>` : ''}

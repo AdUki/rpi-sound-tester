@@ -262,7 +262,7 @@ bool Config::from_json(const std::string& text, Config* out, std::string* err) {
 void Config::apply_to(Control& ctl, unsigned rate) const {
   for (unsigned i = 0; i < kMaxInputs; ++i) {
     ctl.inputs[i].gain_db.store(
-        std::clamp(inputs[i].gain_db, channels().gain_min_db(i), kInputGainMaxDb));
+        std::clamp(inputs[i].gain_db, channels().gain_min_db(i), channels().gain_max_db(i)));
     ctl.inputs[i].mute.store(inputs[i].mute);
   }
 

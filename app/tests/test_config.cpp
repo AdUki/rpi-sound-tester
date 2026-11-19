@@ -193,6 +193,8 @@ void test_saved_values_are_clamped() {
   Config c;
   c.inputs[0].gain_db = 80.0f;
   c.inputs[1].gain_db = -30.0f;
+  c.inputs[channels().net_base()].gain_db = 12.0f;      // a network input never amplifies
+  c.inputs[channels().net_base() + 1].gain_db = -90.0f;
   c.outputs[0].gain_db = 10.0f;
   c.sine_level_db = 10.0f;
   c.ping_interval_s = 0.01f;
@@ -203,6 +205,8 @@ void test_saved_values_are_clamped() {
 
   CHECK_EQ(ctl.inputs[0].gain_db.load(), kInputGainMaxDb);
   CHECK_EQ(ctl.inputs[1].gain_db.load(), kInputGainMinDb);
+  CHECK_EQ(ctl.inputs[channels().net_base()].gain_db.load(), kNetGainMaxDb);
+  CHECK_EQ(ctl.inputs[channels().net_base() + 1].gain_db.load(), kNetGainMinDb);
   CHECK_EQ(ctl.outputs[0].gain_db.load(), kLevelMaxDb);
   CHECK_EQ(ctl.sine.level_db.load(), kLevelMaxDb);
   CHECK_EQ(ctl.ping.interval_s.load(), kPingIntervalMinS);
