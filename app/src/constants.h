@@ -92,6 +92,25 @@ inline constexpr size_t kCaptureMinFrames = 4096;
 // changes it. Well under the ceiling so a fresh freeze is quick; raise it per-session as needed.
 inline constexpr double kCaptureDefaultSeconds = 10.0;
 
+// GET /api/capture/window: at most this many min/max columns; a window of len <= 2 x cols comes
+// back raw, so raw tops out at twice this.
+inline constexpr unsigned kWindowMaxCols = 2048;
+
+// GET /api/capture/wav: the body is built in memory (so a lapped ring read is a clean 410, never a
+// truncated file), so it is capped, and one is built at a time: a second waits up to
+// kWavBuildWaitS for the first (then 429), so it checks MemAvailable with the first's pages
+// resident. Read from the ring/snapshot in chunks of kWavChunkFrames frames (all channels), each
+// post-validated.
+inline constexpr uint64_t kWavMaxBytes = 256ull * 1024 * 1024;
+inline constexpr unsigned kWavBuildWaitS = 10;
+inline constexpr size_t kWavChunkFrames = 16384;
+// A live span may not start within this many seconds of the ring's oldest sample: the writer
+// would lap it while the body is read (a 410 every time).
+inline constexpr double kWavLiveMarginS = 2.0;
+
+// GET /api/genie/sync: calls are serialised (freeze to resume); a second waits this long, then 429.
+inline constexpr unsigned kSyncWaitS = 10;
+
 // The scope's envelope: 200 min/max columns per second of capture, 480 frames each at 96 kHz, and
 // 60 s of history. Counted in seconds rather than frames so that every rate gets the same history.
 inline constexpr unsigned kEnvColumnsPerS = 200;
@@ -108,6 +127,11 @@ inline constexpr unsigned kSpectrumBins = 240;
 
 inline constexpr size_t kXcorrMaxLen = 1u << 19;
 inline constexpr size_t kXcorrMaxFft = 1u << 20;
+// Share of the cross-spectrum magnitude within a few bins of its dominant partial's harmonic
+// series above which xcorr treats the window as a steady tone (and weighs each crest by the energy
+// it overlaps), unless both channels hold an onset: a level rise of kXcorrOnsetRiseDb.
+inline constexpr float kXcorrTonalShare = 0.93f;
+inline constexpr float kXcorrOnsetRiseDb = 10.0f;
 
 inline constexpr unsigned kListenChunkFrames = 4096;
 inline constexpr unsigned kMaxListenStreams = 12;
@@ -307,6 +331,34 @@ inline constexpr unsigned kBtInputPeriods = 10;
 
 // "Genie" convenience helpers (GET /api/genie/sound, GET /api/genie/sync).
 inline constexpr float kGenieSoundThresholdDb = -60.0f;  // peak_db above this reads as "sound"
+// genie/sound `playing` also needs the 100 ms RMS above this: an idle analog input's noise floor
+// peaks above kGenieSoundThresholdDb with its RMS far below.
+inline constexpr float kGeniePlayingRmsDb = -60.0f;
+// genie/sound tone.match: how far tone.freq_hz may sit from expect_hz.
+inline constexpr double kGenieToneTolHz = 5.0;
+
+// GET /api/genie/wait: how long a condition must hold by default, the default and longest wait,
+// how often it looks (the analysis refresh), and how many may block at once. Each pending wait
+// parks one web worker; the pool has kThreadsMin..kThreadsMax (webserver.cpp), so a capped few
+// can never starve the console and the other requests.
+inline constexpr uint64_t kGenieWaitHoldMs = 300;
+inline constexpr double kGenieWaitTimeoutS = 20.0;
+inline constexpr double kGenieWaitMaxTimeoutS = 120.0;
+inline constexpr unsigned kGenieWaitTickMs = 100;
+inline constexpr unsigned kGenieMaxWaits = 8;
+
+// GET /api/genie/watch: the span's analysis defaults, its limits and how many may run at once.
+// A watch reads up to (ring - margin) seconds per input and, for from=now, parks a web worker for
+// up to kGenieWatchNowMaxS; two at once keep a Pi 3's cores for the audio and analysis threads.
+inline constexpr double kGenieWatchSeconds = 10.0;
+inline constexpr double kGenieWatchMarginS = 3.0;   // kept between the span's start and the ring's oldest
+inline constexpr double kGenieWatchNowMaxS = 60.0;
+inline constexpr unsigned kGenieMaxWatches = 2;
+inline constexpr unsigned kGenieWatchMaxInputs = 16;
+inline constexpr size_t kGenieWatchMaxEvents = 200;
+inline constexpr double kGenieWatchBlockMs = 10.0;
+inline constexpr size_t kGenieWatchChunkFrames = 8192;  // ring read per chunk, all channels
+inline constexpr double kGenieWatchMergeMs = 2.0;  // one sender's channels: events this close are one
 
 // Per-ping xcorr window for GET /api/genie/sync, mirroring the console's Scope auto-measure
 // (app.js PING_* constants): the window runs from a ping's emission up to just before the next, so
@@ -315,5 +367,17 @@ inline constexpr float kGenieSoundThresholdDb = -60.0f;  // peak_db above this r
 inline constexpr uint64_t kPingWinGuard = 64;      // trim off the next emission -> one ping per window
 inline constexpr uint64_t kPingMinWindow = 4096;   // a ping this near the buffer end can't be trusted
 inline constexpr float kPingMinPeak = 0.05f;       // below this the correlation is noise, not an arrival
+
+// GET /api/genie/sync mode=sliding (music, radio, anything that is not the tester's ping): windows
+// across the snapshot, each xcorr'd on its own. At most this many per call, spread evenly, so a
+// long snapshot stays a ~1 s call on a Pi 3 (one 16384-sample window is a 32768-point FFT set).
+inline constexpr size_t kSyncMaxWindows = 200;
+inline constexpr uint64_t kSyncMinWindow = 256;
+inline constexpr double kSyncQuietDb = -60.0;       // a window with either channel's RMS below: skipped
+inline constexpr double kSyncMinConfidence = 1.5;   // default min_confidence for a window to count
+inline constexpr int kSyncTrustMinWindows = 10;    // sliding: kept windows a trusted summary needs
+// mode=auto uses the pings when at least this many arrive on the pair with confidence >=
+// min_confidence, else the sliding windows.
+inline constexpr size_t kSyncAutoMinPings = 3;
 
 }  // namespace st

@@ -1,7 +1,8 @@
 # HTTP API
 
-Base URL: `http://soundtester.local` (port 80 on the device; `--port` elsewhere). All bodies are
-JSON except the audio streams.
+Base URL: `http://soundtester` (port 80 on the device; `--port` elsewhere, e.g. `make run` on
+`:8080`). Use the device's hostname or its IP address: mDNS (`soundtester.local`) is not resolvable
+everywhere a script or a sender runs. All bodies are JSON except the audio streams.
 
 How many inputs and outputs there are depends on the board. The **engine card** paces everything:
 on a Pi it is the Octo, whose 6 ADCs are inputs 0–5 (IN 1–6) and whose 8 DACs are outputs 0–7
@@ -30,7 +31,8 @@ A write answers `{"ok": true}` unless its section shows another body. A failure 
 `{"error": "why"}` with **400** for a body that is not JSON, lacks a required field or holds a bad
 value; **404** for an input, output, sink, channel or Bluetooth device that does not exist; **409**
 when the request does not fit the current state; **503** when what it needs is not running or not
-ready yet.
+ready yet. A path under `/api/` that no endpoint answers, or the wrong method on one, is a **404**
+`{"error": "no such endpoint: GET /api/status; see GET /api"}`.
 
 ### `GET /api`
 This document, rendered to HTML (built from `api.md`). Also served as the static `/api.html`.
@@ -38,24 +40,36 @@ This document, rendered to HTML (built from `api.md`). Also served as the static
 ## State
 
 ### `GET /api/state`
-The whole device state in one object: `inputs`, `outputs`, `sinks`, `sources`, `devices`, `generators`,
-`channel_map`, `capture`, `engine`, `system`, and `limits` (slider ranges and feature flags the
-console reads). `engine.backend` is `card` (the engine card), `timer` (a board without one) or
+The whole device state in one object: `version`, `unix_ms`, `daemon_uptime_s`, `inputs`, `outputs`,
+`sinks`, `sources`, `devices`, `generators`, `channel_map`, `capture`, `engine`, `system`, and
+`limits` (slider ranges and feature flags the console reads). `engine.backend` is `card` (the engine card), `timer` (a board without one) or
 `simulator`. `limits.channel_map` and `limits.sync_watch` are `false` without an engine card: the
 TDM slot map and the I2S sync watch are the Octo's. `limits.bluetooth` says Bluetooth is running.
 Each input and output has a `name`, set only in `config.json` — there is no API to change it. A
 network input with none takes its sender's (`thinkpad`, `thinkpad (1/2)` for half of a stereo
-stream).
+stream), with ` (gone)` added once that sender has disconnected (`net.state` `disconnected`), so a
+name never reads like a live sender that is not there: pick NET inputs by `net.state` or with the
+genie selector, not by name.
 
+- `version`: `{"git": "8c6a898cad15-dirty", "build_time": "2026-11-19T08:42:26Z"}` — `git describe
+  --always --dirty` of the tree the daemon was built from (`-dirty`: with uncommitted changes) and
+  the build time in UTC. In an image build, `build_time` is the reproducible-build time (the newest
+  source file's), and `git` is `"unknown"` when the build could not ask git. Compare it with the
+  checkout before trusting a field documented here.
+- `unix_ms`: the wall clock (ms since 1970, UTC) when the reply was built, read together with
+  `engine.samples`, to line tester sample indices up with a DUT's log. `daemon_uptime_s`: seconds
+  since the daemon started (`system.uptime_s` is the machine's).
 - `inputs[]`: `ch`, `name`, `kind`, `label`, `active`, `gain_db`, `mute`, `bypass`, `gain_min_db`,
   `gain_max_db`, `net` (null but on a network input: its link, `{name, state, transport, rate, format, encoding}`,
   as in `GET /api/net` with `rate` the sender's own, which the dashboard card shows),
   `rms_db`, `peak_db`, `tone` (as in `GET /api/genie/sound`). One per input, `limits.inputs_total`.
-- `outputs[]`: the engine card's outputs, `ch`, `source`, `gain_db`, `mute`, `name`; empty without
-  an engine card.
+  `GET /api/inputs` answers this array on its own.
+- `outputs[]`: the engine card's outputs, `ch`, `label` (`"OUT 1"` for `ch` 0: what the console
+  calls it; a sink's channels are named by their `position` instead), `source`, `gain_db`, `mute`,
+  `name`; empty without an engine card.
 - `sinks`, `sources`, `devices`: as `GET /api/sinks`, `/api/sources` and `/api/devices`.
-- `capture`: as `GET /api/capture/status` without the `live_*` fields, plus `analyze_frames`, what
-  the next freeze copies.
+- `capture`: as `GET /api/capture/status` without the `live_*`, `analyze_seconds` and `ring_seconds`
+  fields; `analyze_frames` is what the next freeze copies.
 - `engine`: `running`, `sim`, `backend`, `device` (the engine card's ALSA name), `rate`, `period`
   and `periods` (frames per period, and how many), `format`, `capture_channels` (what the card
   captures, before the slot map), `xruns`, `generation` (bumps on every xrun), `samples` (the sample
@@ -78,6 +92,10 @@ stream).
   can tell an older daemon by their absence.
 
 ## Inputs
+
+### `GET /api/inputs`
+`GET /api/state` `inputs[]` on its own: one object per input, `ch`, `name`, `kind`, `label`,
+`active`, `net`, gains, meters and `tone`, as described there.
 
 ### `PUT /api/inputs/{ch}`
 ```json
@@ -411,8 +429,14 @@ Freeze copies the recent ring into a snapshot so measurements cannot shift while
 ```
 503 when there is not enough captured audio to freeze yet; resume answers `{"frozen": false}`.
 Ask only for samples in `[valid_start, valid_start + valid_len)`. `generation` bumps on every xrun —
-if it changed, the timeline has a gap. `status` also returns `live_now` (write head) and
-`live_oldest` (oldest readable live sample).
+if it changed, the timeline has a gap. `status` also returns `live_now` (write head), `live_oldest`
+(oldest readable live sample), `analyze_frames` / `analyze_seconds` (what the next freeze copies,
+see `capture/config`) and `ring_seconds` (how far back the live ring reaches once it has filled):
+```json
+{"frozen": false, "freeze_sample": 0, "valid_start": 0, "valid_len": 0, "generation": 0,
+ "live_now": 21910528, "live_oldest": 13523968, "analyze_frames": 960000, "analyze_seconds": 10.0,
+ "ring_seconds": 87.36}
+```
 
 ### `POST /api/capture/config`
 ```json
@@ -425,9 +449,81 @@ allocated that large. Resets to 10 s on restart.
 
 ### `GET /api/capture/window?ch=&start=&len=&cols=`
 The scope. `ch` is required; `len` defaults to 96000, `start` to the last `len` frames and `cols` to
-1024 (1–2048). Answers `{"ch", "start", "len", "raw"}` plus `min[]` and `max[]`, one pair per
-column, or `samples[]` when `raw` (`len ≤ 2×cols`). Serves the frozen snapshot if frozen, else the
-live ring.
+1024. One channel per call: a `ch` list or a repeated `ch` is a 400. Answers
+`{"ch", "start", "len", "cols", "raw"}` plus `min[]` and `max[]`, one pair per column, or
+`samples[]` when `raw` (`len ≤ 2×cols`). So raw audio comes at most 4096 samples per call
+(`cols=2048&len=4096`). Serves the frozen snapshot if frozen, else the live ring.
+
+Every param is a number ≥ 0 (a fraction is truncated); anything else is a 400, and so is a value out of range, with the
+range in the error: `ch` 0…`limits.inputs_total`−1, `len` 1…the ring, `cols` 1–2048 (refused, not
+clamped), and a span outside what can be read:
+`{"error": "[5, 105) is outside the live ring [13530112, 21916672)"}` (or `outside the frozen range
+[…)` while frozen).
+
+For more than a screenful of raw samples use `GET /api/capture/wav` below: one call instead of a
+loop of 4096-sample windows.
+
+### `GET /api/capture/wav?[<selector>&](start=&len= | seconds=)[&format=]`
+Raw multichannel audio in one call: an interleaved WAV of the selected inputs, in the order selected.
+```sh
+# the DUT's stereo stream, the last 12 s, 16-bit
+curl -s -m 30 -D h.txt -o cap.wav "$B/api/capture/wav?device=heston&seconds=12&format=s16"
+grep -i '^x-st-' h.txt
+```
+```
+X-ST-Start-Sample: 5739008
+X-ST-Len: 1152000
+X-ST-Rate: 96000
+X-ST-Generation: 1
+X-ST-Unix-Ms: 1763560000123
+X-ST-Channels: 6,7
+X-ST-Source: live
+X-ST-Format: s16
+```
+- **Inputs** — the genie selector (*Choosing inputs* below): `ch=0,1,2` (that order is the file's
+  channel order: `ch=2,0` puts IN 3 first), `device=`/`stream=`/`stream_index=`/`kind=`; none = every
+  input. A sender is resolved **now**, so on a frozen snapshot it names where the sender is now, not
+  where it was at the freeze.
+- **The span** — exactly one of:
+  - `start=&len=` — absolute sample indices (frames). On the **frozen snapshot** while frozen
+    (`[valid_start, valid_start + valid_len)`), else on the **live ring** (`[live_oldest, live_now)`
+    of `GET /api/capture/status`, less its oldest **2 s** once the ring has filled: the writer would
+    overwrite those while the body is built, so a span starting there is a 400 naming the range that
+    can be read).
+  - `seconds=N` — the last N s of the **live ring**, frozen or not (fractions too): at most the
+    ring's length less those 2 s.
+- `format` — `f32` (default; IEEE float, the ring's values bit for bit, full scale ±1.0), `s32` or
+  `s16` (integer PCM, rounded and clipped at full scale; an Octo input's 24-bit codes come back exact
+  in `s32`). Plain `fmt` (tag 3 for float, 1 for PCM; no WAVE_FORMAT_EXTENSIBLE) that libsndfile,
+  scipy, sox and ffmpeg read at any channel count (Python's `wave` module reads `s16`/`s32` only).
+
+The body is the whole file with its `Content-Length`. The headers place it on the tester's axis:
+`X-ST-Start-Sample` (the first frame's sample index), `X-ST-Len` (frames), `X-ST-Rate` (Hz),
+`X-ST-Generation` (the snapshot's `generation` when frozen, else the engine's now: compare it with an
+earlier reading, as for `capture/freeze`), `X-ST-Unix-Ms` (the wall clock at the first frame, to line
+it up with a DUT's log), `X-ST-Channels` (the ring columns, in file order), `X-ST-Source` (`frozen` or
+`live`) and `X-ST-Format`. The same facts, with each input's `label`, are in the file's `LIST/INFO`
+comment (`ffprobe cap.wav` shows it), so a saved capture keeps them. As everywhere on the ring, a
+network or device input's audio was heard `capture_delay_ms` before its sample index.
+
+**Size:** at most **256 MB** of samples per call (`len × channels × 4`, or × 2 for `s16`): ~50 s of 14
+inputs in `f32` at 96 kHz; a stereo `s16` sender's whole ring (less 2 s). The body is
+built in memory before it is sent, from post-validated reads of the ring or snapshot, so a file is
+never stitched from two laps of the ring. **Latency:** building 200 MB takes ~0.15 s on a desktop
+and several times that on a Pi 3; then the transfer: a 96 kHz `f32` channel is 384 kB per second of
+audio, so 12 s of 2 channels is 9 MB. Use `curl -m 30` (longer for a big body over Wi-Fi). One body
+is built at a time; a second request waits for it (up to 10 s).
+
+**Errors:** **400** with the valid range for a span outside it
+(`[5, 105) is outside the frozen range [1719808, 2679808)`,
+`seconds must be at most 34.480 (what the live ring holds now, less 2.0 s kept clear of its oldest
+end)`), for both or neither of
+`start+len`/`seconds`, `start` without `len`, a bad `format` or number, a malformed selector, and for
+a body over the cap (`5280000 frames is 282 MB: at most 256 MB, i.e. 4793490 frames (49.932 s) of these
+channels in this format …`); **404** for a sender that is not connected (as in *Choosing inputs*);
+**410** when the span was overwritten while it was read (should not happen past the 2 s margin)
+or the snapshot was resumed or replaced meanwhile — ask again; **429** when another export
+held the build for over 10 s; **507** when the board has not the free memory for the body.
 
 ### `POST /api/capture/xcorr`
 ```json
@@ -445,60 +541,519 @@ not a cable.
 Check `confidence` before trusting `lag_samples`: it is the winning peak over the tallest separate
 rival. Above 3, trust it. Below 2 it is ambiguous — either more than one ping is in the window
 (bracket a single ping) or you used a continuous tone (its delay is only known modulo the carrier —
-use a ping).
+use a ping). That holds for any steady periodic tone, a square wave or a clipped sine as much as a
+sine (the test counts the whole harmonic series), and for a tone so low that the window holds only
+a few of its periods (confidence 1). A ringing ping (bing, bong) bracketed with its start inside the
+window reads confident; a window that opens partway through its ring-out has no onset to pin the
+cycle and reads ambiguous — move the window's start before the ping.
 
 ## Genie helpers
 
-Shortcuts that turn the primitives above into a single answer.
+Shortcuts that turn the primitives above into a single answer, for scripts and agents. Which one
+answers which question:
 
-### `GET /api/genie/sound[?ch=&threshold_db=]`
-Is there sound on an input?
+| Question | Endpoint | Answers |
+|---|---|---|
+| Is there sound on an input, is it playing now, is it the tone I expect? | `GET /api/genie/sound` | at once (a 100 ms reading) |
+| Tell me when it starts, stops, goes live, or changes (instead of sleep-and-poll) | `GET /api/genie/wait` | when the condition holds, or at `timeout_s` |
+| Did it drop out, click, step or slip over the last (or next) N seconds? | `GET /api/genie/watch` | at once (`from=past`) or after N s (`from=now`) |
+| What is the delay between two inputs (L/R skew, speaker vs speaker, a path's latency)? | `GET /api/genie/sync` | 0.5–3 s on a Pi |
+| Give me the raw samples of these inputs over this span | `GET /api/capture/wav` (above) | at once, one WAV |
+
+They all name inputs the same way (*Choosing inputs*, next), echo who each input is (`label`, `name`,
+`kind`, `net`) so a reply can be reported as "NET 3", not as a column, and place what they read on the
+tester's sample axis (`sample`, `start_sample`, sync's `snapshot`) — sound, wait and watch also on the
+wall clock (`unix_ms`, `unix_ms_start`; capture/wav in `X-ST-Unix-Ms`), to line up with a DUT's log.
+Every one is a GET, so a browser's address bar runs it too; in the examples `B=http://soundtester`.
+Errors are JSON `{"error": "…"}` with a 4xx/5xx status; "nothing found" is a 200 with a verdict
+(`met: false`, `ok: false`) and a `reason`, so check that field before using the numbers.
+
+### Choosing inputs
+Every genie endpoint (and `GET /api/spectrum`) takes the same input selector. All of it is optional;
+with none, every input is returned.
+- `ch=4,5` — inputs by index, in that order. A comma list and repeated `ch=4&ch=5` both work.
+- `device=<prefix>` — a **connected** network sender whose `device`, `name`, `host`, `last_device`
+  or `mac` starts with this, ignoring case (`device=heston` finds `heston120-501e2d676be9`).
+- `stream=<name>` — a connected sender's stream (the plugin's `name`, e.g. `main`), exact. With
+  `device=` too, both must match.
+- `stream_index=N` — with `device`/`stream`, only member N (1-based) of each matched run: `1` is the
+  left of a stereo sender, `2` the right.
+- `kind=local|net|device` — only inputs of that kind (keeps idle analog inputs out of a NET hunt).
+  With `ch`, it filters the list.
+
+A sender is resolved on every request, so it is found wherever it reconnected to: never hard-code the
+channels a sender had. When a sender has more than one matching run (a stale run left behind by a
+reconnect, or `main` and `notif` of one host), only the runs that are `streaming` count if any is;
+otherwise every connected one. All of them are returned, grouped run by run. The reply's `resolved`
+says what the selector found:
 ```json
-{"sample": 1488896, "threshold_db": -60.0,
- "channels": [{"ch": 0, "sound": true, "rms_db": -20.1, "peak_db": -18.0,
-               "tone": {"valid": true, "freq_hz": 996.09, "thd_n_pct": 0.0032}}]}
+"resolved": {"inputs": [20, 21], "device": "heston",
+             "runs": [{"inputs": [20, 21], "channel": 14, "device": "heston120-501e2d676be9",
+                       "stream": "pipewire", "stream_count": 2, "state": "streaming"}]}
 ```
-`sound` is `peak_db > threshold_db`. Peak is a 3 s hold, so a tick or ping counts as sound, not just
-a steady tone. `threshold_db` defaults to −60. `?ch=` for one input; omit it for every input.
+(`channel` is the run's first NET channel, as in `GET /api/net`; without `device`/`stream` it is
+just `{"inputs": […]}`, plus `kind` when given.)
 
-### `GET /api/genie/sync[?ch_a=&ch_b=&cur_x=&cur_y=]`
-Delay between two inputs. A GET, so you can run it from a browser. Every param is optional:
-- `ch_a` / `ch_b` — the pair. Default: the first two inputs that currently have sound. Positive lag
-  = later on `ch_b`.
-- `cur_x` / `cur_y` — two sample indices bracketing **one** window to measure. Omit both to measure
-  **every ping marker in the buffer** instead.
+**400** for a malformed selector: a `ch` that is not a number or out of range, an empty `device`,
+`ch` together with `device`/`stream`, `stream_index` without them, or `kind` other than `net` with
+them; and, on every endpoint that takes it, for a selector that matches no inputs (`ch=6,7&kind=local`
+when 6 and 7 are network inputs, `kind=device` on a board without device inputs): `the selector
+matches no inputs on this board`. **404** when no connected sender matches, listing the channels a matching sender was last on:
+```json
+{"error": "no connected sender matches device 'heston120'", "matched": 0,
+ "last_seen": [{"input": 20, "channel": 14, "last_device": "heston120-501e2d676be9",
+                "last_stream": "pipewire", "state": "disconnected"}]}
+```
+also when the matched runs have no member `stream_index`.
+
+### `GET /api/genie/sound[?<selector>&threshold_db=&min_rms_db=&expect_hz=&tol_hz=]`
+Is there sound on an input, and is it playing now?
+```json
+{"sample": 1488896, "unix_ms": 1763560000123, "threshold_db": -60.0, "min_rms_db": -60.0,
+ "resolved": {"inputs": [20, 21], "device": "heston", "runs": [ … ]},
+ "channels": [{"ch": 20, "label": "NET 15", "name": "pipewire · heston120-501e2d676be9 (1/2)",
+               "kind": "net",
+               "net": {"channel": 14, "device": "heston120-501e2d676be9",
+                       "last_device": "heston120-501e2d676be9", "stream": "pipewire",
+                       "stream_index": 1, "stream_count": 2, "state": "streaming"},
+               "sound": true, "sound_now": true, "playing": true, "last_sound_ms_ago": 0,
+               "rms_db": -20.1, "peak_db": -18.0, "peak_now_db": -18.4, "threshold_db": -60.0,
+               "tone": {"valid": true, "freq_hz": 996.09, "thd_n_pct": 0.0032,
+                        "peak_hz": 996.09, "peak_db": -21.0, "reason": null}}]}
+```
+Inputs by the selector above. Per channel:
+- `label`, `name`, `kind` — as in `GET /api/state` `inputs[]` (report an input by its `label`,
+  "NET 15", not by `ch`). `net` is null except on a network input: who is on it (`device` is empty
+  once the sender has gone; `last_device` keeps it) and the link `state` (`streaming` while audio is
+  arriving, `connected` with the sender silent on the wire or stalled, `disconnected`, or `""` never
+  used).
+- `sound` — `peak_db > threshold_db`. `peak_db` is a **3 s hold**: the largest sample of the last
+  3 s, each peak held exactly 3 s after the sample it was at (a louder one re-arms it; a softer one
+  during a louder one's hold is still held its own 3 s), and every sample is metered, so a 1 ms tick
+  or ping between polls counts. It stays true for 3 s after the last sound above `threshold_db`
+  (to the next 100 ms reading: 3.0–3.1 s), with `rms_db` at −120.
+- `sound_now` — the latest 100 ms window's own peak (`peak_now_db`, no hold) is above `threshold_db`.
+- `playing` — `sound_now` and `rms_db > min_rms_db`: **the verdict for "is it playing now"**. An idle
+  analog input's noise floor (peaks around −55 dB, RMS −70…−82) fails it, and so does a stopped
+  input's 3 s hold.
+- `last_sound_ms_ago` — how long ago a reading (its 100 ms window, or every sample since the last
+  reading if that was longer) last peaked above −60 dBFS (fixed, not `threshold_db`), measured to
+  `sample` (to the 100 ms reading); 0 while it does, null if never since the daemon started.
+- `rms_db` (100 ms window), `peak_db` (3 s hold, as above), `peak_now_db` (100 ms, no hold); all post
+  input-gain, silence at −120. `threshold_db` echoes the top-level one.
+- `tone` — the tone detector, as in `GET /api/state` and `GET /api/spectrum`: an 8192-sample FFT
+  refreshed at 5 Hz (so for ~200 ms after a start or stop it can disagree with `rms_db`).
+  `peak_hz`/`peak_db` are always the dominant partial in 20 Hz–20 kHz. `valid` needs that partial
+  above **−80 dBFS** and everything else in band (THD+N) at most **30 %** of it; then `freq_hz` is
+  its frequency, else 0. `reason` says why not: `"silent"` (dominant partial ≤ −80 dBFS,
+  `thd_n_pct` 0) or `"not_a_tone"` (THD+N over 30 % — music, speech, noise; `thd_n_pct` kept). It is
+  null when `valid`. `thd_n_pct` is **percent**.
+
+Params: `threshold_db` (default −60) for `sound`/`sound_now`; `min_rms_db` (default −60) for
+`playing`; `expect_hz=1000` or `expect_hz=1000,1500` — one frequency for every returned channel or
+one per channel in their order (a count that fits neither is a 400) — adds `tone.expect_hz` and
+`tone.match` (`valid` and within `tol_hz` of it; `tol_hz` defaults to 5 and is echoed top level).
+A param that is not a number is a 400. `unix_ms` is the wall clock when the engine was at `sample` (to line the reply up with a DUT's log).
+A network input's audio reaches the ring `GET /api/net` `delay_ms` after it was sent, so a sender
+that just started reads `playing` that much later.
+
+**400** for a malformed selector or a param that is not a number, an `expect_hz` count that fits
+neither one nor one per channel; **404** for a sender that is not connected (as in *Choosing
+inputs*). **Latency:** none — it reads the latest analysis snapshot (refreshed every 100 ms) and
+answers at once; `curl -m 5` is plenty.
+
+```sh
+# is the DUT playing on its sender right now?
+curl -s -m 5 "$B/api/genie/sound?device=heston" | jq -c '.channels[] | {label, playing, rms_db}'
+# is the 1 kHz test tone on IN 1 and IN 2?
+curl -s -m 5 "$B/api/genie/sound?ch=0,1&expect_hz=1000" |
+  jq -c '.channels[] | {label, match: .tone.match, freq_hz: .tone.freq_hz, thd_n_pct: .tone.thd_n_pct}'
+```
+
+To wait for a sender to start (or stop) playing, use `GET /api/genie/wait` below rather than a
+loop of these.
+
+### `GET /api/genie/wait?until=…[&<selector>&hold_ms=&timeout_s=&all=&threshold_db=&min_rms_db=&freq_hz=&tol_hz=]`
+Blocks until something happens on an input, then answers: the server-side replacement for a
+sleep-and-poll loop. It looks every 100 ms (the analysis refresh) at the same readings as
+`genie/sound` and at `GET /api/net`, and answers as soon as the condition has held `hold_ms`
+without a break, or when `timeout_s` runs out.
+```json
+{"met": true, "until": "sound", "after_ms": 2911, "met_sample": 1335168,
+ "met_unix_ms": 1763560003235, "onset_ms": 1611, "hold_ms": 300, "timeout_s": 20.0, "all": false,
+ "threshold_db": -60.0, "min_rms_db": -60.0,
+ "sample": 1363968, "unix_ms": 1763560003535, "capture_delay_ms": 1000.0,
+ "resolved": {"inputs": [6, 7], "stream": "main", "runs": [ … ]}, "moved_from": null,
+ "channels": [{"ch": 6, "label": "NET 1", "name": "main · heston120 (1/2)", "kind": "net",
+               "device": "heston120",
+               "net": {"channel": 0, "device": "heston120", "last_device": "heston120",
+                       "stream": "main", "stream_index": 1, "stream_count": 2,
+                       "state": "streaming", "frames_received": 46041,
+                       "frames_per_s": 47980.2, "last_audio_ms_ago": 17},
+               "holds": true, "playing": true, "sound_now": true,
+               "rms_db": -23.0, "peak_now_db": -20.0,
+               "tone": {"valid": true, "freq_hz": 439.92, … }, "changed": null}]}
+```
+`until` (required) — per input:
+- `sound` — `playing`, as in `genie/sound`: the unheld 100 ms peak above `threshold_db` and the RMS
+  above `min_rms_db` (an idle analog input's noise floor does not count).
+- `silence` — not `sound_now`: the unheld 100 ms peak at or below `threshold_db`. No 3 s hold, so it
+  is met right after the sound stops (not 3 s later, as `sound` going false would be).
+- `tone` — `tone.valid`, and within `tol_hz` (default 5) of `freq_hz` when given (any valid tone
+  without it). `expect_hz=` (the name `genie/sound` and `genie/watch` use) is the same parameter
+  here, one frequency; both together is a 400, and so is either, or `tol_hz`, with any other `until`.
+  (`freq_hz` on `genie/sound` or `genie/watch` is a 400 naming `expect_hz`.)
+- `live` — the sender is `streaming` and its `frames_received` has moved past where it stood at the
+  wait's first look at that input: audio is arriving **now**, not just within the last second.
+  Network inputs only: without a selector it watches every network input; a `ch` that is not one,
+  or `kind` other than `net`, is a 400.
+- `change` — `playing` differs from what it was on that input at the start of the wait. The reply's
+  `changed` says which inputs flipped: `"on"` (started playing) or `"off"`, null for the rest. Wait
+  with no selector, then start or stop the DUT: the input that flips is the one it is wired to.
+
+Met when **any** selected input has held its condition for `hold_ms` (default 300, 0 = the first
+look it holds on); `all=1` (or `any=0`) needs every selected input, and at least one. `timeout_s`
+defaults to 20 and takes 0…120 (fractions too; 0 looks once). `threshold_db`/`min_rms_db` default to
+−60 as in `genie/sound`.
+
+**The selector** (as in *Choosing inputs*) is resolved again on every look, so a wait on
+`device=`/`stream=` follows a sender that reconnects onto other channels; `moved_from` then lists the
+inputs it started on (null otherwise), and an input new to the wait starts its own baseline and hold
+there. A sender that is not connected yet is not an error: the wait waits for it (a sender that never
+comes is a timeout with `last_seen`). For `silence` and `change`, a sender that leaves after it was
+found (aplay ending, a killed player: it closes its PCM) is still watched on the inputs it was last
+on, unless another sender has taken them: its audio drains through the ring and they go silent, so
+"wait until the DUT stops" is met. The reply then has `"sender_left": true`, `resolved: null` and
+those inputs in `channels`. With no selector, every input is watched (every network input
+for `live`) — give one for `sound`/`silence`/`tone`, or an idle input decides it.
+
+The reply: `met`; `after_ms`, **wall time** from the request to the look that met it (or to the
+timeout); `sample`/`unix_ms` of the analysis reading it ended on (as in `genie/sound`); and per
+selected input its levels then, `holds` (its condition held on that last look, for however long), and
+for a network input the `net` block of `genie/sound` plus `frames_received`, `frames_per_s` and
+`last_audio_ms_ago` from `GET /api/net`.
+
+**When it happened.** `after_ms` is when the wait *answered*, not when the thing happened: it
+**includes `hold_ms`** (the condition had to hold that long first) and, for `sound`, `silence`,
+`tone` and `change`, **`capture_delay_ms`** — every input's audio enters the ring that long after
+it was heard, the alignment delay that keeps network and device inputs on one axis with the analog
+ones (`GET /api/net` `delay_ms` while the network or Bluetooth input is on, at least 150 ms while a
+device input is bound, else 0). `live` reads the link, not the ring, so it has no capture delay. For
+when the condition **started**:
+- `met_sample` / `met_unix_ms` — the analysis reading (its ring `sample`, and that sample's wall
+  time as `unix_ms` reckons it) that began the run of looks that met it: the start of the hold. With
+  `all=1`, the reading on which the last of the inputs began holding. The reading is the **end** of
+  its 100 ms window, so the change itself happened up to 100 ms before it.
+- `onset_ms` — from the request to then, in the DUT's time: `met_unix_ms − capture_delay_ms −` the
+  request's wall time (for `live`, the look's own time from the request). ≤ 0 when the condition
+  already held as the request came in (for `sound` on an input already playing, about
+  −`capture_delay_ms`). So "how long after I pressed play did sound arrive" is `onset_ms`, to
+  ~100 ms.
+
+All three are null unless `met`. Levels and `tone` are refreshed at 10 Hz and 5 Hz, so `after_ms` is
+at most ~100 ms (tone ~200 ms) late on top of `hold_ms` and the capture delay.
+
+**Timeout:** a 200 with `met: false` and a `reason`:
+- `"no connected sender matches stream 'main'"` with `last_seen` (as the selector's 404 lists it)
+  when the selector found no sender on the last look;
+- `"sender not streaming: NET 1 (heston120 connected, last audio 4004 ms ago); NET 2 (…)"` when a
+  selected network input's sender is connected but silent on the wire or stalled, `disconnected`, or
+  absent (`"NET 3 (no sender)"`) — the link, not the DUT, is why nothing played. Only for `sound`,
+  `tone` and `live`, and only when the wait was about senders (`device=`/`stream=`, or nothing but
+  network inputs selected): a wait over analog and NET inputs is not blamed on an idle NET input;
+- otherwise `"timed out after 20 s: sound did not hold for 300 ms on any selected input"`.
+
+**400** for a missing or unknown `until`, a bad number, a malformed selector, or one that matches no
+input on this board (`kind=device` on a board with none). **429** when 8 waits are already pending
+(each holds a server thread; retry when one has answered). **503** `"the daemon is shutting down"` to
+a wait cut short by a stop. A client that hangs up ends its wait (and frees its slot) within 100 ms.
+Give curl at least `timeout_s` + a few seconds: `curl -m 25` for the default.
+
+```sh
+# the DUT started playing on its sender (wherever it reconnected to)
+curl -s -m 30 "$B/api/genie/wait?device=heston&until=sound&timeout_s=20" | jq '{met, after_ms, reason}'
+# a sender that is about to connect is live
+curl -s -m 30 "$B/api/genie/wait?stream=main&until=live" | jq '{met, reason, inputs: .resolved.inputs}'
+# which analog input is the DUT: start the wait, then start or stop the DUT
+curl -s -m 40 "$B/api/genie/wait?kind=local&until=change&timeout_s=30" |
+  jq '.channels[] | select(.changed) | {label, changed}'
+# the 1 kHz test tone arrived on the left channel
+curl -s -m 30 "$B/api/genie/wait?device=atron&stream_index=1&until=tone&freq_hz=1000"
+```
+
+### `GET /api/genie/watch[?<selector>&seconds=&from=&block_ms=&silence_db=&click_k=&expect_hz=&resid_dbc=&slip_deg=&level_step_db=]`
+What happened on an input over a span of the ring: dropouts, clicks, level steps and, on a test
+tone, phase slips and distortion, each at the sample it happened, plus the span's level statistics.
+The server-side replacement for polling `genie/sound` once a second or pulling the span out with
+`capture/window` for a gap/glitch/sine-fit script.
+```json
+{"from": "now", "seconds": 10.0, "start_sample": 7384064, "len": 960000, "analysed": 960000,
+ "rate": 96000.0, "block_ms": 10.0, "unix_ms_start": 1763560000000, "t_ago_s_start": 10.04,
+ "capture_delay_ms": 1000.0, "generation": 1, "generation_changed": false,
+ "incomplete": false, "reason": null, "elapsed_ms": 10051, "analysis_ms": 46,
+ "params": {"silence_db": -60.0, "click_k": 10.0, "expect_hz": "auto", "resid_dbc": -50.0,
+            "slip_deg": 20.0, "level_step_db": 6.0},
+ "resolved": {"inputs": [6, 7], "stream": "main", "runs": [ … ]},
+ "channels": [{"ch": 6, "label": "NET 1", "name": "main · heston120 (1/2)", "kind": "net",
+               "net": {…},
+               "sound_pct": 82.9, "silent_s": 1.71,
+               "rms_db": {"min": -120.0, "p10": -120.0, "median": -13.47, "max": -13.4},
+               "peak_max_db": -10.46, "clipped_samples": 0,
+               "counts": {"zero_run": 0, "gap": 1, "onset": 0, "offset": 0, "click": 0,
+                          "level_step": 0, "phase_slip": 0, "resid": 0},
+               "tone": {"expect_hz": 998.145, "source": "analysis", "blocks": 829, "bad_blocks": 2,
+                        "freq_hz_median": 1000.0, "freq_hz_min": 998.004, "freq_hz_max": 1000.0,
+                        "thd_n_pct_median": 0.0666, "thd_n_pct_max": 42.1,
+                        "resid_dbc_median": -63.5, "resid_dbc_max": -7.5},
+               "tone_note": null,
+               "link": {"underruns": 10, "underrun_events": 2, "late_drops": 7, "range_drops": 0,
+                        "resyncs": 1, "reconnects": 0, "device_changed": false,
+                        "state": "streaming", "frames_per_s": 95275.0}}, …],
+ "events": [{"kind": "gap", "ch": [6, 7], "labels": ["NET 1", "NET 2"], "sample": 7811998,
+             "t_s": 4.4576, "t_ago_s": 5.58, "len_ms": 1720.792, "zeros": true, "click": true}],
+ "events_truncated": false}
+```
+**The span** — `seconds` (default 10) of every selected input (the selector of *Choosing inputs*;
+with none, every input, at most 16):
+- `from=past` (default) — the last `seconds` of the ring, answered at once. Up to the ring's length
+  less 3 s: ~84 s at 96 kHz with 6 network inputs, ~40 s with 16 (a 400 says the limit).
+- `from=now` — the next `seconds` from the request on: it blocks until they have been captured
+  (at most 60 s), then analyses them. Start it, then do what you are testing (toggle the DUT, kill a
+  sender); give curl `seconds` + 10. A client that hangs up ends it.
+
+The span is the ring's, so every input's audio in it was heard `capture_delay_ms` before (as in
+`genie/wait`); `start_sample`/`unix_ms_start` place it, and every event carries its own `sample`,
+`t_s` (from the span's start) and `t_ago_s` (before the reply). A span the writer overtakes while it
+is read (only a very long one on a busy Pi) stops there: `incomplete: true`, `reason`, and
+`analysed` (samples) short of `len`, with the figures over what was read.
+
+**Per channel** (`label`/`name`/`kind`/`net` as in `genie/sound`), over 10 ms blocks (`block_ms`,
+1–100):
+- `sound_pct` — share of the span in blocks whose RMS is at or above `silence_db` (default −60
+  dBFS); `silent_s` the rest, in seconds.
+- `rms_db` — the blocks' RMS: `min`, `p10`, `median`, `max` (dBFS, silence −120). `peak_max_db` the
+  largest sample; `clipped_samples` those at |x| ≥ 0.999.
+- `counts` — events of each kind on this channel (all of them, also past the event cap).
+- `tone` — **tone mode**, null when off. Each block is least-squares fitted with a sine at
+  `expect_hz` (plus DC, and a linear drift of amplitude and phase, so a tone a few Hz off still
+  fits). `freq_hz_median/min/max` come from the phase advance between consecutive clean blocks
+  (finer than any FFT bin: a network sender's converter trim shows, e.g. 998.0 Hz at its 0.2 % limit
+  while it catches up); `thd_n_pct_*` and `resid_dbc_*` are each block's residual against the tone
+  (THD+N, percent; and the same in dBc); `blocks` the non-quiet blocks fitted, `bad_blocks` those
+  whose residual is above `resid_dbc`. `source` says where `expect_hz` came from.
+  `tone_note` says why tone mode is off with `expect_hz=auto`.
+- `link` — `from=now` and a network input only: how the sender's counters (`GET /api/net`) moved
+  over the request — `underruns` (engine blocks), `underrun_events`, `late_drops`, `range_drops`,
+  `resyncs`, `reconnects`, plus `device_changed` (a different sender is on the channel at the end
+than at the start; false when the channel is empty at the end — a sender that left reads
+`state: disconnected`), the link
+  `state` and `frames_per_s` at the end. The counters move one `capture_delay_ms` before the audio
+  they affect reaches the ring, so a hole in the last second of the span shows here but not yet as
+  an event. Null otherwise.
+
+**Events** — one list for all channels, by sample, at most 200 (`events_truncated` past that; the
+`counts` are complete). Each has `kind`, `ch` and `labels` (the inputs it was seen on: the members of
+one network sender's run that show the same event within 2 ms are **one** event), `sample`, `t_s`,
+`t_ago_s` and `len_ms`. Kinds:
+- `gap` — quiet blocks (below `silence_db`) with level (20 dB over `silence_db`) within 30 ms on
+  **both** sides, and sustained there (the median block over 0.5 s on each side that loud too): a
+  dropout. The pauses of an intermittent signal (the ping/tick generator, a click track) are no
+  gaps, and its bursts no onsets. `zeros: true` when it is one run of exact 0.0 samples — a network hole
+  (`NetTimeline` plays an unwritten frame as exact zero), a muted input — and then `sample`
+  and `len_ms` are exact to the sample; otherwise they are to the block. An analog path (or the
+  simulator's noise floor) is never exactly zero, so a muted output reads `zeros: false`.
+- `onset` / `offset` — the same abrupt edge on one side only: the sound started (`sample` = its first
+  block, `len_ms` 0) or stopped (`len_ms` = how long it stayed quiet, to the span's end or a soft
+  return). A **fade** (a track ending) has no abrupt edge and is neither: a track gap is not a
+  dropout.
+- `zero_run` — at least 1 ms of exact 0.0 inside audio (level within 50 ms both sides) too short to
+  make a quiet block: a short network hole. Exact to the sample. Holes inside a `gap` are part of it.
+- `click` — a sample whose second difference |x[n−1] − 2x[n] + x[n+1]| exceeds `click_k` (default
+  **10**) times the median of its 10 ms block and of the blocks either side, and at least
+  `silence_db` in absolute terms; `sample` is the worst sample of a cluster (2 ms), `len_ms` the
+  cluster, `level_db` its size. The edge of a gap, a hole, a slip or a step clicks too, and is then
+  reported on that event as `click: true`, not apart. At the default, 40 s of white or music-like
+  noise reads no click; lower `click_k` (not below ~8) to hunt smaller ones.
+- `level_step` — the RMS of two **steady** 100 ms stretches (every block but one within 1.5 dB of
+  their median, quiet blocks left out) either side of a point differs by more than `level_step_db`
+  (default 6): `from_db`, `to_db`, and `sample` to the block. On a tone or noise that is a volume
+  jump; music with steady notes (the music generator) shows its own dynamics here too, so judge
+  steps on a test signal.
+- `phase_slip` — tone mode: the tone's phase jumped by more than `slip_deg` (default 20°) against its
+  steady drift: samples lost or repeated. `slip_samples` (> 0: the tone jumped **ahead**, as if that
+  many samples were lost; < 0: it fell behind, samples repeated) and `slip_deg`, modulo one period
+  of the tone (±48 samples at 1 kHz / 96 kHz); `sample` is exact (to the block when the span had
+  already left the ring for the second look). A slip across a `gap` or `zero_run` (up to 1 s) is put
+  on that event as its `slip_samples`/`slip_deg`: the tone came back shifted (none: the hole kept
+  its place, as a network hole does). A slip is a lasting move: the clean block before it must agree
+  with the one before that, and the clean block after it with the one after that. So one block
+  knocked off-phase by a disturbance (a burst at the tone's own frequency on one channel) that is
+  back in place on the next is no slip, and nor is anything in the span's **last or first block or
+  two**, where there is no neighbour to confirm it — a span that ends right after a disturbance does
+  not invent a slip there; `from=now` a little longer (or a later `from=past`) sees it. A span that
+  is not a whole number of blocks ends in a partial block, which counts for levels and clicks, for
+  the tone's residual (`resid`, `bad_blocks`) only when long enough to fit, and never for its phase.
+- `resid` — tone mode: blocks in a row whose residual is above `resid_dbc` (default −50 dBc) that no
+  other event explains (distortion, an interferer, a wrong `expect_hz`); `resid_dbc` the worst.
+
+**`expect_hz`** — `auto` (default): per input, the tone detector's `freq_hz` (as in `genie/sound`)
+when it reads a valid tone at the span's end, else tone mode off (`tone_note` says why). `none`:
+off. `1000` or `1000,1500`: one frequency for every input or one per input in order; each needs a
+whole cycle per block (≥ 100 Hz at 10 ms; raise `block_ms` for a lower tone) and to be below
+Nyquist. `resid_dbc` (−200…0), `slip_deg` (0…180) and `level_step_db` (0…100) tune the detectors.
+
+`generation` is the engine's discontinuity counter at the end; `generation_changed` whether the
+span holds a seam — an xrun or a capture-axis move (the network delay changed, a device input bound)
+puts one in the ring, and it can read as a gap or a slip. `from=now`: the counter moved during the
+span. `from=past`: the engine keeps the ring sample of its latest move, and the span holds a seam when
+that is inside it (every earlier move is earlier still).
+
+**400** for a malformed selector or param, `seconds` over the limit (the message says it), a ring
+that does not hold `seconds` yet, an `expect_hz` count that fits neither one nor one per input, or
+more than 16 inputs; **404** for a sender not connected (as in *Choosing inputs*). **429** when 2
+watches are already running (each takes a server thread and, while it analyses, a core). **503**
+`"the daemon is shutting down"` for a `from=now` cut short by a stop, and `"the engine is not
+advancing: …"` for one whose span has not been captured 5 s after it should have been (a stalled
+or unopenable card: see `engine.last_error` in `/api/state`). **Latency** (on top of the
+wait for `from=now`): the analysis runs ~1000× real time per input on a desktop (84 s of 14 inputs
+in 0.8 s; `analysis_ms` reports it) and should be 10–20× slower on a Pi 3 — 10 s of 2 inputs well
+under a second, the whole ring of every input ~10 s. Use `curl -m 30` for `from=past`.
+
+```sh
+# did the DUT's stream drop out in the last 30 s?
+curl -s -m 30 "$B/api/genie/watch?device=heston&seconds=30" |
+  jq '{counts: [.channels[] | {label, counts}], events: [.events[] | {kind, labels, t_ago_s, len_ms}]}'
+# soak a 1 kHz test tone for the next 60 s: holes, slips, THD+N
+curl -s -m 75 "$B/api/genie/watch?stream=main&from=now&seconds=60&expect_hz=1000" |
+  jq '.channels[] | {label, counts, tone: .tone | {freq_hz_median, thd_n_pct_max, bad_blocks}, link}'
+```
+
+### `GET /api/genie/sync[?<pair>&mode=&since=&win=&step=&min_confidence=&cur_x=&cur_y=]`
+Delay between two inputs. A GET, so you can run it from a browser. Every param is optional. A positive
+lag means the signal arrives later on `ch_b`.
+
+**The pair** — one of:
+- `device=<prefix>` and/or `stream=<name>` alone: **left vs right of that sender** — member 1 of its
+  run is `ch_a`, member 2 `ch_b` (resolved as in *Choosing inputs* above; with several
+  matching runs, the first). A one-channel sender is a 400: pair it with `a=`/`b=`.
+- `a=<side>` and `b=<side>`, each an input number (`a=0`) or a sender `<device>[/<stream>]`
+  (`a=heston`, `a=heston/main`, `a=/notif`): **the first channel of that sender's run** — sender
+  against sender, or a sender against an analog reference.
+- `ch_a=` / `ch_b=` — input numbers, as before (`ch_a` and `a` together is a 400).
+- Nothing (or one side missing): the first inputs that are `playing` (as in `genie/sound`), then
+  those whose 3 s held peak is above −60 dB.
+
+`ch`, `stream_index` and `kind` are a 400 here; a sender that is not connected is a 404 with
+`last_seen`, as in `genie/sound` (its `error` starts with `a: `/`b: ` for a side). The reply echoes
+both sides, so you can report them by name:
+```json
+"ch_a": 6, "ch_b": 7,
+"a": {"ch": 6, "label": "NET 1", "name": "main · heston120 (1/2)", "kind": "net",
+      "device": "heston120", "stream": "main", "stream_index": 1},
+"b": {"ch": 7, "label": "NET 2", …}
+```
+(`device`/`stream`/`stream_index` are null for an analog input), plus `resolved` (as in
+`genie/sound`) with `device=`/`stream=`.
+
+**`mode`** — what to correlate (default `auto`):
+- `pings` — every ping marker in the snapshot: each window runs from one emission up to just before
+  the next, so it holds exactly one arrival wherever the loopback delay puts it (the console Scope's
+  method). Needs the ping generator routed into the path.
+- `sliding` — **anything both inputs carry** (music, radio, a DUT's own content): windows of `win`
+  samples every `step` (default: the next power of two of 0.17 s — 16384 at 96 kHz, 8192 at 48 kHz —
+  and `step = win`) across the snapshot. At most **200** windows: past that, 200 evenly spaced ones.
+  A window where either input's RMS is below −60 dBFS is skipped unmeasured (`n_quiet`); a measured
+  one is `kept` when its `confidence ≥ min_confidence` (default 1.5) and its `peak ≥ 0.05`.
+  `win` is 256…524288; a lag longer than about half a window will not be found, so raise `win` for a
+  long delay (e.g. a Bluetooth speaker against an analog reference: `win=131072`).
+- `auto` — `pings` when at least 3 ping readings on the pair have `confidence ≥ min_confidence`,
+  otherwise `sliding`. (Ping markers are logged whether or not the ping is routed anywhere, and a
+  ping window of music correlates at confidence ~1.1.) If sliding finds nothing but 1–2 pings did
+  reach `min_confidence`, those (and only those) are the answer; pings below it never are.
+  `mode_used` says which.
+
+**`since=<sample>`** or **`since_ms_ago=<ms>`** (before the snapshot end): only ping markers and
+windows that start at or after it — the audio after a setting changed. Echoed as `since` (a sample).
 
 Freeze: if the capture is already frozen (`POST /api/capture/freeze`) it measures on that snapshot
 and leaves it frozen; otherwise it freezes, measures and unfreezes. `frozen` in the reply says which.
+The snapshot is the *Analyze buffer* (`POST /api/capture/config`, 10 s by default) ending now — one
+`delay_ms` behind a network sender's wire.
 
-With `cur_x`/`cur_y` — one window:
 ```json
-{"ch_a": 0, "ch_b": 1, "frozen": true, "start": 1166016, "len": 16384,
- "lag_samples": 137, "lag_ms": 1.4271, "lag_m": 0.4895, "confidence": 42.0, "peak": 0.99}
-```
-Without them — every ping marker, plus a summary:
-```json
-{"ch_a": 0, "ch_b": 1, "frozen": false,
- "snapshot": {"freeze_sample": 3018112, "valid_start": 1097728, "valid_len": 1920384, "generation": 0},
+{"ok": true, "reason": null, "mode": "auto", "mode_used": "sliding", "trusted": true,
+ "ch_a": 6, "ch_b": 7, "a": {…}, "b": {…}, "frozen": false,
+ "n_markers": 5, "n_skipped": 0, "n_no_arrival": 0, "n_windows": 58, "n_quiet": 0,
+ "win": 16384, "step": 16384, "min_confidence": 1.5,
+ "snapshot": {"freeze_sample": 3018112, "valid_start": 2058112, "valid_len": 960000, "generation": 0},
  "measurements": [
-   {"center": 1170112, "variant": "tick", "start": 1166016,
-    "len": 18432, "lag_samples": 137, "lag_ms": 1.4271, "lag_m": 0.4895, "confidence": 999.0,
-    "peak": 0.99},
-   {"center": 954112, "variant": "tick", "skipped": "outside buffer"}],
- "summary": {"n": 27, "lag_samples_median": 137.0, "lag_ms_median": 1.4271, "lag_m_median": 0.4895,
+   {"start": 2058112, "len": 16384, "lag_samples": 137, "lag_ms": 1.4271, "confidence": 4.74,
+    "peak": 0.99, "kept": true}],
+ "summary": {"n": 58, "lag_samples_median": 137.0, "lag_ms_median": 1.4271, "lag_m_median": 0.4895,
              "lag_samples_min": 137, "lag_samples_max": 137, "lag_samples_spread": 0,
-             "confidence_median": 999.0}}
+             "lag_samples_mad": 0.0, "lag_ms_mad": 0.0, "lag_ms_stdev": 0.0,
+             "lag_ms_p10": 1.4271, "lag_ms_p90": 1.4271, "confidence_median": 4.74,
+             "bimodal": false}}
 ```
-Each ping is bracketed from its emission up to just before the next, so the window holds exactly one
-arrival wherever the loopback delay puts it — the same method the console's Scope uses. A ping
-outside the snapshot is `skipped` (`outside buffer`), and so is one too near its end (`too near
-buffer end`) or one whose window `xcorr` refuses (its error); raise the *Analyze buffer* (`POST
-/api/capture/config`) to reach further back. A reading whose `peak` is below 0.05 is flagged
-`"no_arrival": true` — the pair carries no captured arrival for that ping (e.g. it was emitted
-before routing) — and is left out of the summary. `lag_samples_spread` (max−min) is the
-marker-to-marker jitter. Read each `confidence`: below ~2 the lag is ambiguous (a repeating stimulus
-or a continuous tone). Answers 503 when there is not enough captured audio to freeze, 400 when no
-input has sound and no channels were given.
+- **`ok`** — false when nothing could be measured; `reason` says why, and `summary` is just
+  `{"n": 0}`. The status is still **200**: check `ok` (`jq 'select(.ok)'`) before any arithmetic on
+  the summary. Reasons: `no ping markers in the snapshot (ping generator off?)`,
+  `all N pings no_arrival on ch A/B: check routing`, `both channels silent (RMS below -60 dB)`,
+  `ch_a (IN 5) silent …`, `the two channels are never loud in the same window`,
+  `snapshot shorter than one window (…)`, `no window correlated with confidence >= 1.5 (unrelated
+  signals, or a steady tone)` — any steady periodic waveform, harmonics and all; in `auto`, the
+  sliding reason, then `; pings: …` (what the pings found, `no ping markers …` included) only
+  when the ping generator is routed somewhere now — an output, or a channel of an enabled sink's
+  layout, whose source is `gen` `ping` — so a sync over music with the ping routed nowhere is not
+  sent to check a routing nobody asked for. With `mode=pings` the pings' reason is the reason, and
+  `all N pings no_arrival on ch A/B` then ends `: the ping is routed to no output or sink` instead
+  of `: check routing` when nothing plays it.
+- `trusted` — the summary can be taken at face value. Pings: `confidence_median > 3` and
+  `lag_samples_mad ≤ 2`. Sliding: `n ≥ 10` kept windows, `lag_ms_stdev < 0.5` and not `bimodal`,
+  with `win` at least a quarter of the default (4096 at 96 kHz, 2048 at 48 kHz) and the stdev under
+  `win`/64: a small window confines every lag to it, so its readings agree by construction, and on
+  tonal music they agree on a wrong lag near 0. False whenever `!ok`.
+- Counts: `n_markers` ping markers inside the snapshot (after `since`), `n_no_arrival` of them read
+  as no arrival, `n_windows` sliding windows tried, `n_quiet` of them skipped for a quiet input,
+  `n_skipped` entries of `measurements` that carry `skipped`. The counts of a mode that did not run
+  are 0.
+- `measurements` — the readings of `mode_used`. A ping entry is `{center, variant, start, len,
+  lag_samples, lag_ms, lag_m, confidence, peak}`, or `{center, variant, skipped}` with `outside
+  buffer`, `before since`, `too near buffer end` or the `xcorr` error, and `"no_arrival": true` when
+  its `peak` is below 0.05 (the pair carries no arrival for that ping, e.g. it was emitted before
+  routing). A sliding entry is `{start, len, lag_samples, lag_ms, confidence, peak, kept}` (quiet
+  windows are only counted).
+- `summary` — over the ping readings with an arrival, or the kept windows: `n`, median, min/max and
+  `lag_samples_spread` (max−min, the reading-to-reading jitter), `lag_samples_mad`/`lag_ms_mad`
+  (median absolute deviation: the jitter with outliers ignored), `lag_ms_stdev`, `lag_ms_p10`/`p90`,
+  `confidence_median`, and `bimodal`: the lags are two answers, not one — over 20 % of them more
+  than 5 MAD from the median, or two clusters of at least 20 % each with a gap over 5× their MAD.
+  Read `confidence` per reading: below ~2 the lag is ambiguous (a repeating stimulus or a steady
+  tone). Raise the *Analyze buffer* to reach further back.
+
+With `cur_x`/`cur_y` — two sample indices bracketing **one** window — `mode` is ignored:
+```json
+{"ok": true, "reason": null, "ch_a": 0, "ch_b": 1, "a": {…}, "b": {…}, "frozen": true,
+ "start": 1166016, "len": 16384, "lag_samples": 137, "lag_ms": 1.4271, "lag_m": 0.4895,
+ "confidence": 42.0, "peak": 0.99}
+```
+A silent input there is `ok: false` with `reason` (200); a window outside the snapshot is a 400.
+
+Answers 503 when there is not enough captured audio to freeze, 400 when no two inputs have sound and
+no pair was given. **Latency:** one call is a freeze copy plus up to ~60 xcorrs (200 at most); on a
+Pi 3 expect about 0.5–3 s (a larger `win` or a longer *Analyze buffer* costs more), so use
+`curl -m 15`, not `-m 3`. One call measures at a time: a second waits for the first (up to 10 s,
+then **429**), so it never loses the first's snapshot. **410** when the snapshot was resumed or
+replaced while the call read it (the console's Analyze/Resume, `POST /api/capture/freeze` or
+`resume`): its readings would mix two snapshots, so ask again.
+
+```sh
+# L/R skew of a sender, on whatever it plays
+curl -s -m 15 "$B/api/genie/sync?device=heston&mode=sliding" |
+  jq 'if .ok then {lag_ms: .summary.lag_ms_median, trusted, mad: .summary.lag_ms_mad} else .reason end'
+# speaker A against speaker B, only audio from after the last change
+curl -s -m 15 "$B/api/genie/sync?a=atron&b=heston&since_ms_ago=5000" | jq '{ok, reason, mode_used, trusted, summary}'
+```
 
 ## Network inputs
 
@@ -553,19 +1108,23 @@ sender, with `transport: "bluetooth"` and its Bluetooth address as `peer`.
 ### `GET /api/net`
 ```json
 {"enabled": true, "listening": true, "port": 4010, "delay_ms": 1000,
- "delay_frames": 96000, "rate": 96000, "n_now": 1466240, "lead_seconds": 1.0, "error": "",
- "inputs": 6, "inputs_configured": 6, "inputs_max": 10,
- "channels": [{"channel": 0, "input": 6, "connected": true, "peer": "192.168.1.7:41154",
+ "delay_frames": 96000, "rate": 96000, "n_now": 1466240, "unix_ms": 1795077781797,
+ "lead_seconds": 1.0, "error": "", "inputs": 6, "inputs_configured": 6, "inputs_max": 10,
+ "channels": [{"channel": 0, "input": 6, "connected": true, "connects": 1,
+               "connected_since_ms": 1795077760533, "peer": "192.168.1.7:41154",
                "name": "thinkpad", "stream": "main", "last_stream": "main",
                "host": "thinkpad.lan", "device": "thinkpad",
                "last_device": "thinkpad", "mac": "3C:7C:3F:12:9A:01", "transport": "net",
                "state": "streaming", "sender_rate": 48000, "format": "S16_LE", "encoding": "pcm",
                "stream_index": 1, "stream_count": 1, "frames_received": 874496,
-               "late_drops": 0, "range_drops": 0, "underruns": 0, "resyncs": 0,
-               "last_target": 1562240, "write_end": 1562496,
+               "frames_per_s": 96361.1, "last_audio_ms_ago": 2,
+               "late_drops": 0, "range_drops": 0, "underruns": 0, "underrun_events": 0,
+               "resyncs": 0, "last_target": 1562240, "write_end": 1562496,
                "lead_frames": 96012, "lead_valid": true, "target_lead_frames": 96000,
-               "lead_error_ms": 0.125, "peak": 0.79}]}
+               "lead_error_ms": 0.125, "peak": 0.79, "peak_db": -1.94}]}
 ```
+`?connected=1` lists only the channels a sender is on (`?connected=0` only the others); anything
+else is a 400. `unix_ms` is the wall clock (ms since 1970, UTC) read with `n_now`.
 `input` is the index to use everywhere else — route it with
 `{"source": {"type": "input", "index": 6}}`, or measure it with `?ch_a=0&ch_b=6`. `name` is what
 the sender calls itself (the plugin sends its hostname), `host` its address resolved to a name when
@@ -584,11 +1143,38 @@ there are, `inputs_configured` how many the next start will have. `transport`
 is `net`, or `bluetooth` for a phone. `lead_error_ms` is `lead_frames` against
 `target_lead_frames` in milliseconds, meaningful while `lead_valid`.
 
-`late_drops` counts packets that arrived after the instant they asked for. They are discarded, not
-slid forward: playing them late would put the audio at the wrong place on the axis, which is the
-one thing this device must not do. A steady count means the network cannot keep up with `delay_ms`
-— raise it. `range_drops` means the sender aimed outside the buffer entirely, and `underruns` means
-the sender stopped supplying audio before its slot came round.
+**Is it live?** One read answers it: `state` is `streaming` while audio arrived in the last second;
+`last_audio_ms_ago` is how long ago it last did (null with no sender on the channel, or before its
+first audio); `frames_per_s` is the rate `frames_received` grew at over the last 1–1.25 s (frames
+at the engine's `rate`, after the converter, so ≈ `rate` while streaming — it arrives in bursts, so
+±10 % is normal — and 0 when stalled; null until the channel has been watched for a second).
+`connected:true` with `frames_per_s` 0 is a sender with its link open and nothing arriving: the
+link or the sender, not the DUT's audio. `connects` counts claims of the channel since the daemon
+started (or the channel was forgotten), so a change between two reads means the sender reconnected;
+`connected_since_ms` is the wall-clock time (ms since 1970) of the current one, null without one.
+
+**Levels.** `peak_db` is that input's meter, as `peak_db` in `GET /api/meters` and `genie/sound`: a
+3 s hold on the ring, so it is aligned with every other input and trails the sender by `delay_ms`.
+`peak` is something else — the **linear** maximum |sample| since the sender connected, measured as
+packets arrive (a `delay_ms` ahead of playout) after the rate converter, so it can exceed 1.0 and
+never falls while the sender stays: not a live level. Use `peak_db` (or `genie/sound`) to ask "is
+there sound now".
+
+**Counters** are per channel, since the daemon started or the channel was forgotten (`DELETE
+/api/net/channels/{n}`); they are not reset on reconnect. `late_drops` counts packets that arrived
+after the instant they asked for. They are discarded, not slid forward: playing them late would put
+the audio at the wrong place on the axis, which is the one thing this device must not do. A steady
+count means the network cannot keep up with `delay_ms` — raise it. `range_drops` (packets) means the
+sender aimed outside the buffer entirely. `underruns` counts **engine blocks** (`engine.period`
+frames each) in which playout ran past the end of the sender's audio **while it was streaming**
+(audio within the last second), and `underrun_events` how many separate times that began — the
+number to watch: one per dropout. Both are judged once per run, so the channels of a stereo sender
+always agree. A sender that stops sending (paused, or its PCM held open and silent) counts nothing;
+neither does the time before its first packet. With the default `delay_ms` of 1000, playout only
+runs dry after the sender has been silent on the wire for about a second, so a sender-side stall
+shows as `late_drops` and a `resyncs` step when it resumes rather than as underruns, and a link
+that stalls and then delivers its backlog counts one event (and only the blocks while late packets
+were arriving). With a short `delay_ms`, any gap longer than the delay counts.
 
 ### `DELETE /api/net/channels/{n}`
 Forgets a channel no sender is on: `active` goes false, its counters and `last_device` are cleared,
@@ -700,7 +1286,7 @@ stays where it was put, still covering the whole run that channel belongs to. A 
 drives that named stream of the machine (until it has played, whichever of the machine's it finds).
 The mixer takes `HOST`, `PORT`, `CHANNEL` and `NAME`; the PCM also `CHANNELS`, `ENCODING`,
 `QUALITY` and `MIXER`. `NAME` is optional, up to 32 characters, and an older device ignores it. Both take
-them positional or named: `soundtester:HOST=bench.local,CHANNELS=2`.
+them positional or named: `soundtester:HOST=soundtester,CHANNELS=2`.
 
 `alsa-plugin/examples/` has a working `/etc/asound.conf` that makes the tester a machine's default
 output and mixer, and a PipeWire sink.
@@ -713,7 +1299,7 @@ attenuate or mute it. For a reference stimulus, which must not be turned down by
 ```
 pcm.soundtester_ref {
         type soundtester
-        host "soundtester.local"
+        host "soundtester"
         mixer off
 }
 ```
@@ -767,7 +1353,7 @@ One endless Ogg/Opus stream with every input interleaved (`limits.inputs_total` 
 order), from a single ring cursor so they stay sample-aligned. Channels are uncoupled (Opus family
 255) — extract them, don't play them as surround:
 ```sh
-ffmpeg -i http://soundtester.local/api/stream.ogg \
+ffmpeg -i http://soundtester/api/stream.ogg \
   -af 'pan=mono|c0=c0' in0.wav -af 'pan=mono|c0=c6' net1.wav
 ```
 `?bitrate=<kbps>` per channel. Max 2 concurrent. Needs a 48/96 kHz rate: 501 at any other.
@@ -795,13 +1381,18 @@ the same analysis snapshot as the WS feed.
 One value per input (`limits.inputs_total`). `rms_db` is a 100 ms window; `peak_db` a 3 s hold. Both
 post input-gain. Silence sits near −120 dB.
 
-### `GET /api/spectrum?ch=`
+### `GET /api/spectrum[?<selector>]`
 ```json
 {"sample": 1488896, "bins_hz": [20.32, …, 39371.6],
- "channels": [{"ch": 0, "bins_db": [240], "tone": {"valid": true, "freq_hz": 996.09, "thd_n_pct": 0.0032}}]}
+ "channels": [{"ch": 0, "bins_db": [240],
+               "tone": {"valid": true, "freq_hz": 996.09, "thd_n_pct": 0.0032,
+                        "peak_hz": 996.09, "peak_db": -21.0, "reason": null}}]}
 ```
 240 log-spaced bins, 20 Hz → min(Nyquist, 40 kHz), in dBFS. `bins_hz` gives each bin's center so you
-can threshold by frequency directly. `?ch=` for one input; omit it for every input.
+can threshold by frequency directly; each bin is the loudest FFT bin it spans, so for a precise
+frequency read `tone.peak_hz` (interpolated, valid tone or not). Inputs by the genie selector
+(`?ch=4,5`, `?device=`, `?kind=`, see "Choosing inputs"); omit it for every input. `tone` is as in
+`GET /api/genie/sound`.
 
 ### `WS /api/ws` — push only
 | rate | message |
@@ -862,5 +1453,5 @@ Shutdown exists because a power cut during a `/data` save can corrupt the card.
 Test hook: feed a line to the kmsg watcher to exercise the I2S-sync-error banner. The body is the
 line, `bcm2835-i2s: I2S SYNC error!` when empty. Answers `{"ok": true, "sync_errors": N}`.
 ```sh
-curl -X POST http://soundtester.local/api/system/inject-kmsg -d 'bcm2835-i2s: I2S SYNC error!'
+curl -X POST http://soundtester/api/system/inject-kmsg -d 'bcm2835-i2s: I2S SYNC error!'
 ```

@@ -57,6 +57,28 @@ SOUNDTESTER_BOARD ??= "rpi3-octo"
 # app/CMakeLists.txt (ST_UNSAFE_MATH defaults on for arm32).
 EXTRA_OECMAKE = "-DCMAKE_BUILD_TYPE=Release -DST_BOARD=${SOUNDTESTER_BOARD}"
 
+# The version the daemon reports (GET /api/state `version.git`): `git describe` of this repository,
+# taken when the recipe is parsed and handed to CMake as ST_VERSION_GIT. app/cmake/build_info.cmake
+# could run it at compile time, but bitbake would not know: a commit that touches nothing under
+# app/ leaves every task signature as it was, so the sstate binary, stamped with the old version,
+# is reused. As a value in EXTRA_OECMAKE it is part of do_configure's signature, and a new describe
+# rebuilds the daemon. BB_DONT_CACHE re-parses the recipe on every bitbake run (a few ms; it is
+# what externalsrc does too), since a commit changes no file bitbake's parse cache watches.
+# Empty when git cannot tell (no git, not a checkout): build_info.cmake then tries itself.
+def soundtester_git_describe(d):
+    import os, subprocess
+    top = os.path.normpath(os.path.join(os.path.dirname(d.getVar('FILE')), '../../../..'))
+    try:
+        return subprocess.check_output(
+            ['git', '-C', top, 'describe', '--always', '--dirty', '--abbrev=12'],
+            stderr=subprocess.DEVNULL, universal_newlines=True).strip()
+    except Exception:
+        return ''
+
+SOUNDTESTER_VERSION_GIT := "${@soundtester_git_describe(d)}"
+BB_DONT_CACHE = "1"
+EXTRA_OECMAKE += "-DST_VERSION_GIT=${SOUNDTESTER_VERSION_GIT}"
+
 # Defaulted here, not only in the .sample: soundtester-device.conf is untracked and every copy
 # created before network input existed lacks this. Without a default the sed below would write
 # a bare "--net-port" with no value and the daemon would refuse to start on the next reflash.

@@ -3,19 +3,26 @@
 #include <httplib.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <sstream>
 #include <vector>
 
+#include "capture_export.h"
 #include "channel_layout.h"
 #include "constants.h"
 #include "genie.h"
+#include "genie_select.h"
+#include "genie_wait.h"
+#include "genie_watch.h"
 #include "listen_encoder.h"
 #include "listen_stream.h"
+#include "output_route.h"
 #include "util/dsp.h"
 #include "util/log.h"
 #include "util/sysinfo.h"
@@ -51,8 +58,10 @@ void send_ok(httplib::Response& res) { send_json(res, json{{"ok", true}}); }
 bool parse_index(const httplib::Request& req, const char* name, unsigned limit, unsigned* out) {
   auto it = req.path_params.find(name);
   if (it == req.path_params.end()) return false;
-  const long v = std::strtol(it->second.c_str(), nullptr, 10);
-  if (v < 0 || v >= static_cast<long>(limit)) return false;
+  // Strictly a number: "xyz" must not read as 0 and act on the first channel.
+  char* end = nullptr;
+  const long v = std::strtol(it->second.c_str(), &end, 10);
+  if (it->second.empty() || *end || v < 0 || v >= static_cast<long>(limit)) return false;
   *out = static_cast<unsigned>(v);
   return true;
 }
@@ -84,14 +93,27 @@ auto json_channel_route(const char* name, unsigned limit, std::string missing, F
   };
 }
 
+// A non-negative number, strictly: false for "abc", "-1" or "12x" rather than reading them as 0.
+// A fraction is truncated ("1200.5" is 1200), as before: the console's scope sends a fractional
+// start when zoomed. *out keeps its default when the param is absent.
+bool query_uint(const httplib::Request& req, const char* key, uint64_t* out) {
+  if (!req.has_param(key)) return true;
+  const std::string v = req.get_param_value(key);
+  const size_t digits = v.find_first_not_of("0123456789");
+  if (v.empty() || digits == 0) return false;
+  if (digits != std::string::npos &&
+      (v[digits] != '.' || v.find_first_not_of("0123456789", digits + 1) != std::string::npos))
+    return false;
+  errno = 0;
+  const uint64_t n = std::strtoull(v.c_str(), nullptr, 10);
+  if (errno == ERANGE) return false;
+  *out = n;
+  return true;
+}
+
 uint64_t query_u64(const httplib::Request& req, const char* key, uint64_t fallback) {
   if (!req.has_param(key)) return fallback;
   return std::strtoull(req.get_param_value(key).c_str(), nullptr, 10);
-}
-
-double query_f64(const httplib::Request& req, const char* key, double fallback) {
-  if (!req.has_param(key)) return fallback;
-  return std::strtod(req.get_param_value(key).c_str(), nullptr);
 }
 
 // A listen stream's ?bitrate= override. When absent, every encode() call re-reads the live
@@ -423,7 +445,188 @@ json meters_json(const AnalysisSnapshot& s) {
 }
 
 json tone_json(const ToneMetrics& t) {
-  return json{{"valid", t.valid}, {"freq_hz", t.freq_hz}, {"thd_n_pct", t.thd_n_pct}};
+  const char* reason = tone_reason_name(t.reason);
+  return json{{"valid", t.valid},
+              {"freq_hz", t.freq_hz},
+              {"thd_n_pct", t.thd_n_pct},
+              {"peak_hz", t.peak_hz},
+              {"peak_db", t.peak_db},
+              {"reason", reason ? json(reason) : json(nullptr)}};
+}
+
+// One request's view of the inputs: what /api/state inputs[] and the genie replies call each one,
+// from one copy of the names, the device sources and the NET status, so a reply agrees with itself.
+struct InputInfo {
+  const ChannelLayout& layout = channels();
+  std::vector<std::string> names;  // config.json input_names
+  std::vector<Devices::Source> sources;
+  std::vector<NetChannelStatus> net;  // index = NET channel
+
+  const NetChannelStatus* net_status(unsigned i) const {
+    if (!layout.is_net(i)) return nullptr;
+    const unsigned c = i - layout.net_base();
+    return c < net.size() ? &net[c] : nullptr;
+  }
+  const std::string& configured_name(unsigned i) const {
+    static const std::string none;
+    return i < names.size() ? names[i] : none;
+  }
+  // A network channel with no name in config.json takes the sender's: the dashboard card then
+  // reads "NET 1 — thinkpad.local" with nothing to configure, which is the whole point of
+  // resolving the sender on this end. Once that sender has gone the name says so, or a script
+  // picking inputs by name would take the channel a sender used to be on for the one it is on.
+  std::string name(unsigned i) const {
+    const NetChannelStatus* n = net_status(i);
+    if (!configured_name(i).empty() || !n) return configured_name(i);
+    std::string who = net_sender_name(*n);
+    if (!who.empty() && n->state == "disconnected") who += " (gone)";
+    return who;
+  }
+  std::string label(unsigned i) const { return input_label(layout, sources, i); }
+  const char* kind(unsigned i) const { return input_kind_name(input_kind(layout, i)); }
+
+  // label, name, kind, and for a network input who is on it: the genie replies' header per input.
+  json genie_json(unsigned i) const {
+    json j{{"label", label(i)}, {"name", name(i)}, {"kind", kind(i)}, {"net", nullptr}};
+    if (const NetChannelStatus* n = net_status(i)) {
+      j["net"] = {{"channel", n->channel},
+                  {"device", n->device},
+                  {"last_device", n->last_device},
+                  {"stream", n->stream},
+                  {"stream_index", n->stream_index},
+                  {"stream_count", n->stream_count},
+                  {"state", n->state}};
+    }
+    return j;
+  }
+};
+
+// The shared genie input selector from a query: ch (comma list or repeated), device, stream,
+// stream_index, kind. False, with the 400 already sent, on a malformed one.
+bool parse_selector(const httplib::Request& req, InputSelector* sel, httplib::Response& res) {
+  if (req.has_param("ch")) {
+    std::vector<std::string> vals;
+    for (size_t i = 0; i < req.get_param_value_count("ch"); ++i)
+      vals.push_back(req.get_param_value("ch", i));
+    std::string err;
+    if (!parse_ch_list(vals, channels().total(), &sel->ch, &err)) {
+      send_error(res, 400, err);
+      return false;
+    }
+  }
+  for (const char* key : {"device", "stream"}) {
+    if (!req.has_param(key)) continue;
+    if (req.get_param_value_count(key) > 1) {
+      send_error(res, 400, std::string(key) + " takes one value");
+      return false;
+    }
+    const std::string v = req.get_param_value(key);
+    if (v.empty()) {
+      send_error(res, 400, std::string(key) + " must not be empty");
+      return false;
+    }
+    (std::string(key) == "device" ? sel->device : sel->stream) = v;
+  }
+  if (req.has_param("stream_index")) {
+    const std::string v = req.get_param_value("stream_index");
+    char* end = nullptr;
+    const long n = std::strtol(v.c_str(), &end, 10);
+    if (v.empty() || *end || n < 1 || n > static_cast<long>(kMaxInputs)) {
+      send_error(res, 400, "stream_index must be 1.." + std::to_string(kMaxInputs));
+      return false;
+    }
+    sel->stream_index = static_cast<unsigned>(n);
+  }
+  if (req.has_param("kind")) {
+    InputKind k;
+    if (!parse_input_kind(req.get_param_value("kind"), &k)) {
+      send_error(res, 400, "kind must be local, net or device");
+      return false;
+    }
+    sel->kind = k;
+  }
+  return true;
+}
+
+// A failed resolution: 400 for a contradictory selector, 404 when no connected sender matches,
+// with the channels it was last seen on.
+void send_selection_error(httplib::Response& res, const InputSelection& s) {
+  json j{{"error", s.error}};
+  if (s.status == 404) {
+    j["matched"] = 0;
+    json seen = json::array();
+    for (const LastSeen& l : s.last_seen) {
+      seen.push_back({{"input", l.input},
+                      {"channel", l.channel},
+                      {"last_device", l.last_device},
+                      {"last_stream", l.last_stream},
+                      {"state", l.state}});
+    }
+    j["last_seen"] = seen;
+  }
+  send_json(res, j, s.status);
+}
+
+// What a selector resolved to, echoed in the reply so a caller sees where the sender is now.
+json resolved_json(const InputSelector& sel, const InputSelection& s) {
+  json j{{"inputs", s.inputs}};
+  if (sel.kind) j["kind"] = input_kind_name(*sel.kind);
+  if (!sel.by_sender()) return j;
+  if (!sel.device.empty()) j["device"] = sel.device;
+  if (!sel.stream.empty()) j["stream"] = sel.stream;
+  if (sel.stream_index) j["stream_index"] = sel.stream_index;
+  json runs = json::array();
+  for (const SelectedRun& r : s.runs) {
+    runs.push_back({{"inputs", r.inputs},
+                    {"channel", r.base},
+                    {"device", r.device},
+                    {"stream", r.stream},
+                    {"stream_count", r.stream_count},
+                    {"state", r.state}});
+  }
+  j["runs"] = runs;
+  return j;
+}
+
+// A finite number, strictly: unlike query_f64, "abc" or "-60dB" is an error, not 0. *out keeps
+// its default when the param is absent.
+bool query_number(const httplib::Request& req, const char* key, double* out) {
+  if (!req.has_param(key)) return true;
+  const std::string v = req.get_param_value(key);
+  char* end = nullptr;
+  const double d = std::strtod(v.c_str(), &end);
+  if (v.empty() || *end || !std::isfinite(d)) return false;
+  *out = d;
+  return true;
+}
+
+// A comma list of doubles (expect_hz=1000,1500). False on an empty item or a non-number.
+bool parse_f64_list(const std::string& v, std::vector<double>* out) {
+  out->clear();
+  size_t pos = 0;
+  while (true) {
+    const size_t comma = v.find(',', pos);
+    const std::string item = v.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+    char* end = nullptr;
+    const double d = std::strtod(item.c_str(), &end);
+    if (item.empty() || *end || !std::isfinite(d)) return false;
+    out->push_back(d);
+    if (comma == std::string::npos) return true;
+    pos = comma + 1;
+  }
+}
+
+int64_t unix_ms_now() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+// The wall clock when the engine was at `sample`, given where it is now (`now`, ring.counter()):
+// what lines a genie reply's sample up with a DUT's log.
+int64_t unix_ms_at(uint64_t sample, uint64_t now, double rate) {
+  return unix_ms_now() -
+         (rate > 0 && now > sample ? std::llround(1000.0 * (now - sample) / rate) : 0);
 }
 
 // The five fields shared by /api/state, /api/capture/freeze and /api/capture/status.
@@ -535,6 +738,16 @@ void WebServer::install_routes() {
   svr.set_file_request_handler([](const httplib::Request&, httplib::Response& res) {
     res.set_header("Cache-Control", "no-cache");
   });
+  // An /api path no route took (a guessed name, or the wrong method) answers JSON like every other
+  // API error, not httplib's empty 404 that a `| jq` turns into a parse error. A handler's own 404
+  // already has a body and is left alone, and so is anything outside /api.
+  svr.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+    using HR = httplib::Server::HandlerResponse;
+    if (res.status != 404 || !res.body.empty() || req.path.rfind("/api/", 0) != 0)
+      return HR::Unhandled;
+    send_error(res, 404, "no such endpoint: " + req.method + " " + req.path + "; see GET /api");
+    return HR::Handled;
+  });
 
   // The API index: GET /api serves docs/api.md rendered to HTML (www/api.html, produced at build
   // time by the md2html tool). Read from disk per request, like the rest of www, so a deploy-www
@@ -549,7 +762,62 @@ void WebServer::install_routes() {
   svr.Get("/api", api_index);
   svr.Get("/api/", api_index);
 
-  svr.Get("/api/state", [this](const httplib::Request&, httplib::Response& res) {
+  // One copy of everything a reply names an input by, taken once per request.
+  auto input_info = [this] {
+    InputInfo info;
+    {
+      std::lock_guard<std::mutex> lk(config_m_);
+      info.names = d_.config.input_names;
+    }
+    info.sources = d_.devices.sources();
+    info.net = d_.net.status();
+    return info;
+  };
+
+  // GET /api/state inputs[], which GET /api/inputs also answers on its own.
+  auto inputs_json = [this](const InputInfo& info, const AnalysisSnapshot& as) {
+    const ChannelLayout& layout = info.layout;
+    // A device input's columns are shown once a device is on them, and stay, like a network
+    // channel's: audio it captured before it was unplugged is still in the ring.
+    auto input_active = [&](unsigned i) {
+      if (layout.is_net(i)) return d_.net.channel_in_use(i - layout.net_base());
+      if (!layout.is_device(i)) return true;
+      for (const Devices::Source& s : info.sources)
+        if (i >= s.first && i < s.first + s.channels) return true;
+      return false;
+    };
+    json ins = json::array();
+    for (unsigned i = 0; i < layout.total(); ++i) {
+      const NetChannelStatus* n = info.net_status(i);
+      ins.push_back({{"ch", i},
+                     {"name", info.name(i)},
+                     {"net", n ? net_link_json(*n, info.configured_name(i)) : json(nullptr)},
+                     {"kind", info.kind(i)},
+                     {"label", info.label(i)},
+                     {"active", input_active(i)},
+                     {"gain_db", d_.ctl.inputs[i].gain_db.load()},
+                     {"mute", d_.ctl.inputs[i].mute.load()},
+                     // The sender on this channel asked for its stream to be left alone: gain and
+                     // mute are ignored here and in alsamixer until it disconnects.
+                     {"bypass", d_.ctl.inputs[i].bypass.load()},
+                     {"gain_min_db", layout.gain_min_db(i)},
+                     {"gain_max_db", layout.gain_max_db(i)},
+                     {"rms_db", as.meters[i].rms_db},
+                     {"peak_db", as.meters[i].peak_db},
+                     {"tone", tone_json(as.tone[i])}});
+    }
+    return ins;
+  };
+
+  svr.Get("/api/inputs", [this, input_info, inputs_json](const httplib::Request&,
+                                                         httplib::Response& res) {
+    const InputInfo info = input_info();
+    send_json(res, inputs_json(info, d_.analysis.snapshot()));
+  });
+
+  svr.Get("/api/state", [this, input_info, inputs_json](const httplib::Request&,
+                                                       httplib::Response& res) {
+    const int64_t unix_ms = unix_ms_now();
     const EngineStats es = d_.engine.stats();
     const AnalysisSnapshot as = d_.analysis.snapshot();
     const CaptureStatus cs = d_.capture.status();
@@ -560,11 +828,10 @@ void WebServer::install_routes() {
       si = sys_;
     }
     // Copies, because a concurrent /api/config/save may replace d_.config.
-    std::vector<std::string> in_names, out_names;
+    std::vector<std::string> out_names;
     int64_t loopback_offset = 0;
     {
       std::lock_guard<std::mutex> lk(config_m_);
-      in_names = d_.config.input_names;
       out_names = d_.config.output_names;
       loopback_offset = d_.config.loopback_offset_samples;
     }
@@ -580,50 +847,16 @@ void WebServer::install_routes() {
                          {"loopback_offset_samples", loopback_offset}});
 
     json outs = json::array();
-    for (unsigned i = 0; i < layout.outputs; ++i)
-      outs.push_back(output_json(d_.ctl.outputs[i], i, out_names[i]));
-
-
-    // A network channel with no name in config.json takes the sender's: the dashboard card then
-    // reads "NET 1 — thinkpad.local" with nothing to configure, which is the whole point of
-    // resolving the sender on this end.
-    const std::vector<NetChannelStatus> net = d_.net.status();
-    auto input_name = [&](unsigned i) -> std::string {
-      if (!in_names[i].empty() || !layout.is_net(i)) return in_names[i];
-      return net_sender_name(net[i - layout.net_base()]);
-    };
-
-    // A device input's columns are shown once a device is on them, and stay, like a network
-    // channel's: audio it captured before it was unplugged is still in the ring.
-    const std::vector<Devices::Source> sources = d_.devices.sources();
-    auto input_active = [&](unsigned i) {
-      if (layout.is_net(i)) return d_.net.channel_in_use(i - layout.net_base());
-      if (!layout.is_device(i)) return true;
-      for (const Devices::Source& s : sources)
-        if (i >= s.first && i < s.first + s.channels) return true;
-      return false;
-    };
-    json ins = json::array();
-    for (unsigned i = 0; i < layout.total(); ++i) {
-      const bool is_net = layout.is_net(i);
-      ins.push_back({{"ch", i},
-                     {"name", input_name(i)},
-                     {"net", is_net ? net_link_json(net[i - layout.net_base()], in_names[i])
-                                    : json(nullptr)},
-                     {"kind", is_net ? "net" : layout.is_device(i) ? "device" : "local"},
-                     {"label", input_label(layout, sources, i)},
-                     {"active", input_active(i)},
-                     {"gain_db", d_.ctl.inputs[i].gain_db.load()},
-                     {"mute", d_.ctl.inputs[i].mute.load()},
-                     // The sender on this channel asked for its stream to be left alone: gain and
-                     // mute are ignored here and in alsamixer until it disconnects.
-                     {"bypass", d_.ctl.inputs[i].bypass.load()},
-                     {"gain_min_db", layout.gain_min_db(i)},
-                     {"gain_max_db", layout.gain_max_db(i)},
-                     {"rms_db", as.meters[i].rms_db},
-                     {"peak_db", as.meters[i].peak_db},
-                     {"tone", tone_json(as.tone[i])}});
+    for (unsigned i = 0; i < layout.outputs; ++i) {
+      json o = output_json(d_.ctl.outputs[i], i, out_names[i]);
+      o["label"] = "OUT " + std::to_string(i + 1);  // as the console names it
+      outs.push_back(std::move(o));
     }
+
+
+    const InputInfo info = input_info();
+    const std::vector<Devices::Source>& sources = info.sources;
+    const json ins = inputs_json(info, as);
 
     json imap = json::array(), omap = json::array();
     for (unsigned i = 0; i < kInputs; ++i) imap.push_back(d_.ctl.input_map[i].load());
@@ -640,6 +873,10 @@ void WebServer::install_routes() {
     for (const Devices::Source& s : sources) srcs.push_back(source_json(s));
 
     json j{
+        {"version", {{"git", opt_.version_git}, {"build_time", opt_.build_time}}},
+        {"unix_ms", unix_ms},
+        {"daemon_uptime_s",
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count()},
         {"inputs", ins},
         {"outputs", outs},
         {"sinks", sinks},
@@ -727,19 +964,17 @@ void WebServer::install_routes() {
   // The WS "spectrum" message as a synchronous GET. Adds `bins_hz` — the center frequency of each
   // of the 240 log-spaced bins — which the WS frame omits (the console reconstructs it), so a
   // script can threshold by frequency directly. Full float precision here (one-shot), unlike the
-  // WS frame's 0.1 dB quantisation. `?ch=N` returns a single input; omit it for every channel.
+  // WS frame's 0.1 dB quantisation. Inputs by the genie selector (`?ch=4,5`, `?device=`, `?kind=`);
+  // none for every channel.
   svr.Get("/api/spectrum", [this](const httplib::Request& req, httplib::Response& res) {
-    int only = -1;
-    if (req.has_param("ch")) {
-      only = static_cast<int>(query_u64(req, "ch", channels().total()));
-      if (only < 0 || only >= static_cast<int>(channels().total())) {
-        return send_error(res, 400, channel_range_msg());
-      }
-    }
+    InputSelector sel;
+    if (!parse_selector(req, &sel, res)) return;
+    const InputSelection pick = resolve_inputs(sel, channels(), d_.net.status());
+    if (!pick.ok()) return send_selection_error(res, pick);
+    if (pick.inputs.empty()) return send_error(res, 400, "the selector matches no inputs on this board");
     const AnalysisSnapshot s = d_.analysis.snapshot();
     json chans = json::array();
-    for (unsigned c = 0; c < channels().total(); ++c) {
-      if (only >= 0 && c != static_cast<unsigned>(only)) continue;
+    for (const unsigned c : pick.inputs) {
       chans.push_back({{"ch", c}, {"bins_db", s.spectrum[c]}, {"tone", tone_json(s.tone[c])}});
     }
     send_json(res, json{{"sample", s.sample},
@@ -1215,13 +1450,30 @@ void WebServer::install_routes() {
   // A network channel is an input like any other once it is here: it is metered, it appears in
   // the scope, it can be routed to an output with {"type":"input","index":N}, and it is a legal
   // xcorr operand against an ADC channel. This endpoint is only about the link itself.
-  svr.Get("/api/net", [this](const httplib::Request&, httplib::Response& res) {
+  svr.Get("/api/net", [this](const httplib::Request& req, httplib::Response& res) {
+    // ?connected=1: only the channels a sender is on (or =0: only the others), so 16 empty rows
+    // do not bury the two that matter.
+    int want_connected = -1;
+    if (req.has_param("connected")) {
+      const std::string v = req.get_param_value("connected");
+      if (v == "1" || v == "true") want_connected = 1;
+      else if (v == "0" || v == "false") want_connected = 0;
+      else return send_error(res, 400, "connected must be 1 or 0");
+    }
     const double rate = d_.engine.rate();
+    const AnalysisSnapshot as = d_.analysis.snapshot();
+    const unsigned net_base = channels().net_base();
     json chans = json::array();
     for (const NetChannelStatus& c : d_.net.status()) {
+      if (want_connected >= 0 && c.connected != (want_connected == 1)) continue;
+      const unsigned input = net_base + c.channel;
       chans.push_back({{"channel", c.channel},
-                       {"input", channels().net_base() + c.channel},
+                       {"input", input},
                        {"connected", c.connected},
+                       {"connects", c.connects},
+                       {"connected_since_ms", c.connected_since_unix_ms
+                                                  ? json(c.connected_since_unix_ms)
+                                                  : json(nullptr)},
                        {"peer", c.peer},
                        {"name", c.name},
                        {"stream", c.stream},
@@ -1238,9 +1490,13 @@ void WebServer::install_routes() {
                        {"stream_index", c.stream_index},
                        {"stream_count", c.stream_count},
                        {"frames_received", c.frames_received},
+                       {"frames_per_s", c.frames_per_s ? json(*c.frames_per_s) : json(nullptr)},
+                       {"last_audio_ms_ago",
+                        c.last_audio_ms_ago ? json(*c.last_audio_ms_ago) : json(nullptr)},
                        {"late_drops", c.late_drops},
                        {"range_drops", c.range_drops},
                        {"underruns", c.underruns},
+                       {"underrun_events", c.underrun_events},
                        {"resyncs", c.resyncs},
                        {"last_target", c.last_target},
                        {"write_end", c.write_end},
@@ -1250,7 +1506,8 @@ void WebServer::install_routes() {
                        {"lead_error_ms", c.lead_valid && rate > 0
                             ? 1000.0 * (c.lead_frames - static_cast<int64_t>(c.target_lead_frames)) / rate
                             : 0.0},
-                       {"peak", c.peak}});
+                       {"peak", c.peak},
+                       {"peak_db", as.meters[input].peak_db}});
     }
     const uint64_t delay = d_.ctl.net.delay_frames.load();
     send_json(res, json{{"enabled", d_.ctl.net.enabled.load()},
@@ -1260,6 +1517,7 @@ void WebServer::install_routes() {
                         {"delay_frames", delay},
                         {"rate", d_.engine.rate()},
                         {"n_now", d_.ring.counter()},
+                        {"unix_ms", unix_ms_now()},
                         {"lead_seconds", delay / rate},
                         {"error", d_.net.last_error()},
                         {"inputs", d_.net.count()},
@@ -1393,21 +1651,37 @@ void WebServer::install_routes() {
     json j = capture_json(d_.capture.status());
     j["live_now"] = now;
     j["live_oldest"] = d_.ring.oldest(now);
+    // How much a freeze copies, and how far back the live ring reaches: what an Analyze can hold.
+    const double rate = d_.engine.rate();
+    const uint64_t analyze = d_.capture.analyze_frames();
+    j["analyze_frames"] = analyze;
+    j["analyze_seconds"] = rate > 0 ? analyze / rate : 0.0;
+    j["ring_seconds"] = rate > 0 ? d_.ring.span() / rate : 0.0;
     send_json(res, j);
   });
 
   svr.Get("/api/capture/window", [this](const httplib::Request& req, httplib::Response& res) {
-    const unsigned ch = static_cast<unsigned>(query_u64(req, "ch", channels().total()));
-    if (ch >= channels().total()) return send_error(res, 400, channel_range_msg());
+    // One channel per call: a list would otherwise silently read only its first entry.
+    if (req.get_param_value_count("ch") > 1 ||
+        req.get_param_value("ch").find(',') != std::string::npos)
+      return send_error(res, 400, "capture/window reads one channel: pass a single ch");
+    uint64_t ch = channels().total();
+    if (!query_uint(req, "ch", &ch) || ch >= channels().total())
+      return send_error(res, 400, channel_range_msg());
     const uint64_t now = d_.ring.counter();
-    const uint64_t len = query_u64(req, "len", 96000);
-    const uint64_t start = query_u64(req, "start", now > len ? now - len : 0);
-    const unsigned cols = static_cast<unsigned>(query_u64(req, "cols", 1024));
+    uint64_t len = 96000, cols = 1024;
+    if (!query_uint(req, "len", &len)) return send_error(res, 400, "len must be a number of frames");
+    if (!query_uint(req, "cols", &cols)) return send_error(res, 400, "cols must be a number");
+    uint64_t start = now > len ? now - len : 0;
+    if (!query_uint(req, "start", &start))
+      return send_error(res, 400, "start must be a sample index (a number >= 0)");
+    cols = std::min<uint64_t>(cols, UINT32_MAX);  // still over the maximum, so still refused
 
-    const WindowResult w = d_.capture.window(ch, start, len, cols);
+    const WindowResult w =
+        d_.capture.window(static_cast<unsigned>(ch), start, len, static_cast<unsigned>(cols));
     if (!w.ok) return send_error(res, 400, w.error);
 
-    json j{{"ch", ch}, {"start", w.start}, {"len", w.len}, {"raw", w.raw}};
+    json j{{"ch", ch}, {"start", w.start}, {"len", w.len}, {"cols", w.cols}, {"raw", w.raw}};
     if (w.raw) {
       j["samples"] = w.samples;
     } else {
@@ -1415,6 +1689,142 @@ void WebServer::install_routes() {
       j["max"] = w.maxs;
     }
     send_json(res, j);
+  });
+
+  // Raw multichannel audio in one call: an interleaved WAV of the selected inputs (the genie
+  // selector, in its order) over start+len (the frozen snapshot while frozen, else the live ring)
+  // or the live ring's last `seconds`. Built in memory from post-validated chunks before a byte is
+  // sent, so a span the writer laps is a 410, not a file with stitched audio, and no lock is held
+  // across network I/O. See docs/api.md, "GET /api/capture/wav".
+  svr.Get("/api/capture/wav", [this, input_info](const httplib::Request& req,
+                                                 httplib::Response& res) {
+    InputSelector sel;
+    if (!parse_selector(req, &sel, res)) return;
+    WavFormat fmt = WavFormat::F32;
+    if (req.has_param("format") && !parse_wav_format(req.get_param_value("format"), &fmt))
+      return send_error(res, 400, "format must be f32, s32 or s16");
+    ExportQuery q;
+    for (const char* key : {"start", "len"}) {
+      if (!req.has_param(key)) continue;
+      uint64_t v = 0;
+      if (!query_uint(req, key, &v))
+        return send_error(res, 400, std::string(key) + " must be a number >= 0 (samples)");
+      (std::string(key) == "start" ? q.start : q.len) = v;
+    }
+    if (req.has_param("seconds")) {
+      double sec = 0;
+      if (!query_number(req, "seconds", &sec)) return send_error(res, 400, "seconds must be a number > 0");
+      q.seconds = sec;
+    }
+
+    const InputInfo info = input_info();
+    const InputSelection pick = resolve_inputs(sel, info.layout, info.net);
+    if (!pick.ok()) return send_selection_error(res, pick);
+    if (pick.inputs.empty()) return send_error(res, 400, "the selector matches no inputs on this board");
+
+    // The span is resolved once the build is ours, so a wait for another export cannot age it.
+    std::unique_lock<std::timed_mutex> build(wav_build_m_, std::defer_lock);
+    if (!build.try_lock_for(std::chrono::seconds(kWavBuildWaitS)))
+      return send_error(res, 429, "another capture/wav is still being built: retry in a moment");
+    const unsigned rate = d_.engine.stats().rate;
+    const uint64_t frame_bytes = pick.inputs.size() * wav_sample_bytes(fmt);
+    CaptureStatus cs;
+    // Resolved against the ring as it is now: once to size the body, and again after it is
+    // allocated (zero-filling 256 MB takes a Pi 3 a while), so the reads start right after.
+    auto resolve_now = [&] {
+      cs = d_.capture.status();
+      const uint64_t head = d_.ring.counter();
+      ExportBuffers bufs;
+      bufs.frozen = cs.frozen;
+      bufs.frozen_begin = cs.valid_start;
+      bufs.frozen_end = cs.valid_start + cs.valid_len;
+      bufs.live_begin = d_.ring.oldest(head);
+      bufs.live_end = head;
+      // What the writer overwrites within the margin: nothing until the ring has filled.
+      const uint64_t margin = static_cast<uint64_t>(kWavLiveMarginS * rate);
+      bufs.live_margin = d_.ring.oldest(head + margin) - bufs.live_begin;
+      return resolve_export_span(q, bufs, rate, frame_bytes, kWavMaxBytes);
+    };
+    ExportSpan sp = resolve_now();
+    if (sp.status != 200) return send_error(res, sp.status, sp.error);
+
+    // The body is resident until the client has it: refuse one the box cannot hold now, as
+    // capture/config does, rather than reach for the OOM killer.
+    const unsigned total = d_.ring.channels();
+    const uint64_t data_bytes = sp.len * frame_bytes;
+    const uint64_t need = data_bytes + kWavChunkFrames * total * sizeof(float);
+    const uint64_t avail = meminfo_bytes("MemAvailable:");
+    if (avail != 0 && need + 64ull * 1024 * 1024 > avail) {
+      return send_error(res, 507,
+                        "not enough free memory for a " + std::to_string(data_bytes / (1024 * 1024)) +
+                            " MB body (" + std::to_string(avail / (1024 * 1024)) +
+                            " MB available): ask for a shorter span or fewer channels");
+    }
+
+    std::string chans_csv, labels;
+    for (size_t k = 0; k < pick.inputs.size(); ++k) {
+      chans_csv += (k ? "," : "") + std::to_string(pick.inputs[k]);
+      labels += (k ? "; " : "") + info.label(pick.inputs[k]);
+    }
+    const char* source = nullptr;
+
+    // ---- Read and encode, chunk by chunk ------------------------------------------------------
+    auto data = std::make_shared<std::string>();
+    std::vector<float> buf;
+    try {
+      buf.resize(kWavChunkFrames * total);
+      data->resize(static_cast<size_t>(data_bytes));
+    } catch (const std::bad_alloc&) {
+      return send_error(res, 507, "not enough memory for the body");
+    }
+    sp = resolve_now();  // same len (it never depends on the head), a fresh start for `seconds`
+    if (sp.status != 200) return send_error(res, sp.status, sp.error);
+    source = sp.from_snapshot ? "frozen" : "live";
+    for (uint64_t off = 0; off < sp.len;) {
+      const size_t n = static_cast<size_t>(std::min<uint64_t>(kWavChunkFrames, sp.len - off));
+      const bool ok = sp.from_snapshot
+                          ? d_.capture.snapshot_frames(cs.freeze_sample, sp.start + off, n, buf.data())
+                          : d_.ring.read_interleaved(sp.start + off, n, buf.data());
+      if (!ok) {
+        const std::string why =
+            sp.from_snapshot
+                ? "the frozen snapshot was resumed or replaced while it was read"
+                : "the live ring overwrote sample " + std::to_string(sp.start + off) +
+                      " while it was read (the span was too near its oldest sample)";
+        return send_error(res, 410, why + ": ask again");
+      }
+      wav_encode(buf.data(), n, total, pick.inputs, fmt, data->data() + off * frame_bytes);
+      off += n;
+    }
+    const uint32_t gen = sp.from_snapshot ? cs.generation : d_.engine.stats().generation;
+    const int64_t unix_ms = unix_ms_at(sp.start, d_.ring.counter(), rate);
+    // The same facts as the X-ST-* headers, inside the file, so a saved capture keeps them.
+    auto hdr = std::make_shared<const std::string>(wav_header(
+        rate, static_cast<unsigned>(pick.inputs.size()), fmt, sp.len,
+        "soundtester capture: start_sample=" + std::to_string(sp.start) +
+            " len=" + std::to_string(sp.len) + " rate=" + std::to_string(rate) +
+            " unix_ms=" + std::to_string(unix_ms) + " generation=" + std::to_string(gen) +
+            " source=" + source + " format=" + wav_format_name(fmt) + " ch=" + chans_csv +
+            " labels=" + labels));
+
+    res.set_header("X-ST-Start-Sample", std::to_string(sp.start));
+    res.set_header("X-ST-Len", std::to_string(sp.len));
+    res.set_header("X-ST-Rate", std::to_string(rate));
+    res.set_header("X-ST-Generation", std::to_string(gen));
+    res.set_header("X-ST-Unix-Ms", std::to_string(unix_ms));
+    res.set_header("X-ST-Channels", chans_csv);
+    res.set_header("X-ST-Source", source);
+    res.set_header("X-ST-Format", wav_format_name(fmt));
+    res.set_header("Content-Disposition",
+                   "attachment; filename=\"capture-" + std::to_string(sp.start) + ".wav\"");
+    // Header then samples, 1 MB per write; both buffers live until httplib is done with them.
+    res.set_content_provider(
+        hdr->size() + data->size(), "audio/wav",
+        [hdr, data](size_t offset, size_t length, httplib::DataSink& sink) {
+          const std::string& part = offset < hdr->size() ? *hdr : *data;
+          const size_t at = offset < hdr->size() ? offset : offset - hdr->size();
+          return sink.write(part.data() + at, std::min<size_t>({length, part.size() - at, 1u << 20}));
+        });
   });
 
   svr.Post("/api/capture/xcorr", json_route([this](const json& j, const httplib::Request&,
@@ -1448,67 +1858,829 @@ void WebServer::install_routes() {
   // sound is a thin wrapper over the analysis snapshot, sync over the freeze+xcorr path. See
   // docs/api.md, "Genie helpers".
 
-  // "Is there sound on a channel?" The verdict is peak_db (a 3 s hold, so it catches a transient
-  // tick/ping as well as a sustained tone — an RMS-only test can fall between ticks and miss it)
-  // over a threshold (default kGenieSoundThresholdDb; override with ?threshold_db=). rms_db,
-  // peak_db and the tone detector ride along. ?ch=N returns one input; omit for every channel.
-  svr.Get("/api/genie/sound", [this](const httplib::Request& req, httplib::Response& res) {
-    int only = -1;
-    if (req.has_param("ch")) {
-      only = static_cast<int>(query_u64(req, "ch", channels().total()));
-      if (only < 0 || only >= static_cast<int>(channels().total())) {
-        return send_error(res, 400, channel_range_msg());
+  // "Is there sound on a channel?" Inputs by the shared selector (ch list, or device/stream of a
+  // NET sender, or kind); every input when none is given. Per channel:
+  //   sound      peak_db (a 3 s hold, so it catches a tick/ping between polls) > threshold_db
+  //   sound_now  the latest 100 ms window's own peak > threshold_db: no hold, no tail
+  //   playing    sound_now && rms_db > min_rms_db: "is the DUT playing", which an idle analog
+  //              input's noise floor and a stopped input's hold both fail
+  // plus who the input is (label/name/kind/net) and the tone detector. expect_hz (one per returned
+  // channel, or one for all) and tol_hz add tone.match. See docs/api.md, "Genie helpers".
+  svr.Get("/api/genie/sound", [this, input_info](const httplib::Request& req,
+                                                 httplib::Response& res) {
+    InputSelector sel;
+    if (!parse_selector(req, &sel, res)) return;
+    double threshold = kGenieSoundThresholdDb, min_rms = kGeniePlayingRmsDb, tol = kGenieToneTolHz;
+    if (!query_number(req, "threshold_db", &threshold) || !query_number(req, "min_rms_db", &min_rms))
+      return send_error(res, 400, "threshold_db and min_rms_db are numbers in dB");
+    if (!query_number(req, "tol_hz", &tol) || tol < 0)
+      return send_error(res, 400, "tol_hz must be a number >= 0");
+    if (req.has_param("freq_hz"))
+      return send_error(res, 400, "genie/sound takes the expected frequency as expect_hz");
+    std::vector<double> expect;
+    const bool want_match = req.has_param("expect_hz");
+    if (want_match && (!parse_f64_list(req.get_param_value("expect_hz"), &expect) ||
+                       std::any_of(expect.begin(), expect.end(), [](double f) { return f <= 0; })))
+      return send_error(res, 400, "expect_hz takes positive frequencies in Hz, comma-separated");
+
+    const InputInfo info = input_info();
+    const InputSelection pick = resolve_inputs(sel, info.layout, info.net);
+    if (!pick.ok()) return send_selection_error(res, pick);
+    if (pick.inputs.empty()) return send_error(res, 400, "the selector matches no inputs on this board");
+    if (want_match && expect.size() != 1 && expect.size() != pick.inputs.size()) {
+      return send_error(res, 400,
+                        "expect_hz has " + std::to_string(expect.size()) + " values for " +
+                            std::to_string(pick.inputs.size()) +
+                            " channels: give one for all or one per channel, in order");
+    }
+
+    const AnalysisSnapshot s = d_.analysis.snapshot();
+    const double rate = d_.engine.rate();
+    const uint64_t now = d_.ring.counter();
+    json chans = json::array();
+    for (size_t k = 0; k < pick.inputs.size(); ++k) {
+      const unsigned c = pick.inputs[k];
+      const ChannelMeters& m = s.meters[c];
+      const bool sound_now = m.peak_now_db > threshold;
+      json tone = tone_json(s.tone[c]);
+      if (want_match) {
+        const double f = expect.size() == 1 ? expect[0] : expect[k];
+        tone["expect_hz"] = f;
+        tone["match"] = s.tone[c].valid && std::fabs(s.tone[c].freq_hz - f) <= tol;
+      }
+      json j{{"ch", c}};
+      j.update(info.genie_json(c));
+      j.update({{"sound", m.peak_db > threshold},
+                {"sound_now", sound_now},
+                {"playing", sound_now && m.rms_db > min_rms},
+                {"last_sound_ms_ago",
+                 m.loud_seen && rate > 0
+                     ? json(std::llround(1000.0 * static_cast<double>(s.sample - m.last_loud) / rate))
+                     : json(nullptr)},
+                {"rms_db", m.rms_db},
+                {"peak_db", m.peak_db},
+                {"peak_now_db", m.peak_now_db},
+                {"threshold_db", threshold},
+                {"tone", tone}});
+      chans.push_back(std::move(j));
+    }
+    json out{{"sample", s.sample},
+             {"unix_ms", unix_ms_at(s.sample, now, rate)},
+             {"threshold_db", threshold},
+             {"min_rms_db", min_rms},
+             {"resolved", resolved_json(sel, pick)},
+             {"channels", chans}};
+    if (want_match) out["tol_hz"] = tol;
+    send_json(res, out);
+  });
+
+  // "Wait until something happens on an input" instead of a sleep-and-poll loop: blocks until
+  // `until` has held hold_ms on any selected input (all=1: every one), or timeout_s passes. Looks
+  // every analysis refresh (100 ms) at the analysis snapshot and the NET status, re-resolving a
+  // device/stream selector each time so it follows a sender that moves. A timeout is a 200 with
+  // met:false and a reason. At most kGenieMaxWaits at once (429 beyond): each parks a worker.
+  // The condition itself is WaitTracker's (genie_wait.h); see docs/api.md, "Genie helpers".
+  svr.Get("/api/genie/wait", [this, input_info](const httplib::Request& req,
+                                                httplib::Response& res) {
+    // ---- Parameters -------------------------------------------------------------------------
+    WaitCondition cond;
+    if (!req.has_param("until") || !parse_wait_until(req.get_param_value("until"), &cond.until))
+      return send_error(res, 400, "until must be sound, silence, tone, live or change");
+    InputSelector sel;
+    if (!parse_selector(req, &sel, res)) return;
+    if (!query_number(req, "threshold_db", &cond.threshold_db) ||
+        !query_number(req, "min_rms_db", &cond.min_rms_db))
+      return send_error(res, 400, "threshold_db and min_rms_db are numbers in dB");
+    // expect_hz is the name genie/sound and genie/watch use: the same thing here (one value).
+    if (req.has_param("freq_hz") && req.has_param("expect_hz"))
+      return send_error(res, 400, "freq_hz and expect_hz are one parameter here: pass one");
+    const char* freq_key = req.has_param("expect_hz") ? "expect_hz" : "freq_hz";
+    if ((req.has_param(freq_key) || req.has_param("tol_hz")) && cond.until != WaitUntil::Tone)
+      return send_error(res, 400, std::string(freq_key) + " and tol_hz are for until=tone");
+    if (req.has_param(freq_key)) {
+      double f = 0;
+      if (!query_number(req, freq_key, &f) || f <= 0)
+        return send_error(res, 400, std::string(freq_key) + " must be one frequency in Hz > 0");
+      cond.freq_hz = f;
+    }
+    if (!query_number(req, "tol_hz", &cond.tol_hz) || cond.tol_hz < 0)
+      return send_error(res, 400, "tol_hz must be a number >= 0");
+    const uint64_t max_ms = static_cast<uint64_t>(kGenieWaitMaxTimeoutS * 1000);
+    if (!query_uint(req, "hold_ms", &cond.hold_ms) || cond.hold_ms > max_ms)
+      return send_error(res, 400, "hold_ms must be 0.." + std::to_string(max_ms));
+    double timeout_s = kGenieWaitTimeoutS;
+    if (!query_number(req, "timeout_s", &timeout_s) || timeout_s < 0 ||
+        timeout_s > kGenieWaitMaxTimeoutS)
+      return send_error(res, 400, "timeout_s must be 0.." +
+                                      std::to_string(static_cast<int>(kGenieWaitMaxTimeoutS)));
+    for (const char* key : {"all", "any"}) {
+      if (!req.has_param(key)) continue;
+      const std::string v = req.get_param_value(key);
+      if (v != "0" && v != "1" && v != "true" && v != "false")
+        return send_error(res, 400, std::string(key) + " must be 0 or 1");
+    }
+    auto flag = [&req](const char* key) {
+      const std::string v = req.get_param_value(key);
+      return v == "1" || v == "true";
+    };
+    const bool all_given = req.has_param("all"), any_given = req.has_param("any");
+    if (all_given && any_given && flag("all") == flag("any"))
+      return send_error(res, 400, "all and any contradict each other: pass one");
+    cond.all = all_given ? flag("all") : any_given && !flag("any");
+
+    // Only a network input has a sender to be live: with no selector, the network inputs.
+    if (cond.until == WaitUntil::Live) {
+      if (sel.kind && *sel.kind != InputKind::Net)
+        return send_error(res, 400, "until=live is about network senders: kind must be net");
+      for (unsigned c : sel.ch) {
+        if (!channels().is_net(c))
+          return send_error(res, 400, "until=live is about network senders: input " +
+                                          std::to_string(c) + " is not a network input");
+      }
+      if (sel.ch.empty() && !sel.by_sender()) sel.kind = InputKind::Net;
+    }
+
+    // A selector that cannot resolve on any tick is the caller's mistake: say so now. One that
+    // names a sender not connected yet (404) is what a wait is for.
+    {
+      const InputInfo info = input_info();
+      const InputSelection pick = resolve_inputs(sel, info.layout, info.net);
+      if (pick.status == 400) return send_selection_error(res, pick);
+      if (pick.ok() && pick.inputs.empty())
+        return send_error(res, 400, "the selector matches no inputs on this board");
+    }
+
+    if (genie_waits_.fetch_add(1) >= kGenieMaxWaits) {
+      genie_waits_.fetch_sub(1);
+      return send_error(res, 429,
+                        "already " + std::to_string(kGenieMaxWaits) +
+                            " genie/wait requests pending: retry when one has answered");
+    }
+    struct Slot {
+      std::atomic<unsigned>& n;
+      ~Slot() { n.fetch_sub(1); }
+    } slot{genie_waits_};
+
+    // ---- The wait ---------------------------------------------------------------------------
+    using namespace std::chrono;
+    const auto t0 = steady_clock::now();
+    const int64_t t0_unix_ms = unix_ms_now();
+    const uint64_t timeout_ms = static_cast<uint64_t>(std::llround(timeout_s * 1000));
+    WaitTracker tracker(cond);
+    std::optional<InputInfo> last;  // the last tick's (InputInfo holds a reference: no assignment)
+    InputSelection pick;
+    AnalysisSnapshot s;
+    std::optional<std::vector<unsigned>> first_inputs;
+    // A sender that stops by closing its PCM (aplay ending, a killed player) is no longer
+    // connected, so its selector stops resolving: for silence and change, keep evaluating the
+    // inputs it was last on (its audio drains through the ring, then they read silent), unless
+    // another sender has taken them.
+    const bool keep_after_leave =
+        sel.by_sender() && (cond.until == WaitUntil::Silence || cond.until == WaitUntil::Change);
+    std::vector<unsigned> resolved_inputs, eval;
+    bool sender_left = false;
+    bool met = false;
+    uint64_t elapsed = 0;
+    for (;;) {
+      last.emplace(input_info());
+      const InputInfo& info = *last;
+      pick = resolve_inputs(sel, info.layout, info.net);
+      s = d_.analysis.snapshot();
+      std::vector<WaitSample> now;
+      eval.clear();
+      sender_left = false;
+      if (pick.ok()) {
+        if (!first_inputs) first_inputs = pick.inputs;
+        resolved_inputs = pick.inputs;
+        eval = pick.inputs;
+      } else if (keep_after_leave && pick.status == 404 && !resolved_inputs.empty()) {
+        for (unsigned c : resolved_inputs) {
+          const NetChannelStatus* n = info.net_status(c);
+          if (!n || !n->connected) eval.push_back(c);
+        }
+        sender_left = !eval.empty();
+      }
+      {
+        for (unsigned c : eval) {
+          WaitSample w;
+          w.ch = c;
+          w.rms_db = s.meters[c].rms_db;
+          w.peak_now_db = s.meters[c].peak_now_db;
+          w.tone_valid = s.tone[c].valid;
+          w.tone_hz = s.tone[c].freq_hz;
+          if (const NetChannelStatus* n = info.net_status(c)) {
+            w.streaming = n->state == "streaming";
+            w.frames_received = n->frames_received;
+          }
+          now.push_back(w);
+        }
+      }
+      elapsed = static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now() - t0).count());
+      if (tracker.update(elapsed, now, s.sample)) {
+        met = true;
+        break;
+      }
+      if (elapsed >= timeout_ms) break;
+      // A daemon stopping must not wait out anyone's timeout (the worker pool joins this
+      // thread), and a client that hung up has nobody to answer.
+      if (!running_.load()) return send_error(res, 503, "the daemon is shutting down");
+      if (req.is_connection_closed()) return;
+      std::this_thread::sleep_for(milliseconds(std::min<uint64_t>(kGenieWaitTickMs,
+                                                                   timeout_ms - elapsed)));
+    }
+
+    // ---- The reply --------------------------------------------------------------------------
+    const InputInfo& info = *last;
+    const double rate = d_.engine.rate();
+    json chans = json::array();
+    std::vector<WaitNetInput> net_inputs;
+    {
+      for (unsigned c : eval) {
+        const ChannelMeters& m = s.meters[c];
+        const NetChannelStatus* n = info.net_status(c);
+        json j{{"ch", c}};
+        j.update(info.genie_json(c));
+        if (n) {
+          j["net"]["frames_received"] = n->frames_received;
+          j["net"]["frames_per_s"] = n->frames_per_s ? json(*n->frames_per_s) : json(nullptr);
+          j["net"]["last_audio_ms_ago"] =
+              n->last_audio_ms_ago ? json(*n->last_audio_ms_ago) : json(nullptr);
+          net_inputs.push_back({info.label(c), n->device.empty() ? n->last_device : n->device,
+                                n->state, n->last_audio_ms_ago});
+        }
+        WaitSample w;
+        w.rms_db = m.rms_db;
+        w.peak_now_db = m.peak_now_db;
+        const int flip = tracker.changed(c);
+        j.update({{"device", n ? json(n->device) : json(nullptr)},
+                  {"holds", tracker.holds(c)},
+                  {"playing", wait_playing(cond, w)},
+                  {"sound_now", m.peak_now_db > cond.threshold_db},
+                  {"rms_db", m.rms_db},
+                  {"peak_now_db", m.peak_now_db},
+                  {"tone", tone_json(s.tone[c])},
+                  {"changed", flip > 0 ? json("on") : flip < 0 ? json("off") : json(nullptr)}});
+        chans.push_back(std::move(j));
       }
     }
-    const double threshold = query_f64(req, "threshold_db", kGenieSoundThresholdDb);
-    const AnalysisSnapshot s = d_.analysis.snapshot();
-    json chans = json::array();
-    for (unsigned c = 0; c < channels().total(); ++c) {
-      if (only >= 0 && c != static_cast<unsigned>(only)) continue;
-      chans.push_back({{"ch", c},
-                       {"sound", s.meters[c].peak_db > threshold},
-                       {"rms_db", s.meters[c].rms_db},
-                       {"peak_db", s.meters[c].peak_db},
-                       {"tone", tone_json(s.tone[c])}});
+    // Where the condition started holding: the first reading of the run that met it. The ring's
+    // audio was heard capture_delay before it reached the ring, so onset_ms (from the request) takes
+    // that off; `live` reads the link, not the ring, so its onset is the look's own time.
+    const double capture_delay_ms = rate > 0 ? 1000.0 * d_.ctl.capture_delay.load() / rate : 0.0;
+    json met_sample = nullptr, met_unix_ms = nullptr, onset_ms = nullptr;
+    if (met && tracker.met_onset()) {
+      const WaitTracker::Onset& o = *tracker.met_onset();
+      const int64_t at = unix_ms_at(o.sample, d_.ring.counter(), rate);
+      met_sample = o.sample;
+      met_unix_ms = at;
+      onset_ms = cond.until == WaitUntil::Live
+                     ? static_cast<int64_t>(o.t_ms)
+                     : at - std::llround(capture_delay_ms) - t0_unix_ms;
     }
-    send_json(res, json{{"sample", s.sample}, {"threshold_db", threshold}, {"channels", chans}});
+    json out{{"met", met},
+             {"until", wait_until_name(cond.until)},
+             {"after_ms", elapsed},
+             {"met_sample", met_sample},
+             {"met_unix_ms", met_unix_ms},
+             {"onset_ms", onset_ms},
+             {"hold_ms", cond.hold_ms},
+             {"timeout_s", timeout_s},
+             {"all", cond.all},
+             {"threshold_db", cond.threshold_db},
+             {"min_rms_db", cond.min_rms_db},
+             {"sample", s.sample},
+             {"unix_ms", unix_ms_at(s.sample, d_.ring.counter(), rate)},
+             {"capture_delay_ms", capture_delay_ms},
+             {"resolved", pick.ok() ? resolved_json(sel, pick) : json(nullptr)},
+             {"moved_from", first_inputs && pick.ok() && *first_inputs != pick.inputs
+                                ? json(*first_inputs)
+                                : json(nullptr)},
+             {"channels", chans}};
+    if (sender_left) out["sender_left"] = true;
+    if (cond.until == WaitUntil::Tone) {
+      out["freq_hz"] = cond.freq_hz ? json(*cond.freq_hz) : json(nullptr);
+      out["tol_hz"] = cond.tol_hz;
+    }
+    if (!met) {
+      std::string reason;
+      if (!pick.ok() && !sender_left) {
+        reason = pick.error;
+        json seen = json::array();
+        for (const LastSeen& l : pick.last_seen) {
+          seen.push_back({{"input", l.input},
+                          {"channel", l.channel},
+                          {"last_device", l.last_device},
+                          {"last_stream", l.last_stream},
+                          {"state", l.state}});
+        }
+        out["last_seen"] = seen;
+      } else {
+        // The link explains a timeout only when the wait was about senders: a sender selector,
+        // or nothing but network inputs (an analog DUT hunt has idle NET inputs too).
+        reason = wait_net_reason(cond.until, net_inputs,
+                                 sel.by_sender() || net_inputs.size() == eval.size());
+      }
+      if (reason.empty()) {
+        char hold[32];
+        std::snprintf(hold, sizeof hold, "%g", timeout_s);
+        reason = std::string("timed out after ") + hold + " s: " + wait_until_name(cond.until) +
+                 " did not hold for " + std::to_string(cond.hold_ms) + " ms on " +
+                 (cond.all ? "every" : "any") + " selected input";
+      }
+      out["reason"] = reason;
+    }
+    send_json(res, out);
+  });
+
+  // "What happened on an input over a span": dropouts, clicks, level steps and, on a test tone,
+  // phase slips and distortion, each at its sample, plus the span's level statistics. from=past
+  // analyses the last `seconds` of the ring and answers at once; from=now waits for `seconds` to
+  // be captured first (at most 60). The analysis is WatchAnalyzer's (genie_watch.h), fed straight
+  // from the ring in post-validated chunks. At most kGenieMaxWatches at once (429 beyond). See
+  // docs/api.md, "Genie helpers".
+  svr.Get("/api/genie/watch", [this, input_info](const httplib::Request& req,
+                                                 httplib::Response& res) {
+    using namespace std::chrono;
+    const auto t_req = steady_clock::now();
+    // ---- Parameters -------------------------------------------------------------------------
+    InputSelector sel;
+    if (!parse_selector(req, &sel, res)) return;
+    const std::string from = req.has_param("from") ? req.get_param_value("from") : "past";
+    if (from != "past" && from != "now") return send_error(res, 400, "from must be past or now");
+    const bool now_mode = from == "now";
+    double seconds = kGenieWatchSeconds, block_ms = kGenieWatchBlockMs;
+    WatchParams wp;
+    if (!query_number(req, "seconds", &seconds) || seconds <= 0)
+      return send_error(res, 400, "seconds must be a number > 0");
+    if (!query_number(req, "block_ms", &block_ms) || block_ms < 1 || block_ms > 100)
+      return send_error(res, 400, "block_ms must be 1..100");
+    if (!query_number(req, "silence_db", &wp.silence_db) || wp.silence_db < -150 || wp.silence_db > 0)
+      return send_error(res, 400, "silence_db must be -150..0 (dBFS)");
+    if (!query_number(req, "click_k", &wp.click_k) || wp.click_k < 2 || wp.click_k > 1000)
+      return send_error(res, 400, "click_k must be 2..1000");
+    if (!query_number(req, "resid_dbc", &wp.resid_dbc) || wp.resid_dbc < -200 || wp.resid_dbc > 0)
+      return send_error(res, 400, "resid_dbc must be -200..0 (dB against the tone)");
+    if (!query_number(req, "slip_deg", &wp.slip_deg) || wp.slip_deg <= 0 || wp.slip_deg > 180)
+      return send_error(res, 400, "slip_deg must be > 0 and <= 180");
+    if (!query_number(req, "level_step_db", &wp.level_step_db) || wp.level_step_db <= 0 ||
+        wp.level_step_db > 100)
+      return send_error(res, 400, "level_step_db must be > 0 and <= 100");
+    if (req.has_param("freq_hz"))
+      return send_error(res, 400, "genie/watch takes the expected frequency as expect_hz");
+    const std::string expect = req.has_param("expect_hz") ? req.get_param_value("expect_hz") : "auto";
+    std::vector<double> expect_hz;  // empty: auto or none
+    const double rate = d_.engine.rate();
+    wp.rate = rate;
+    wp.block = std::max(16u, static_cast<unsigned>(std::llround(block_ms * rate / 1000.0)));
+    // A tone needs a whole cycle in a block to be fitted, and must be below Nyquist.
+    const double min_hz = rate / wp.block, max_hz = rate / 2 * 0.95;
+    if (expect != "auto" && expect != "none") {
+      if (!parse_f64_list(expect, &expect_hz) ||
+          std::any_of(expect_hz.begin(), expect_hz.end(),
+                      [&](double f) { return f < min_hz || f > max_hz; })) {
+        char msg[200];
+        std::snprintf(msg, sizeof msg,
+                      "expect_hz is auto, none, or frequencies in Hz, comma-separated, each "
+                      "%.0f..%.0f (one cycle per block_ms up to Nyquist)",
+                      std::ceil(min_hz), std::floor(max_hz));
+        return send_error(res, 400, msg);
+      }
+    }
+
+    InputInfo info0 = input_info();
+    const InputSelection pick = resolve_inputs(sel, info0.layout, info0.net);
+    if (!pick.ok()) return send_selection_error(res, pick);
+    if (pick.inputs.empty()) return send_error(res, 400, "the selector matches no inputs on this board");
+    if (pick.inputs.size() > kGenieWatchMaxInputs)
+      return send_error(res, 400, std::to_string(pick.inputs.size()) + " inputs selected: at most " +
+                                      std::to_string(kGenieWatchMaxInputs) +
+                                      " per watch (narrow it with ch=, device= or kind=)");
+    if (!expect_hz.empty() && expect_hz.size() != 1 && expect_hz.size() != pick.inputs.size())
+      return send_error(res, 400, "expect_hz has " + std::to_string(expect_hz.size()) + " values for " +
+                                      std::to_string(pick.inputs.size()) +
+                                      " channels: give one for all or one per channel, in order");
+
+    // The span: never nearer than kGenieWatchMarginS to the ring's oldest sample, so it is still
+    // there while it is read.
+    const double ring_s = static_cast<double>(d_.ring.span()) / rate;
+    const double max_s = std::floor((now_mode ? std::min(kGenieWatchNowMaxS, ring_s - kGenieWatchMarginS)
+                                              : ring_s - kGenieWatchMarginS) * 10) / 10;
+    if (seconds > max_s) {
+      char msg[160];
+      std::snprintf(msg, sizeof msg, "seconds must be at most %.1f for from=%s (the ring holds %.1f s)",
+                    max_s, from.c_str(), ring_s);
+      return send_error(res, 400, msg);
+    }
+    const uint64_t len = static_cast<uint64_t>(std::llround(seconds * rate));
+    if (len < wp.block) return send_error(res, 400, "seconds is shorter than one block");
+
+    if (genie_watches_.fetch_add(1) >= kGenieMaxWatches) {
+      genie_watches_.fetch_sub(1);
+      return send_error(res, 429,
+                        "already " + std::to_string(kGenieMaxWatches) +
+                            " genie/watch requests running: retry when one has answered");
+    }
+    struct Slot {
+      std::atomic<unsigned>& n;
+      ~Slot() { n.fetch_sub(1); }
+    } slot{genie_watches_};
+
+    // ---- The span ---------------------------------------------------------------------------
+    uint64_t start = 0;
+    std::vector<NetChannelStatus> net0;
+    const EngineStats es0 = d_.engine.stats();
+    const uint32_t gen0 = es0.generation;
+    // from=past: whether a seam (an xrun, a capture-axis move) lies inside the span, from where
+    // the last one was — read before the head, so it is at or before the span's end.
+    bool seam_in_past = false;
+    if (!now_mode) {
+      const uint64_t head = d_.ring.counter();
+      if (head < len) {
+        char msg[120];
+        std::snprintf(msg, sizeof msg, "the ring holds only %.1f s so far", head / rate);
+        return send_error(res, 400, msg);
+      }
+      start = head - len;
+      seam_in_past = es0.generation_at > start && es0.generation_at < head;
+    } else {
+      start = d_.ring.counter();
+      net0 = info0.net;
+      // A stalled engine (a card that cannot be reopened) never gets there: give up 5 s late.
+      const auto deadline = steady_clock::now() + milliseconds(static_cast<int64_t>(seconds * 1000)) +
+                            std::chrono::seconds(5);
+      while (d_.ring.counter() < start + len) {
+        if (!running_.load()) return send_error(res, 503, "the daemon is shutting down");
+        if (req.is_connection_closed()) return;
+        if (steady_clock::now() > deadline)
+          return send_error(res, 503,
+                            "the engine is not advancing: " +
+                                std::to_string(d_.ring.counter() - start) + " of " +
+                                std::to_string(len) +
+                                " samples captured (see /api/state engine.last_error)");
+        const uint64_t left = start + len - d_.ring.counter();
+        std::this_thread::sleep_for(milliseconds(std::clamp<uint64_t>(
+            static_cast<uint64_t>(1000.0 * static_cast<double>(left) / rate) + 1, 1, 100)));
+      }
+    }
+    const uint32_t gen1 = d_.engine.stats().generation;
+    const InputInfo info = input_info();  // who is on each input now, at the span's end
+
+    // expect_hz per input: given, or auto from the tone detector now (the span's end).
+    const AnalysisSnapshot snap = d_.analysis.snapshot();
+    const size_t ni = pick.inputs.size();
+    std::vector<WatchAnalyzer> an;
+    std::vector<std::string> tone_note(ni), tone_src(ni);
+    an.reserve(ni);
+    for (size_t k = 0; k < ni; ++k) {
+      const unsigned c = pick.inputs[k];
+      WatchParams p = wp;
+      if (!expect_hz.empty()) {
+        p.tone_hz = expect_hz.size() == 1 ? expect_hz[0] : expect_hz[k];
+        tone_src[k] = "expect_hz";
+      } else if (expect == "auto") {
+        const ToneMetrics& t = snap.tone[c];
+        if (!t.valid) {
+          const char* why = tone_reason_name(t.reason);
+          tone_note[k] = std::string("auto: no valid tone at the span's end") +
+                         (why ? std::string(" (") + why + ")" : "");
+        } else if (t.freq_hz < min_hz || t.freq_hz > max_hz) {
+          char msg[120];
+          std::snprintf(msg, sizeof msg, "auto: the tone (%.1f Hz) is below one cycle per block: raise block_ms",
+                        t.freq_hz);
+          tone_note[k] = msg;
+        } else {
+          p.tone_hz = t.freq_hz;
+          tone_src[k] = "analysis";
+        }
+      }
+      an.emplace_back(p);
+    }
+
+    // ---- The analysis: every selected column out of each post-validated chunk ---------------
+    const auto t_an = steady_clock::now();
+    const unsigned total = d_.ring.channels();
+    std::vector<float> buf(kGenieWatchChunkFrames * total), col(kGenieWatchChunkFrames);
+    bool incomplete = false;
+    std::string reason;
+    uint64_t analysed = 0;
+    for (uint64_t off = 0; off < len;) {
+      const size_t n = static_cast<size_t>(std::min<uint64_t>(kGenieWatchChunkFrames, len - off));
+      if (!d_.ring.read_interleaved(start + off, n, buf.data())) {
+        incomplete = true;
+        char msg[160];
+        std::snprintf(msg, sizeof msg,
+                      "ring overwritten at sample %llu: the span left the ring while it was read; "
+                      "%.2f s of %.2f analysed",
+                      static_cast<unsigned long long>(start + off), off / rate, len / rate);
+        reason = msg;
+        break;
+      }
+      for (size_t k = 0; k < ni; ++k) {
+        const unsigned c = pick.inputs[k];
+        for (size_t i = 0; i < n; ++i) col[i] = buf[i * total + c];
+        an[k].feed(col.data(), n);
+      }
+      off += n;
+      analysed = off;
+    }
+    std::vector<WatchChannelResult> results;
+    results.reserve(ni);
+    for (size_t k = 0; k < ni; ++k) {
+      const unsigned c = pick.inputs[k];
+      results.push_back(an[k].finish([this, start, c](uint64_t off, size_t n, float* out) {
+        return d_.ring.read_channel(start + off, n, c, out);
+      }));
+    }
+    const auto t_done = steady_clock::now();
+
+    // ---- The reply --------------------------------------------------------------------------
+    const uint64_t head = d_.ring.counter();
+    // To `per` steps per unit (100: 0.01), as the nearest double prints: 440.001, not 440.00100000000003.
+    auto rnd = [](double v, double per) { return std::round(v * per) / per; };
+    auto opt = [&](const std::optional<double>& v, double q) {
+      return v ? json(rnd(*v, q)) : json(nullptr);
+    };
+    std::vector<WatchChannelEvents> evs;
+    json chans = json::array();
+    for (size_t k = 0; k < ni; ++k) {
+      const unsigned c = pick.inputs[k];
+      const WatchChannelResult& r = results[k];
+      const NetChannelStatus* n = info.net_status(c);
+      // One sender's run of channels shares its holes: events merge across its members.
+      const int group = n && !n->state.empty() && n->stream_count > 1
+                            ? static_cast<int>(n->channel + 1 - n->stream_index)
+                            : -1;
+      evs.push_back({c, group, &r.events});
+      json counts = json::object();
+      for (size_t i = 0; i < kWatchKinds; ++i)
+        counts[watch_kind_name(static_cast<WatchKind>(i))] = r.counts[i];
+      json tone = nullptr;
+      if (r.tone) {
+        const WatchToneStats& t = *r.tone;
+        tone = {{"expect_hz", rnd(t.expect_hz, 1000)},
+                {"source", tone_src[k]},
+                {"blocks", t.blocks},
+                {"bad_blocks", t.bad_blocks},
+                {"freq_hz_median", opt(t.freq_hz_median, 1000)},
+                {"freq_hz_min", opt(t.freq_hz_min, 1000)},
+                {"freq_hz_max", opt(t.freq_hz_max, 1000)},
+                {"thd_n_pct_median", opt(t.thd_n_pct_median, 10000)},
+                {"thd_n_pct_max", opt(t.thd_n_pct_max, 10000)},
+                {"resid_dbc_median", opt(t.resid_dbc_median, 100)},
+                {"resid_dbc_max", opt(t.resid_dbc_max, 100)}};
+      }
+      json link = nullptr;
+      if (now_mode && n && info.layout.is_net(c)) {
+        const unsigned nc = c - info.layout.net_base();
+        if (nc < net0.size()) {
+          const NetChannelStatus& a = net0[nc];
+          auto delta = [](uint64_t x0, uint64_t x1) { return x1 >= x0 ? x1 - x0 : x1; };
+          link = {{"underruns", delta(a.underruns, n->underruns)},
+                  {"underrun_events", delta(a.underrun_events, n->underrun_events)},
+                  {"late_drops", delta(a.late_drops, n->late_drops)},
+                  {"range_drops", delta(a.range_drops, n->range_drops)},
+                  {"resyncs", delta(a.resyncs, n->resyncs)},
+                  {"reconnects", delta(a.connects, n->connects)},
+                  // A sender that only left is `state`, not someone else.
+                  {"device_changed", !n->device.empty() && a.device != n->device},
+                  {"state", n->state},
+                  {"frames_per_s", n->frames_per_s ? json(rnd(*n->frames_per_s, 10)) : json(nullptr)}};
+        }
+      }
+      json j{{"ch", c}};
+      j.update(info.genie_json(c));
+      j.update({{"sound_pct", rnd(r.sound_pct, 100)},
+                {"silent_s", rnd(r.silent_s, 1000)},
+                {"rms_db",
+                 {{"min", rnd(r.rms_db_min, 100)},
+                  {"p10", rnd(r.rms_db_p10, 100)},
+                  {"median", rnd(r.rms_db_median, 100)},
+                  {"max", rnd(r.rms_db_max, 100)}}},
+                {"peak_max_db", rnd(r.peak_max_db, 100)},
+                {"clipped_samples", r.clipped_samples},
+                {"counts", counts},
+                {"tone", tone},
+                {"tone_note", tone_note[k].empty() ? json(nullptr) : json(tone_note[k])},
+                {"link", link}});
+      chans.push_back(std::move(j));
+    }
+    const auto merged = merge_watch_events(
+        evs, static_cast<uint64_t>(std::llround(kGenieWatchMergeMs * rate / 1000.0)));
+    json events = json::array();
+    for (size_t i = 0; i < merged.size() && i < kGenieWatchMaxEvents; ++i) {
+      const WatchEvent& e = merged[i].ev;
+      const uint64_t sample = start + e.offset;
+      json labels = json::array();
+      for (unsigned c : merged[i].ch) labels.push_back(info.label(c));
+      json j{{"kind", watch_kind_name(e.kind)},
+             {"ch", merged[i].ch},
+             {"labels", labels},
+             {"sample", sample},
+             {"t_s", rnd(static_cast<double>(e.offset) / rate, 10000)},
+             {"t_ago_s", rnd(static_cast<double>(head - sample) / rate, 1000)},
+             {"len_ms", rnd(1000.0 * static_cast<double>(e.len) / rate, 1000)}};
+      if (e.slip_samples) {
+        j["slip_samples"] = rnd(*e.slip_samples, 100);
+        j["slip_deg"] = rnd(*e.slip_deg, 10);
+      }
+      if (e.from_db) {
+        j["from_db"] = rnd(*e.from_db, 100);
+        j["to_db"] = rnd(*e.to_db, 100);
+      }
+      if (e.level_db) j["level_db"] = rnd(*e.level_db, 100);
+      if (e.resid_dbc) j["resid_dbc"] = rnd(*e.resid_dbc, 100);
+      if (e.kind == WatchKind::Gap) j["zeros"] = e.zeros;
+      if (e.click) j["click"] = true;
+      events.push_back(std::move(j));
+    }
+    bool truncated = merged.size() > kGenieWatchMaxEvents;
+    for (const WatchChannelResult& r : results) truncated |= r.events_truncated;
+
+    json out{{"from", from},
+             {"seconds", rnd(static_cast<double>(len) / rate, 10000)},
+             {"start_sample", start},
+             {"len", len},
+             {"analysed", analysed},
+             {"rate", rate},
+             {"block_ms", rnd(1000.0 * wp.block / rate, 1000)},
+             {"unix_ms_start", unix_ms_at(start, head, rate)},
+             {"t_ago_s_start", rnd(static_cast<double>(head - start) / rate, 1000)},
+             {"capture_delay_ms", rate > 0 ? 1000.0 * d_.ctl.capture_delay.load() / rate : 0.0},
+             {"generation", gen1},
+             {"generation_changed", now_mode ? gen1 != gen0 : seam_in_past},
+             {"incomplete", incomplete},
+             {"reason", incomplete ? json(reason) : json(nullptr)},
+             {"elapsed_ms", duration_cast<milliseconds>(t_done - t_req).count()},
+             {"analysis_ms", duration_cast<milliseconds>(t_done - t_an).count()},
+             {"params",
+              {{"silence_db", wp.silence_db},
+               {"click_k", wp.click_k},
+               {"expect_hz", expect_hz.empty() ? json(expect) : json(expect_hz)},
+               {"resid_dbc", wp.resid_dbc},
+               {"slip_deg", wp.slip_deg},
+               {"level_step_db", wp.level_step_db}}},
+             {"resolved", resolved_json(sel, pick)},
+             {"channels", chans},
+             {"events", events},
+             {"events_truncated", truncated}};
+    send_json(res, out);
   });
 
   // "Measure delay/sync between two inputs." A GET, so it runs straight from a browser address
   // bar. Every query param is optional:
-  //   ch_a, ch_b    the pair; default = the first two inputs that currently have sound
-  //   cur_x, cur_y  two sample indices bracketing ONE window to measure; omit both to measure
-  //                 every ping marker in the buffer instead
+  //   ch_a, ch_b       the pair by ring column; a=, b= the same by column or by sender
+  //                    ("<device>[/<stream>]", its first channel); device=/stream= alone = the L
+  //                    and R of that sender's run. Default: the first two inputs playing now.
+  //   cur_x, cur_y     two sample indices bracketing ONE window to measure
+  //   mode             pings (every ping marker), sliding (windows over the whole snapshot, for
+  //                    music or any DUT-played content), auto (pings when >= 3 arrive, else sliding)
+  //   win, step, min_confidence   the sliding windows; since / since_ms_ago  only audio after it
   // Freeze handling follows intent: if the capture is already frozen (you sent POST
   // /api/capture/freeze) it measures on that snapshot and leaves it frozen; otherwise it freezes,
-  // measures and unfreezes. A positive lag means the signal arrives later on ch_b.
-  svr.Get("/api/genie/sync", [this](const httplib::Request& req, httplib::Response& res) {
-    const AnalysisSnapshot as = d_.analysis.snapshot();
-    std::vector<unsigned> sounding;
-    for (unsigned ch = 0; ch < channels().total(); ++ch) {
-      if (as.meters[ch].peak_db > kGenieSoundThresholdDb) sounding.push_back(ch);
-    }
-    // Each channel: the query value if given, else the first sounding input that isn't `exclude`.
-    const std::string range_msg = sync_range_msg();
-    auto pick = [&](const char* key, int exclude, int* out) -> const char* {
-      if (req.has_param(key)) {
-        const long v = std::strtol(req.get_param_value(key).c_str(), nullptr, 10);
-        if (v < 0 || v >= static_cast<long>(channels().total())) return range_msg.c_str();
-        *out = static_cast<int>(v);
-        return nullptr;
-      }
-      for (const unsigned ch : sounding) {
-        if (static_cast<int>(ch) != exclude) {
-          *out = static_cast<int>(ch);
-          return nullptr;
-        }
-      }
-      return "need two inputs with sound, or pass ch_a and ch_b";
+  // measures and unfreezes. A positive lag means the signal arrives later on ch_b. A measurement
+  // that finds nothing is a 200 with ok:false and a reason, never an empty summary to guess at.
+  svr.Get("/api/genie/sync", [this, input_info](const httplib::Request& req,
+                                                httplib::Response& res) {
+    // The snapshot was resumed or replaced (the console's Analyze/Resume, POST
+    // /api/capture/resume) while this call read it: its readings would mix two snapshots or none.
+    auto send_snapshot_lost = [](httplib::Response& r) {
+      send_error(r, 410, std::string(CaptureStore::kSnapshotLost) +
+                             " during the measurement (Analyze/Resume, or capture/freeze/resume): "
+                             "ask again");
     };
-    int a = 0, b = 0;
-    if (const char* e = pick("ch_a", -1, &a)) return send_error(res, 400, e);
-    if (const char* e = pick("ch_b", a, &b)) return send_error(res, 400, e);
+    // ---- Parameters -------------------------------------------------------------------------
+    const std::string mode = req.has_param("mode") ? req.get_param_value("mode") : "auto";
+    if (mode != "auto" && mode != "pings" && mode != "sliding")
+      return send_error(res, 400, "mode must be auto, pings or sliding");
+    const double rate = d_.engine.rate();
+    uint64_t win = sliding_default_window(rate), step = 0, since = 0;
+    if (!query_uint(req, "win", &win) || win < kSyncMinWindow || win > kXcorrMaxLen)
+      return send_error(res, 400, "win must be " + std::to_string(kSyncMinWindow) + ".." +
+                                      std::to_string(kXcorrMaxLen) + " samples");
+    step = win;
+    if (!query_uint(req, "step", &step) || step < 1)
+      return send_error(res, 400, "step must be a number of samples >= 1");
+    double min_conf = kSyncMinConfidence, since_ms_ago = -1.0;
+    if (!query_number(req, "min_confidence", &min_conf) || min_conf < 0)
+      return send_error(res, 400, "min_confidence must be a number >= 0");
+    if (req.has_param("since") && req.has_param("since_ms_ago"))
+      return send_error(res, 400, "since and since_ms_ago are two ways to say one thing: pass one");
+    if (!query_uint(req, "since", &since))
+      return send_error(res, 400, "since must be a sample index");
+    if (!query_number(req, "since_ms_ago", &since_ms_ago) ||
+        (req.has_param("since_ms_ago") && since_ms_ago < 0))
+      return send_error(res, 400, "since_ms_ago must be a number of ms >= 0");
 
+    // ---- The pair -----------------------------------------------------------------------------
+    const InputInfo info = input_info();
+    InputSelector run_sel;
+    if (!parse_selector(req, &run_sel, res)) return;
+    if (!run_sel.ch.empty() || run_sel.stream_index || run_sel.kind)
+      return send_error(res, 400,
+                        "genie/sync takes its pair as ch_a/ch_b, a/b or device/stream "
+                        "(not ch, stream_index or kind)");
+    const unsigned total = channels().total();
+    int a = -1, b = -1;
+    json resolved = nullptr;
+    if (run_sel.by_sender()) {
+      // device=/stream=: the left and right of that sender's run.
+      for (const char* k : {"ch_a", "ch_b", "a", "b"})
+        if (req.has_param(k))
+          return send_error(res, 400, std::string("device/stream measures the L/R of one sender: ") +
+                                          "pass it without " + k);
+      const InputSelection s = resolve_inputs(run_sel, info.layout, info.net);
+      if (!s.ok()) return send_selection_error(res, s);
+      const SelectedRun& run = s.runs.front();
+      if (run.inputs.size() < 2) {
+        return send_error(res, 400, "the sender on " + info.label(run.inputs.front()) +
+                                        " has one channel: pass a= and b= to pair it with another");
+      }
+      a = static_cast<int>(run.inputs[0]);
+      b = static_cast<int>(run.inputs[1]);
+      resolved = resolved_json(run_sel, s);
+    } else {
+      // Each side by ch_x (a column) or x (a column or a sender); both is a contradiction.
+      const std::string range_msg = sync_range_msg();
+      auto side = [&](const char* ch_key, const char* key, int* out) -> bool {
+        if (req.has_param(ch_key) && req.has_param(key)) {
+          send_error(res, 400, std::string(ch_key) + " and " + key + " name the same input: pass one");
+          return false;
+        }
+        if (req.has_param(ch_key)) {
+          uint64_t v = 0;
+          if (!query_uint(req, ch_key, &v) || v >= total) {
+            send_error(res, 400, range_msg);
+            return false;
+          }
+          *out = static_cast<int>(v);
+          return true;
+        }
+        if (!req.has_param(key)) return true;
+        InputSelector sel;
+        std::string err;
+        if (!parse_sync_side(req.get_param_value(key), total, &sel, &err)) {
+          send_error(res, 400, std::string(key) + ": " + err);
+          return false;
+        }
+        if (!sel.ch.empty()) {
+          *out = static_cast<int>(sel.ch.front());
+          return true;
+        }
+        InputSelection s = resolve_inputs(sel, info.layout, info.net);
+        if (!s.ok()) {
+          s.error = std::string(key) + ": " + s.error;
+          send_selection_error(res, s);
+          return false;
+        }
+        *out = static_cast<int>(s.inputs.front());
+        return true;
+      };
+      if (!side("ch_a", "a", &a) || !side("ch_b", "b", &b)) return;
+
+      // Default candidates: the inputs playing now first (genie/sound's `playing`), then the rest
+      // whose held peak reads sound — a ping every few seconds can fall between 100 ms windows,
+      // and an idle analog input's noise floor must not beat a real signal to ch_a.
+      const AnalysisSnapshot as = d_.analysis.snapshot();
+      std::vector<unsigned> sounding;
+      for (unsigned ch = 0; ch < total; ++ch) {
+        const ChannelMeters& m = as.meters[ch];
+        if (m.peak_now_db > kGenieSoundThresholdDb && m.rms_db > kGeniePlayingRmsDb)
+          sounding.push_back(ch);
+      }
+      for (unsigned ch = 0; ch < total; ++ch) {
+        if (as.meters[ch].peak_db > kGenieSoundThresholdDb &&
+            std::find(sounding.begin(), sounding.end(), ch) == sounding.end())
+          sounding.push_back(ch);
+      }
+      auto fill = [&](int* out, int other) {
+        for (const unsigned ch : sounding) {
+          if (*out >= 0) return;
+          if (static_cast<int>(ch) != other) *out = static_cast<int>(ch);
+        }
+      };
+      fill(&a, b);
+      fill(&b, a);
+      if (a < 0 || b < 0) return send_error(res, 400, "need two inputs with sound, or pass ch_a and ch_b");
+    }
+
+    // Who each side is: enough to report it by name without another call.
+    auto side_json = [&](unsigned c) {
+      const NetChannelStatus* n = info.net_status(c);
+      return json{{"ch", c},
+                  {"label", info.label(c)},
+                  {"name", info.name(c)},
+                  {"kind", info.kind(c)},
+                  {"device", n ? json(n->device) : json(nullptr)},
+                  {"stream", n ? json(n->stream) : json(nullptr)},
+                  {"stream_index", n ? json(n->stream_index) : json(nullptr)}};
+    };
+
+    // One sync at a time: a second call that joined the first's freeze would lose it when the
+    // first resumes. The console's Analyze/Resume can still replace the snapshot meanwhile;
+    // every read below is pinned to `cs`, and a measurement that lost it is a 410.
+    std::unique_lock<std::timed_mutex> serial(sync_m_, std::defer_lock);
+    if (!serial.try_lock_for(std::chrono::seconds(kSyncWaitS)))
+      return send_error(res, 429, "another genie/sync is still measuring: retry in a moment");
     // Keep an existing freeze; otherwise freeze for this call only.
     const CaptureStatus pre = d_.capture.status();
     const bool was_frozen = pre.frozen;
@@ -1516,18 +2688,23 @@ void WebServer::install_routes() {
     if (!cs.frozen) return send_error(res, 503, "not enough captured audio to freeze yet");
 
     const double c = 343.0;  // speed of sound, m/s
-    json out{{"ch_a", a}, {"ch_b", b}, {"frozen", was_frozen}};
+    json out{{"ch_a", a}, {"ch_b", b}, {"a", side_json(a)}, {"b", side_json(b)},
+             {"frozen", was_frozen}};
+    if (!resolved.is_null()) out["resolved"] = resolved;
 
     // Two cursors -> one window between them.
     if (req.has_param("cur_x") && req.has_param("cur_y")) {
       const uint64_t x = query_u64(req, "cur_x", 0), y = query_u64(req, "cur_y", 0);
       const uint64_t start = std::min(x, y), len = std::max(x, y) - std::min(x, y);
-      const XcorrResult r = d_.capture.xcorr(a, b, start, len);
+      const XcorrResult r = d_.capture.xcorr(a, b, start, len, cs.freeze_sample);
+      if (r.error == CaptureStore::kSnapshotLost) return send_snapshot_lost(res);
       if (!was_frozen) d_.capture.resume();
-      if (!r.ok) return send_error(res, 400, r.error);
-      out.update({{"start", start},
-                  {"len", len},
-                  {"lag_samples", r.lag_samples},
+      // A silent channel is a measurement that found nothing; a bad window is the caller's error.
+      if (!r.ok && r.error != "one of the channels is silent") return send_error(res, 400, r.error);
+      out.update({{"ok", r.ok}, {"reason", r.ok ? json(nullptr) : json(r.error)},
+                  {"start", start}, {"len", len}});
+      if (!r.ok) return send_json(res, out);
+      out.update({{"lag_samples", r.lag_samples},
                   {"lag_ms", r.lag_ms},
                   {"lag_m", r.lag_ms * c / 1000.0},
                   {"confidence", r.confidence},
@@ -1535,78 +2712,249 @@ void WebServer::install_routes() {
       return send_json(res, out);
     }
 
-    // No cursors -> every ping marker in the frozen buffer. Bracket each ping the way the console's
-    // Scope auto-measure does (app.js labelablePings): the window runs from this emission up to just
-    // before the next, so it holds exactly one ping *arrival* wherever the loopback delay lands it.
-    // A fixed window centred on the emission would miss the arrival once loopback exceeds it — the
-    // cause of the large bogus lags a narrow window reports.
-    const auto pings = d_.ctl.ping_log.recent();  // chronological (oldest -> newest)
-    const uint64_t interval =
-        static_cast<uint64_t>(std::llround(d_.ctl.ping.interval_s.load() * d_.engine.rate()));
     const uint64_t snap_end = cs.valid_start + cs.valid_len;
-    json meas = json::array();
-    std::vector<SyncMeasurement> good;
-    for (size_t i = 0; i < pings.size(); ++i) {
-      const uint64_t sample = pings[i].sample;
-      json e{{"center", sample}, {"variant", ping_name(static_cast<PingVariant>(pings[i].variant))}};
-      if (sample < cs.valid_start || sample >= snap_end) {
-        e["skipped"] = "outside buffer";
-        meas.push_back(e);
-        continue;
-      }
-      const uint64_t gap = (i + 1 < pings.size()) ? pings[i + 1].sample - sample : interval;
-      const uint64_t natural = std::min<uint64_t>(
-          std::max<uint64_t>(1024, gap > kPingWinGuard ? gap - kPingWinGuard : 1024), kXcorrMaxLen);
-      const uint64_t room = snap_end - sample;
-      if (room < std::min<uint64_t>(natural, kPingMinWindow)) {
-        e["skipped"] = "too near buffer end";
-        meas.push_back(e);
-        continue;
-      }
-      const uint64_t len = std::min(natural, room);
-      const XcorrResult r = d_.capture.xcorr(a, b, sample, len);
-      if (!r.ok) {
-        e["skipped"] = r.error;
-        meas.push_back(e);
-        continue;
-      }
-      e.update({{"start", sample},
-                {"len", len},
-                {"lag_samples", r.lag_samples},
-                {"lag_ms", r.lag_ms},
-                {"lag_m", r.lag_ms * c / 1000.0},
-                {"confidence", r.confidence},
-                {"peak", r.peak}});
-      // Below the peak floor the correlation is noise, not a captured arrival on this pair — flag
-      // it and keep it out of the summary (the console shows these as a dash).
-      if (r.peak < kPingMinPeak) {
-        e["no_arrival"] = true;
-      } else {
-        good.push_back({r.lag_samples, r.confidence});
-      }
-      meas.push_back(e);
+    const bool has_since = req.has_param("since") || req.has_param("since_ms_ago");
+    if (since_ms_ago >= 0) {
+      const uint64_t back = static_cast<uint64_t>(std::llround(since_ms_ago * rate / 1000.0));
+      since = snap_end > back ? snap_end - back : 0;
     }
+    const uint64_t begin = std::max(cs.valid_start, since);
+    const std::string after = has_since ? " after since" : "";
+
+    struct Run {
+      json meas = json::array();
+      std::vector<SyncMeasurement> good;
+      std::string reason;  // set when good is empty
+      size_t skipped = 0;  // measurements entries carrying `skipped`
+    };
+    size_t n_markers = 0, n_no_arrival = 0, n_windows = 0, n_quiet = 0;
+    const std::string pair_name = "ch " + std::to_string(a) + "/" + std::to_string(b);
+
+    // Whether anything plays the ping now: an engine output, or a channel of an enabled sink's
+    // layout, whose source is the ping generator. Its markers are logged either way, so without
+    // this a sync over music would blame "no_arrival" pings nobody was sent.
+    bool ping_routed = false;
+    for (unsigned o = 0; o < channels().outputs; ++o)
+      ping_routed |= routes_gen(d_.ctl.outputs[o], GenId::Ping);
+    for (unsigned k = 0; k < kMaxSinks; ++k) {
+      const SinkControl& sc = d_.ctl.sinks[k];
+      if (!sc.enabled.load(std::memory_order_relaxed)) continue;
+      const unsigned speakers = sink_layout_info(sink_layout(sc)).speakers;
+      for (unsigned c = 0; c < speakers; ++c) ping_routed |= routes_gen(sc.outputs[c], GenId::Ping);
+    }
+
+    // Every ping marker in the frozen buffer. Bracket each ping the way the console's Scope
+    // auto-measure does (app.js labelablePings): the window runs from this emission up to just
+    // before the next, so it holds exactly one ping *arrival* wherever the loopback delay lands
+    // it. A fixed window centred on the emission would miss the arrival once loopback exceeds it —
+    // the cause of the large bogus lags a narrow window reports.
+    auto run_pings = [&] {
+      Run p;
+      const auto pings = d_.ctl.ping_log.recent();  // chronological (oldest -> newest)
+      const uint64_t interval =
+          static_cast<uint64_t>(std::llround(d_.ctl.ping.interval_s.load() * rate));
+      for (size_t i = 0; i < pings.size(); ++i) {
+        const uint64_t sample = pings[i].sample;
+        json e{{"center", sample}, {"variant", ping_name(static_cast<PingVariant>(pings[i].variant))}};
+        auto skip = [&](const std::string& why) {
+          e["skipped"] = why;
+          ++p.skipped;
+          p.meas.push_back(e);
+        };
+        if (sample < cs.valid_start || sample >= snap_end) {
+          skip("outside buffer");
+          continue;
+        }
+        if (sample < begin) {
+          skip("before since");
+          continue;
+        }
+        ++n_markers;
+        const uint64_t gap = (i + 1 < pings.size()) ? pings[i + 1].sample - sample : interval;
+        const uint64_t natural = std::min<uint64_t>(
+            std::max<uint64_t>(1024, gap > kPingWinGuard ? gap - kPingWinGuard : 1024), kXcorrMaxLen);
+        const uint64_t room = snap_end - sample;
+        if (room < std::min<uint64_t>(natural, kPingMinWindow)) {
+          skip("too near buffer end");
+          continue;
+        }
+        const uint64_t len = std::min(natural, room);
+        const XcorrResult r = d_.capture.xcorr(a, b, sample, len, cs.freeze_sample);
+        if (!r.ok) {
+          skip(r.error);
+          continue;
+        }
+        e.update({{"start", sample},
+                  {"len", len},
+                  {"lag_samples", r.lag_samples},
+                  {"lag_ms", r.lag_ms},
+                  {"lag_m", r.lag_ms * c / 1000.0},
+                  {"confidence", r.confidence},
+                  {"peak", r.peak}});
+        // Below the peak floor the correlation is noise, not a captured arrival on this pair —
+        // flag it and keep it out of the summary (the console shows these as a dash).
+        if (r.peak < kPingMinPeak) {
+          e["no_arrival"] = true;
+          ++n_no_arrival;
+        } else {
+          p.good.push_back({r.lag_samples, r.confidence});
+        }
+        p.meas.push_back(e);
+      }
+      if (n_markers == 0) {
+        p.reason = "no ping markers in the snapshot" + after + " (ping generator off?)";
+      } else if (p.good.empty() && n_no_arrival == n_markers) {
+        p.reason = "all " + std::to_string(n_no_arrival) + " pings no_arrival on " + pair_name +
+                   (ping_routed ? ": check routing" : ": the ping is routed to no output or sink");
+      } else if (p.good.empty()) {
+        p.reason = "no ping arrived on " + pair_name + " (" + std::to_string(n_no_arrival) +
+                   " no_arrival, " + std::to_string(n_markers - n_no_arrival) +
+                   " skipped near the buffer end or refused)";
+      }
+      return p;
+    };
+
+    // Windows over the whole snapshot (from since): any content both channels carry, not only
+    // the tester's pings. A window with either channel quiet is skipped unmeasured; a measured one
+    // counts when its correlation is unambiguous (confidence) and real (peak).
+    auto run_sliding = [&] {
+      Run s;
+      const std::vector<uint64_t> starts =
+          sliding_window_starts(begin, snap_end, win, step, kSyncMaxWindows);
+      n_windows = starts.size();
+      size_t quiet_a = 0, quiet_b = 0;
+      for (const uint64_t start : starts) {
+        double ra = -120.0, rb = -120.0;
+        // False only when the snapshot went away (the windows lie inside it): never "quiet".
+        if (!d_.capture.rms_db(a, start, win, &ra, cs.freeze_sample) ||
+            !d_.capture.rms_db(b, start, win, &rb, cs.freeze_sample))
+          break;
+        if (ra < kSyncQuietDb) ++quiet_a;
+        if (rb < kSyncQuietDb) ++quiet_b;
+        if (ra < kSyncQuietDb || rb < kSyncQuietDb) {
+          ++n_quiet;
+          continue;
+        }
+        const XcorrResult r = d_.capture.xcorr(a, b, start, win, cs.freeze_sample);
+        if (!r.ok) {
+          ++s.skipped;
+          s.meas.push_back({{"start", start}, {"len", win}, {"skipped", r.error}});
+          continue;
+        }
+        const bool kept = r.confidence >= min_conf && r.peak >= kPingMinPeak;
+        s.meas.push_back({{"start", start},
+                          {"len", win},
+                          {"lag_samples", r.lag_samples},
+                          {"lag_ms", r.lag_ms},
+                          {"confidence", r.confidence},
+                          {"peak", r.peak},
+                          {"kept", kept}});
+        if (kept) s.good.push_back({r.lag_samples, r.confidence});
+      }
+      const size_t n = starts.size();
+      if (n == 0) {
+        s.reason = "snapshot" + after + " shorter than one window (" +
+                   std::to_string(snap_end > begin ? snap_end - begin : 0) + " < " +
+                   std::to_string(win) + " samples)";
+      } else if (n_quiet == n && quiet_a == n && quiet_b == n) {
+        s.reason = "both channels silent (RMS below " + std::to_string(int(kSyncQuietDb)) + " dB)";
+      } else if (n_quiet == n && (quiet_a == n || quiet_b == n)) {
+        s.reason = std::string(quiet_a == n ? "ch_a" : "ch_b") + " (" +
+                   info.label(quiet_a == n ? a : b) + ") silent (RMS below " +
+                   std::to_string(int(kSyncQuietDb)) + " dB)";
+      } else if (n_quiet == n) {
+        s.reason = "the two channels are never loud in the same window";
+      } else if (s.good.empty()) {
+        s.reason = "no window correlated with confidence >= " + json(min_conf).dump() +
+                   " (unrelated signals, or a steady tone)";
+      }
+      return s;
+    };
+
+    Run r;
+    std::string mode_used = mode;
+    if (mode == "pings") {
+      r = run_pings();
+    } else if (mode == "sliding") {
+      r = run_sliding();
+    } else {
+      r = run_pings();
+      mode_used = "pings";
+      // Ping markers are logged whether or not the ping is routed anywhere, and a 1 s window of
+      // music still "arrives" (peak) without a ping in it: only unambiguous readings count as the
+      // pair carrying the pings. Music correlates at confidence ~1.1 over a ping window; a ping
+      // reads hundreds; noise reads ~5 and is measured right either way.
+      const size_t clean = static_cast<size_t>(std::count_if(
+          r.good.begin(), r.good.end(), [&](const SyncMeasurement& m) { return m.confidence >= min_conf; }));
+      if (clean < kSyncAutoMinPings) {
+        Run s = run_sliding();
+        if (!s.good.empty() || clean == 0) {
+          // What the pings found, only when something plays them: a sync over music with the
+          // ping routed nowhere has its markers logged all the same, and "all N pings no_arrival"
+          // would send the caller to check a routing nobody asked for.
+          if (s.good.empty() && ping_routed) {
+            if (r.reason.empty())  // pings arrived, but none unambiguous
+              r.reason = std::to_string(r.good.size()) + " arrived on " + pair_name +
+                         ", none with confidence >= " + json(min_conf).dump();
+            s.reason += "; pings: " + r.reason;
+          }
+          r = std::move(s);
+          mode_used = "sliding";
+        } else {
+          // Sliding found nothing, 1-2 clean pings did: they are the answer, and only they.
+          r.good.erase(std::remove_if(r.good.begin(), r.good.end(),
+                                      [&](const SyncMeasurement& m) { return m.confidence < min_conf; }),
+                       r.good.end());
+        }
+      }
+    }
+    // Pinned reads fail only once the snapshot is no longer `cs`, and it never comes back: so
+    // this one check says whether every reading above came from it.
+    const CaptureStatus post = d_.capture.status();
+    if (!post.frozen || post.freeze_sample != cs.freeze_sample) return send_snapshot_lost(res);
     if (!was_frozen) d_.capture.resume();
 
-    const SyncSummary sum = summarize_sync(good);
+    const bool ok = !r.good.empty();
+    const SyncSummary sum = summarize_sync(r.good);
     json summary{{"n", sum.n}};
-    if (sum.n > 0) {
-      const double lag_ms = 1000.0 * sum.lag_samples_median / d_.engine.rate();
+    bool trusted = false;
+    if (ok) {
+      const double ms = 1000.0 / rate;
       summary.update({{"lag_samples_median", sum.lag_samples_median},
-                      {"lag_ms_median", lag_ms},
-                      {"lag_m_median", lag_ms * c / 1000.0},
+                      {"lag_ms_median", sum.lag_samples_median * ms},
+                      {"lag_m_median", sum.lag_samples_median * ms * c / 1000.0},
                       {"lag_samples_min", sum.lag_samples_min},
                       {"lag_samples_max", sum.lag_samples_max},
                       {"lag_samples_spread", sum.lag_samples_spread},
-                      {"confidence_median", sum.confidence_median}});
+                      {"lag_samples_mad", sum.lag_samples_mad},
+                      {"lag_ms_mad", sum.lag_samples_mad * ms},
+                      {"lag_ms_stdev", sum.lag_samples_stdev * ms},
+                      {"lag_ms_p10", sum.lag_samples_p10 * ms},
+                      {"lag_ms_p90", sum.lag_samples_p90 * ms},
+                      {"confidence_median", sum.confidence_median},
+                      {"bimodal", sum.bimodal}});
+      trusted = mode_used == "pings" ? sync_trusted_pings(sum) : sync_trusted_sliding(sum, rate, win);
     }
-    out.update({{"snapshot",
+    out.update({{"ok", ok},
+                {"reason", ok ? json(nullptr) : json(r.reason)},
+                {"mode", mode},
+                {"mode_used", mode_used},
+                {"trusted", trusted},
+                {"n_markers", n_markers},
+                {"n_skipped", r.skipped},
+                {"n_no_arrival", n_no_arrival},
+                {"n_windows", n_windows},
+                {"n_quiet", n_quiet},
+                {"snapshot",
                  {{"freeze_sample", cs.freeze_sample},
                   {"valid_start", cs.valid_start},
                   {"valid_len", cs.valid_len},
                   {"generation", cs.generation}}},
-                {"measurements", meas},
+                {"measurements", r.meas},
                 {"summary", summary}});
+    if (has_since) out["since"] = since;
+    if (mode_used == "sliding")
+      out.update({{"win", win}, {"step", step}, {"min_confidence", min_conf}});
     send_json(res, out);
   });
 

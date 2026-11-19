@@ -35,7 +35,7 @@ AudioEngine::AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt, Cloc
       clock_(clock),
       own_backend_(make_backend(ctl, opt_, clock)),
       backend_(own_backend_.get()),
-      core_(ctl, ring, clock, opt_.rate, generation_) {}
+      core_(ctl, ring, clock, opt_.rate, generation_, generation_at_) {}
 
 AudioEngine::AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt, AudioBackend& backend,
                          Clock& clock)
@@ -43,7 +43,7 @@ AudioEngine::AudioEngine(Control& ctl, RingBuffer& ring, EngineOptions opt, Audi
       opt_(opt),
       clock_(clock),
       backend_(&backend),
-      core_(ctl, ring, clock, opt_.rate, generation_) {}
+      core_(ctl, ring, clock, opt_.rate, generation_, generation_at_) {}
 
 AudioEngine::~AudioEngine() { stop(); }
 
@@ -61,6 +61,7 @@ EngineStats AudioEngine::stats() const {
   s.format = opt_.timer() ? backend_->shape().format : "S32_LE";
   s.xruns = xruns_.load();
   s.generation = generation_.load();
+  s.generation_at = generation_at_.load();
   s.samples = ring_.counter();
   s.last_error = error();
   return s;
@@ -68,6 +69,7 @@ EngineStats AudioEngine::stats() const {
 
 bool AudioEngine::recover(int err) {
   xruns_.fetch_add(1);
+  generation_at_.store(ring_.counter());
   generation_.fetch_add(1);
   LOG_WARN("xrun/recover: {} (total {})", backend_strerror(err), xruns_.load());
   return backend_->recover(err);

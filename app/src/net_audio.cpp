@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -165,7 +166,17 @@ struct NetAudioServer::Channel {
   std::atomic<uint64_t> late_drops{0};
   std::atomic<uint64_t> range_drops{0};
   std::atomic<uint64_t> underruns{0};
+  std::atomic<uint64_t> underrun_events{0};
   std::atomic<uint64_t> resyncs{0};
+  std::atomic<uint64_t> connects{0};
+  std::atomic<int64_t> connected_unix_ms{0};
+  // The first channel of the run this one belongs to, for the audio thread: it judges an underrun
+  // once per run, on that channel, so the members of a stereo pair never disagree. Set by the claim
+  // (took()), and back to the channel's own index while unclaimed, so the moment between a claim's
+  // CAS and took() judges the channel on its own (no packet yet: no underrun).
+  std::atomic<unsigned> run_base{0};
+  // The audio thread's own: whether the last block was an underrun, for counting where one starts.
+  bool under_prev = false;
   std::atomic<uint64_t> last_target{0};
   // The filtered lead the converter's ratio is steered by, which is also the honest thing to
   // report: a raw per-interval maximum reads about one audio block pessimistic.
@@ -229,7 +240,10 @@ NetAudioServer::NetAudioServer(Control& ctl, double rate, unsigned period, Clock
   const size_t frames = timeline_frames(rate);
   const unsigned n = st::channels().net;
   chans_.reserve(n);
-  for (unsigned c = 0; c < n; ++c) chans_.push_back(std::make_unique<Channel>(frames));
+  for (unsigned c = 0; c < n; ++c) {
+    chans_.push_back(std::make_unique<Channel>(frames));
+    chans_[c]->run_base.store(c);  // an unclaimed channel is its own run (see run_base)
+  }
   LOG_INFO("net: {} channels, {} frame timelines ({:.1f} s each)", n, frames, frames / rate);
 }
 
@@ -357,6 +371,15 @@ int NetAudioServer::claim_channels(unsigned want, const std::string& ip, unsigne
       c.instance = instance;
       c.holder_fd = holder_fd;
       c.pin = pin;
+    }
+    const int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+    for (unsigned i = 0; i < count; ++i) {
+      Channel& c = *chans_[b + i];
+      c.run_base.store(b, std::memory_order_relaxed);
+      c.connects.fetch_add(1, std::memory_order_relaxed);
+      c.connected_unix_ms.store(unix_ms, std::memory_order_relaxed);
     }
     return static_cast<int>(b);
   };
@@ -527,6 +550,11 @@ void NetAudioServer::release_channels(unsigned base, unsigned count) {
     }
     c.src_rate.store(0);
     c.last_audio_ns.store(0);
+    c.connected_unix_ms.store(0);
+    // Its own run again before the claim goes: the next claim's CAS publishes `claimed` before
+    // took() stores the new base, and meanwhile the audio thread must not copy another run's
+    // verdict onto it.
+    c.run_base.store(base + i, std::memory_order_relaxed);
     c.claimed.store(false);
   }
 }
@@ -563,6 +591,7 @@ void NetAudioServer::accept_loop() {
     pfds.reserve(listen_fds_.size());
     for (int lfd : listen_fds_) pfds.push_back(pollfd{lfd, POLLIN, 0});
     const int pr = poll(pfds.data(), pfds.size(), 250);
+    mark_rates();  // the frames_per_s cadence: see RateMeter
     if (pr <= 0) continue;
 
     size_t which = pfds.size();
@@ -1103,6 +1132,9 @@ void NetAudioServer::read_block(uint64_t n, size_t frames, uint64_t delay, float
   // Publish the PLAYOUT position, not the trailing one: a packet is late once its slot has gone
   // past the point where it would have been emitted, whatever the ring is still catching up on.
   reader_n_.store(n, std::memory_order_release);
+  // Once per block: whether a run is streaming decides whether running dry is an underrun.
+  const uint64_t now_ns = clock_.now_ns();
+  std::array<bool, kMaxInputs> under{};  // this block's verdict, per channel
 
   for (unsigned c = 0; c < count(); ++c) {
     Channel& ch = *chans_[c];
@@ -1110,18 +1142,33 @@ void NetAudioServer::read_block(uint64_t n, size_t frames, uint64_t delay, float
     float* rp = ring + (st::channels().net_base() + c);
 
     if (!ch.claimed.load(std::memory_order_relaxed)) {
+      ch.under_prev = false;
       for (size_t i = 0; i < frames; ++i) lp[i * st::channels().total()] = 0.0f;
       if (ring != live)
         for (size_t i = 0; i < frames; ++i) rp[i * st::channels().total()] = 0.0f;
       continue;
     }
 
-    // Only once the sender has actually supplied something: the gap between claiming a channel
-    // and the first packet landing is the playout lead working as intended, not an underrun.
-    const uint64_t end = ch.timeline.write_end();
-    if (end != 0 && n + frames > end) {
-      ch.underruns.fetch_add(1, std::memory_order_relaxed);
+    // Judged once per run, on its first channel, and copied to the rest: the sender's write lands
+    // in the run's timelines one after the other, and judging each against its own write_end let
+    // this block catch L written and R not yet. A run's first channel comes before its members.
+    const unsigned base = ch.run_base.load(std::memory_order_relaxed);
+    if (base < c) {
+      under[c] = under[base];
+    } else {
+      // Only once the sender has actually supplied something (the gap between the claim and the
+      // first packet landing is the playout lead working as intended), and only while it is
+      // streaming: a sender that pauses or keeps its PCM open and silent runs dry by design.
+      const uint64_t end = ch.timeline.write_end();
+      const uint64_t heard = ch.last_audio_ns.load(std::memory_order_relaxed);
+      const bool streaming = heard != 0 && (heard >= now_ns || now_ns - heard < kNetStreamingNs);
+      under[c] = streaming && end != 0 && n + frames > end;
     }
+    if (under[c]) {
+      ch.underruns.fetch_add(1, std::memory_order_relaxed);
+      if (!ch.under_prev) ch.underrun_events.fetch_add(1, std::memory_order_relaxed);
+    }
+    ch.under_prev = under[c];
 
     // The live read must come first and must not clear, or the trailing read would find the
     // frames already gone.
@@ -1288,6 +1335,8 @@ bool NetAudioServer::forget_channel(unsigned c) {
   ch.late_drops.store(0);
   ch.range_drops.store(0);
   ch.underruns.store(0);
+  ch.underrun_events.store(0);
+  ch.connects.store(0);
   ch.resyncs.store(0);
   ch.last_target.store(0);
   ch.lead_avg.store(0);
@@ -1312,9 +1361,20 @@ bool NetAudioServer::forget_channel(unsigned c) {
   return true;
 }
 
+void NetAudioServer::mark_rates() const {
+  // The clock is read under the lock: two markers (the accept loop, a status() reader) must mark
+  // in time order, or the later-locking one's older mark would read as a counter reset.
+  std::lock_guard<std::mutex> lock(rate_m_);
+  const uint64_t now = clock_.now_ns();
+  rates_.resize(count());
+  for (unsigned c = 0; c < count(); ++c)
+    rates_[c].mark(now, chans_[c]->frames_received.load(std::memory_order_relaxed));
+}
+
 std::vector<NetChannelStatus> NetAudioServer::status() const {
   std::vector<NetChannelStatus> out;
   out.reserve(count());
+  mark_rates();
   const uint64_t now = clock_.now_ns();
   for (unsigned c = 0; c < count(); ++c) {
     const Channel& ch = *chans_[c];
@@ -1325,7 +1385,9 @@ std::vector<NetChannelStatus> NetAudioServer::status() const {
     s.late_drops = ch.late_drops.load();
     s.range_drops = ch.range_drops.load();
     s.underruns = ch.underruns.load();
+    s.underrun_events = ch.underrun_events.load();
     s.resyncs = ch.resyncs.load();
+    s.connects = ch.connects.load();
     s.last_target = ch.last_target.load();
     s.write_end = ch.timeline.write_end();
     s.lead_frames = ch.lead_avg.load();
@@ -1334,7 +1396,17 @@ std::vector<NetChannelStatus> NetAudioServer::status() const {
     s.peak = ch.peak_milli.load() / 1000.0f;
     s.rate = ch.src_rate.load();
     const uint64_t heard = ch.last_audio_ns.load();
-    const bool streaming = s.connected && heard != 0 && now - heard < kNetStreamingNs;
+    // A packet after `now` was read (heard > now) is as live as it gets, not 584 years old.
+    const bool streaming =
+        s.connected && heard != 0 && (heard >= now || now - heard < kNetStreamingNs);
+    if (s.connected) {
+      s.connected_since_unix_ms = ch.connected_unix_ms.load();
+      if (heard != 0) s.last_audio_ms_ago = heard >= now ? 0 : (now - heard) / 1000000ull;
+    }
+    {
+      std::lock_guard<std::mutex> lock(rate_m_);
+      s.frames_per_s = rates_[c].per_second(now, s.frames_received);
+    }
     {
       std::lock_guard<std::mutex> lock(ch.m);
       s.format = ch.format;

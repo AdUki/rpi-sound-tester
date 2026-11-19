@@ -50,12 +50,14 @@ void feed_sink(const SinkFeed& f, const OutputControl* outs, uint64_t n, size_t 
 }  // namespace
 
 EngineCore::EngineCore(Control& ctl, RingBuffer& ring, Clock& clock, unsigned rate,
-                       std::atomic<uint32_t>& generation)
+                       std::atomic<uint32_t>& generation,
+                       std::atomic<uint64_t>& generation_at)
     : ctl_(ctl),
       ring_(ring),
       clock_(clock),
       rate_(rate),
       generation_(generation),
+      generation_at_(generation_at),
       device_delay_(static_cast<unsigned>(1ull * kDeviceInputDelayMs * rate / 1000)) {}
 
 void EngineCore::set_input_timeline(unsigned column, NetTimeline* timeline) {
@@ -243,6 +245,7 @@ unsigned EngineCore::sync_capture_delay(bool device_inputs) {
     std::fill(cap_delay_.begin(), cap_delay_.end(), 0.0f);
     cap_delay_pos_ = 0;
     cap_delay_frames_ = want;
+    generation_at_.store(ring_.counter());
     generation_.fetch_add(1);
     ctl_.capture_delay.store(want, std::memory_order_relaxed);
     LOG_INFO("capture delay now {} frames ({:.0f} ms)", want, 1000.0 * want / rate_);

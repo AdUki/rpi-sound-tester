@@ -7,12 +7,14 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "constants.h"
 #include "control.h"
+#include "net_rate.h"
 #include "util/asrc.h"
 #include "util/clock.h"
 #include "vorbis_decode.h"
@@ -94,7 +96,12 @@ struct NetChannelStatus {
   uint64_t frames_received = 0;
   uint64_t late_drops = 0;
   uint64_t range_drops = 0;
+  // Engine blocks (engine.period frames each) in which playout ran past the end of what the
+  // sender had supplied while its run was streaming (audio within kNetStreamingNs), and how many
+  // separate times that started. Decided once per run per block, so every member of a run reads
+  // the same. A sender that stops (pause, close) adds nothing.
   uint64_t underruns = 0;
+  uint64_t underrun_events = 0;
   uint64_t resyncs = 0;
   uint64_t last_target = 0;
   uint64_t write_end = 0;
@@ -103,7 +110,19 @@ struct NetChannelStatus {
   int64_t lead_frames = 0;
   bool lead_valid = false;
   uint64_t target_lead_frames = 0;
+  // Linear max of |sample| since the channel was last claimed, measured as packets arrive (a
+  // delay ahead of playout) after the converter, so it can exceed 1.0. Not a level meter.
   float peak = 0.0f;
+  // Claims of this channel since the daemon started (or the channel was forgotten), and the wall
+  // clock of the current one (0: none).
+  uint64_t connects = 0;
+  int64_t connected_since_unix_ms = 0;
+  // How long ago audio last arrived on the current connection, in ms; empty before any has, or
+  // with no sender on the channel.
+  std::optional<uint64_t> last_audio_ms_ago;
+  // frames_received per second (engine-rate frames, after the converter) over the last >= 1 s;
+  // empty until the channel has been watched that long.
+  std::optional<double> frames_per_s;
 };
 
 // Accepts connections from the soundtester ALSA plugin and turns them into input channels.
@@ -324,6 +343,10 @@ class NetAudioServer {
 
   std::vector<std::unique_ptr<Channel>> chans_;
   std::atomic<uint64_t> reader_n_{0};
+  // frames_received rate per channel, marked by status() and by the accept loop's 250 ms wake.
+  mutable std::mutex rate_m_;
+  mutable std::vector<RateMeter> rates_;
+  void mark_rates() const;
   // Counts releases, so a free channel can say how long ago it was let go.
   std::atomic<uint64_t> release_seq_{0};
   // Instance ids of live streams whose run a newer open of the same machine and stream took over,

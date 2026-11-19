@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <new>
@@ -31,6 +32,35 @@ std::string mb_str(size_t floats) {
   char buf[32];
   snprintf(buf, sizeof(buf), "%.0f", mb);
   return buf;
+}
+
+// Fills cum[i] with the energy of x[0, i), for i = 0..len.
+void running_energy(const float* x, size_t len, std::vector<double>& cum) {
+  cum.resize(len + 1);
+  cum[0] = 0.0;
+  for (size_t i = 0; i < len; ++i) cum[i + 1] = cum[i] + static_cast<double>(x[i]) * x[i];
+}
+
+// Whether a signal's short-term level climbs out of a quieter stretch earlier in the window: any
+// block more than kXcorrOnsetRiseDb above the quietest block before it. `cum` is its running
+// energy (running_energy). A block is one period of the window's dominant partial (`period`, in
+// samples) or longer — any periodic signal's energy over a block that long varies by at most
+// 3 dB wherever it starts, so a steady tone, however rich in harmonics, never reads as one — and
+// blocks step by a quarter of that, so an onset is seen once a period of quieter signal precedes
+// it.
+bool has_onset(const std::vector<double>& cum, double period) {
+  const size_t len = cum.size() - 1;
+  const size_t block = std::max<size_t>(32, static_cast<size_t>(std::ceil(period)));
+  if (len < 2 * block) return false;
+  const size_t hop = block / 4;
+  const double rise = std::pow(10.0, kXcorrOnsetRiseDb / 10.0);
+  double quietest = cum[block];
+  for (size_t b = hop; b + block <= len; b += hop) {
+    const double e = cum[b + block] - cum[b];
+    if (e > rise * quietest) return true;
+    quietest = std::min(quietest, e);
+  }
+  return false;
 }
 
 }  // namespace
@@ -221,26 +251,36 @@ std::string CaptureStore::frozen_range_error() const {
 WindowResult CaptureStore::window(unsigned ch, uint64_t start, uint64_t len, unsigned cols) const {
   WindowResult r;
   if (ch >= st::channels().total()) {
-    r.error = "channel out of range";
+    r.error = "ch must be 0.." + std::to_string(st::channels().total() - 1);
     return r;
   }
-  if (len == 0 || len > ring_.frames()) {
-    r.error = "len out of range";
+  if (len == 0 || len > ring_.span()) {
+    r.error = "len must be 1.." + std::to_string(ring_.span()) + " (the ring)";
     return r;
   }
-  cols = std::clamp(cols, 1u, 2048u);
+  // Refused rather than clamped: a caller asking for 4096 columns to get 8192 raw samples would
+  // otherwise get min/max pairs back and read them as samples.
+  if (cols == 0 || cols > kWindowMaxCols) {
+    r.error = "cols must be 1.." + std::to_string(kWindowMaxCols) +
+              " (raw needs len <= 2 x cols, so at most " + std::to_string(2 * kWindowMaxCols) +
+              " samples per call)";
+    return r;
+  }
+  // Which span was asked for, in front of the span there is: the error says both.
+  const std::string asked =
+      "[" + std::to_string(start) + ", " + std::to_string(start + len) + ") is ";
 
   std::vector<float> buf(static_cast<size_t>(len));
   {
     std::lock_guard<std::mutex> lock(m_);
     if (status_.frozen) {
       if (!snapshot_read(ch, start, len, buf.data())) {
-        r.error = frozen_range_error();
+        r.error = asked + frozen_range_error();
         return r;
       }
     } else if (!ring_.read_channel(start, static_cast<size_t>(len), ch, buf.data())) {
       const uint64_t now = ring_.counter();
-      r.error = "outside the live ring [" + std::to_string(ring_.oldest(now)) + ", " +
+      r.error = asked + "outside the live ring [" + std::to_string(ring_.oldest(now)) + ", " +
                 std::to_string(now) + ")";
       return r;
     }
@@ -249,6 +289,7 @@ WindowResult CaptureStore::window(unsigned ch, uint64_t start, uint64_t len, uns
   r.ok = true;
   r.start = start;
   r.len = len;
+  r.cols = cols;
 
   if (len <= 2ull * cols) {
     r.raw = true;
@@ -272,7 +313,41 @@ WindowResult CaptureStore::window(unsigned ch, uint64_t start, uint64_t len, uns
   return r;
 }
 
-XcorrResult CaptureStore::xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, uint64_t len) {
+bool CaptureStore::snapshot_frames(uint64_t freeze_sample, uint64_t start, uint64_t len,
+                                   float* out) const {
+  std::lock_guard<std::mutex> lock(m_);
+  if (!status_.frozen || status_.freeze_sample != freeze_sample || len == 0) return false;
+  if (start < status_.valid_start) return false;
+  const uint64_t off = start - status_.valid_start;
+  if (len > status_.valid_len || off > status_.valid_len - len) return false;
+  const size_t stride = st::channels().total();
+  std::memcpy(out, snap_.data() + off * stride, static_cast<size_t>(len) * stride * sizeof(float));
+  return true;
+}
+
+bool CaptureStore::rms_db(unsigned ch, uint64_t start, uint64_t len, double* out,
+                          uint64_t freeze_sample) const {
+  if (len == 0) return false;
+  std::lock_guard<std::mutex> lock(m_);
+  if (!status_.frozen || ch >= st::channels().total() || start < status_.valid_start) return false;
+  if (freeze_sample != 0 && status_.freeze_sample != freeze_sample) return false;
+  const uint64_t off = start - status_.valid_start;
+  if (len > status_.valid_len || off > status_.valid_len - len) return false;
+  const size_t stride = st::channels().total();
+  const float* p = snap_.data() + off * stride + ch;
+  double sum = 0.0, sq = 0.0;
+  for (uint64_t i = 0; i < len; ++i, p += stride) {
+    sum += *p;
+    sq += static_cast<double>(*p) * *p;
+  }
+  const double n = static_cast<double>(len);
+  const double var = std::max(0.0, sq / n - (sum / n) * (sum / n));
+  *out = var > 1e-12 ? std::max(-120.0, 10.0 * std::log10(var)) : -120.0;
+  return true;
+}
+
+XcorrResult CaptureStore::xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, uint64_t len,
+                                uint64_t freeze_sample) {
   XcorrResult r;
   if (ch_a >= st::channels().total() || ch_b >= st::channels().total()) {
     r.error = "channel out of range";
@@ -304,7 +379,11 @@ XcorrResult CaptureStore::xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, ui
   {
     std::lock_guard<std::mutex> lock(m_);
     if (!status_.frozen) {
-      r.error = "freeze the capture first";
+      r.error = freeze_sample != 0 ? kSnapshotLost : "freeze the capture first";
+      return r;
+    }
+    if (freeze_sample != 0 && status_.freeze_sample != freeze_sample) {
+      r.error = kSnapshotLost;
       return r;
     }
     if (!snapshot_read(ch_a, start, len, fa_.data()) ||
@@ -409,18 +488,86 @@ XcorrResult CaptureStore::xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, ui
   for (size_t k = 2; k < ca_.size(); ++k) {
     if (std::abs(ca_[k]) > std::abs(ca_[k_dom])) k_dom = k;
   }
-  const int64_t exclude =
-      static_cast<int64_t>(1.5 * static_cast<double>(n) / static_cast<double>(k_dom));
+  const double period = static_cast<double>(n) / static_cast<double>(k_dom);
+  const int64_t exclude = static_cast<int64_t>(1.5 * period);
+  // A steady tone's crests need a correction first: the zero-padded (linear) correlation at
+  // lag m sums only len - |m| products, so even a steady tone's crests fall off with |m| — in a
+  // short window (genie/sync's sliding 16384) by more than the 1.5 % this test allows. Each crest
+  // is therefore divided by the energy it overlaps (per_overlap, below). That is applied only to
+  // a window that is TONAL: one harmonic series carries nearly all of the cross-spectrum
+  // magnitude — the dominant partial and its multiples. A sine puts ~0.975 there, a square wave,
+  // a clipped sine or a sine + 30 % third 0.94-0.98; white noise < 0.1, pink < 0.65. Counting
+  // the harmonics is what catches the harmonic-rich tones: their fundamental alone holds only
+  // 0.79-0.90, and genie/sync trusted their lag a cycle off. Elsewhere the uncorrected test is
+  // the right one (music's and a ping's crests do decay off the true lag). The simulator's music,
+  // held synth notes with a second harmonic over a bass, peaks at ~0.95: the windows over 0.93
+  // are a held melody note whose period divides the bass note's (D5 over G2, C5 over C3), and
+  // their correlation does repeat every bass period (10.2 / 7.6 ms) to within 0.3 % — genuinely
+  // ambiguous; the uncorrected test only picked the true lag because it was the nearer to 0.
+  // The partial's own band is +-4 frequency-resolution bins (n / len FFT bins each: its main
+  // lobe and near side lobes), each harmonic's +-2. Harmonics are counted only while their teeth
+  // leave a third of the bins out; for a lower partial the comb would cover (nearly) everything
+  // and pass any spectrum, so the partial alone counts.
+  float spec_total = 0.0f, spec_comb = 0.0f;
+  const size_t dom_radius = std::max<size_t>(2, 4 * n / static_cast<size_t>(len));
+  const size_t harm_radius = std::max<size_t>(1, 2 * n / static_cast<size_t>(len));
+  const bool comb = 2 * k_dom >= 3 * (2 * harm_radius + 1);
+  for (size_t k = 1; k < ca_.size(); ++k) {
+    const float a = std::abs(ca_[k]);
+    spec_total += a;
+    const size_t h = comb ? std::max<size_t>(1, (k + k_dom / 2) / k_dom) : 1;
+    const size_t c = h * k_dom;
+    const size_t radius = h == 1 ? dom_radius : harm_radius;
+    if (k + radius >= c && k <= c + radius) spec_comb += a;
+  }
+  const bool tonal_spectrum = spec_total > 0.0f && spec_comb > kXcorrTonalShare * spec_total;
+  bool tonal = false;
+  if (tonal_spectrum) {
+    running_energy(fa_.data(), len, cum_a_);
+    running_energy(fb_.data(), len, cum_b_);
+    tonal = !(has_onset(cum_a_, period) && has_onset(cum_b_, period));
+  }
+  // The overlap at lag m pairs a[t] with b[t + m]: a's [max(0, -m), len - max(0, m)) with b's
+  // [max(0, m), len - max(0, -m)). Dividing by the geometric mean of the two stretches' energy
+  // is dividing by len - |m| for a steady level, and also right for a level that moves:
+  // - A window that opens mid ring-out (bong, bing) has nothing to pin the cycle, but its decay
+  //   leaves the crests off the true lag a percent or two short of it per overlap sample; per
+  //   unit energy they are level (an exponential is self-similar), so it reads unresolved
+  //   instead of a cycle off at confidence 999.
+  // - A burst whose onset is in the window keeps its lag: a crest a cycle off pairs the loudest
+  //   first cycle with the silence before it on the other channel, and loses that energy.
+  // An onset on both channels (has_onset) skips the correction altogether, as a guard: the
+  // attack pins the lag, and the uncorrected test reads it (it keeps a few more of the music's
+  // windows with a note attack in them measurable).
+  const int64_t slen = static_cast<int64_t>(len);
+  const auto per_overlap = [this, slen, tonal](float v, int64_t m) {
+    if (!tonal) return v;
+    const int64_t lo = std::max<int64_t>(0, m), hi = std::max<int64_t>(0, -m);
+    const double ea = cum_a_[slen - lo] - cum_a_[hi];
+    const double eb = cum_b_[slen - hi] - cum_b_[lo];
+    const double norm = std::sqrt(ea * eb);
+    return norm > 0.0 ? static_cast<float>(v / norm) : 0.0f;
+  };
   float far_crest = 0.0f;
   for (int64_t m = lobe_lo; m <= lobe_hi; ++m) {
     if (std::llabs(m - best) <= exclude) continue;
     const float v = std::fabs(corr_[wrap(m)]);
-    if (v > far_crest && v >= std::fabs(corr_[wrap(m - 1)]) &&
-        v >= std::fabs(corr_[wrap(m + 1)])) {
-      far_crest = v;
-    }
+    if (v >= std::fabs(corr_[wrap(m - 1)]) && v >= std::fabs(corr_[wrap(m + 1)]))
+      far_crest = std::max(far_crest, per_overlap(v, m));
   }
-  const bool cycle_unresolved = far_crest > 0.985f * best_v;
+  const float best_crest = per_overlap(best_v, best);
+  // A tone so low that the half-height lobe cannot hold a crest past the exclusion (two periods
+  // beyond half its width) leaves the crest test nothing to compare: unresolved by definition —
+  // provided the lobe does oscillate (the correlation changes sign in it): a slow drift whose
+  // spectrum merely piles up in the lowest bins correlates as one smooth hump, no carrier.
+  bool too_low = tonal && 2.0 * period > static_cast<double>(lobe_hi - lobe_lo) / 2.0;
+  if (too_low) {
+    bool crosses = false;
+    for (int64_t m = lobe_lo; m < lobe_hi && !crosses; ++m)
+      crosses = (corr_[wrap(m)] < 0.0f) != (corr_[wrap(m + 1)] < 0.0f);
+    too_low = crosses;
+  }
+  const bool cycle_unresolved = too_low || far_crest > 0.985f * best_crest;
 
   // Confidence: the envelope peak against the tallest genuinely separate rival lobe. A
   // rival must rise out of a real dip — walking outward from the peak, a sample only
@@ -443,9 +590,11 @@ XcorrResult CaptureStore::xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, ui
   r.lag_ms = 1000.0 * static_cast<double>(best) / rate_;
   r.peak = best_v / std::sqrt(ea * eb);
   r.confidence = second > 0.0f ? env_best / second : 999.0;
-  if (cycle_unresolved) {
+  if (too_low) {
+    r.confidence = std::min(r.confidence, 1.0);
+  } else if (cycle_unresolved) {
     r.confidence =
-        std::min(r.confidence, static_cast<double>(best_v) / static_cast<double>(far_crest));
+        std::min(r.confidence, static_cast<double>(best_crest) / static_cast<double>(far_crest));
   }
   r.confidence = std::min(r.confidence, 999.0);
   return r;

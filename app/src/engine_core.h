@@ -24,9 +24,10 @@ class NetTimeline;
 class EngineCore {
  public:
   // `generation` is the engine's discontinuity counter, bumped here when the capture axis moves,
-  // just as an xrun bumps it. `clock` stamps the anchor each block publishes.
+  // just as an xrun bumps it, storing first in `generation_at` the ring sample it moved at.
+  // `clock` stamps the anchor each block publishes.
   EngineCore(Control& ctl, RingBuffer& ring, Clock& clock, unsigned rate,
-             std::atomic<uint32_t>& generation);
+             std::atomic<uint32_t>& generation, std::atomic<uint64_t>& generation_at);
 
   // Wired in by main() before the engine starts: the core reads its network channels each block.
   void set_net(NetAudioServer* net) { net_.store(net, std::memory_order_relaxed); }
@@ -77,6 +78,7 @@ class EngineCore {
   Clock& clock_;
   const unsigned rate_;
   std::atomic<uint32_t>& generation_;
+  std::atomic<uint64_t>& generation_at_;
   Generators gen_;
 
   uint64_t identify_frames_ = 0;

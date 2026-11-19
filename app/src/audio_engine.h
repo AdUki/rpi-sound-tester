@@ -29,6 +29,9 @@ struct EngineStats {
   std::string format;
   uint64_t xruns = 0;
   uint32_t generation = 0;
+  // The ring sample at which `generation` last moved (0 before it ever has): the seam is just
+  // before it, so a span of the ring holds a seam iff it starts before this and ends at or after.
+  uint64_t generation_at = 0;
   uint64_t samples = 0;
   std::string last_error;
 };
@@ -109,6 +112,7 @@ class AudioEngine {
   std::atomic<bool> streaming_{false};  // true only while audio is actually flowing
   std::atomic<uint64_t> xruns_{0};
   std::atomic<uint32_t> generation_{0};
+  std::atomic<uint64_t> generation_at_{0};  // EngineStats::generation_at
   // Written by the audio thread (channel fallback, period renegotiation), read by stats().
   std::atomic<unsigned> cap_ch_{0};
   std::atomic<unsigned> period_{0};

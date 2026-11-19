@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -35,6 +36,10 @@ struct WebOptions {
   // The most network inputs a restart may be asked for: what the ring's columns and this
   // machine's RAM leave room for.
   unsigned net_inputs_max = kMaxInputs;
+  // What GET /api/state reports as `version`: the build's `git describe` and UTC build time,
+  // from the generated build_info (main.cpp). "unknown" where the build could not tell.
+  std::string version_git = "unknown";
+  std::string build_time = "unknown";
 };
 
 struct Deps {
@@ -68,6 +73,8 @@ class WebServer {
 
   Deps d_;
   WebOptions opt_;
+  // For daemon_uptime_s: the server is built once, at startup.
+  const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
 
   std::unique_ptr<httplib::Server> svr_;
   WsHub hub_;
@@ -79,6 +86,16 @@ class WebServer {
   std::atomic<unsigned> ogg_streams_{0};
   // Monotonic Ogg bitstream serial, unique per stream.ogg connection.
   std::atomic<uint32_t> ogg_serial_{1};
+  // GET /api/genie/wait requests blocking now, capped at kGenieMaxWaits.
+  std::atomic<unsigned> genie_waits_{0};
+  // GET /api/genie/watch requests running now, capped at kGenieMaxWatches.
+  std::atomic<unsigned> genie_watches_{0};
+  // Held while a GET /api/capture/wav body is built (read and encoded): one at a time, so the
+  // next one's MemAvailable check sees the previous body resident.
+  std::timed_mutex wav_build_m_;
+  // Held by GET /api/genie/sync from its freeze to its resume: one measurement at a time, so one
+  // call's resume never pulls the snapshot from under another's reads.
+  std::timed_mutex sync_m_;
   // Per-input telemetry mask, bit c set = input c streamed. A console masks the inputs it is not
   // watching so the spectrum message (the widest frame) drops them. Written by POST
   // /api/telemetry/inputs, read by the publisher. Process-global: one bench, one operator.

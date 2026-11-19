@@ -39,6 +39,8 @@ class RingBuffer {
   uint64_t pinned_bytes() const { return static_cast<uint64_t>(buf_.size()) * sizeof(float); }
 
   // Oldest sample index a reader may still ask for, given the current write head.
+  // How far back a read can reach once the ring has filled: the ring less its safety margin.
+  size_t span() const { return frames_ - safety_; }
   uint64_t oldest(uint64_t head) const {
     const size_t span = frames_ - safety_;
     return head > span ? head - span : 0;

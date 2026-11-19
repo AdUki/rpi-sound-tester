@@ -15,8 +15,8 @@ namespace {
 
 constexpr double kTickHz = 10.0;
 constexpr double kRmsWindowS = 0.1;
-constexpr double kPeakHoldS = 3.0;
-constexpr float kToneThresholdDb = -40.0f;
+// The longest stretch one tick meters for the held peak: what a late tick has to catch up on.
+constexpr double kMeterCatchUpS = 1.0;
 constexpr unsigned kFundamentalBins = 10;  // Hann leakage skirt; a narrower notch invents THD
 constexpr float kThdLowHz = 20.0f;
 constexpr float kThdHighHz = 20000.0f;
@@ -54,6 +54,8 @@ Analysis::Analysis(const RingBuffer& ring, double rate)
   }
 
   for (auto& s : snap_.spectrum) s.assign(kSpectrumBins, kMinDb);
+  const uint64_t hold = static_cast<uint64_t>(std::llround(kPeakHoldS * rate_));
+  for (auto& h : peak_hold_) h = PeakHold(hold, env_col_frames_);
   env_buf_.resize(static_cast<size_t>(env_col_frames_) * st::channels().total());
 }
 
@@ -74,24 +76,120 @@ AnalysisSnapshot Analysis::snapshot() const {
   return snap_;
 }
 
-void Analysis::update_meters(unsigned ch, const float* buf, size_t len, uint64_t now) {
+void PeakHold::add(const float* x, size_t len, uint64_t first) {
+  size_t i = 0;
+  if (first < fed_) i = static_cast<size_t>(std::min<uint64_t>(fed_ - first, len));
+  while (i < len) {
+    // One slice: up to the next multiple of grain_, so slices sit still whatever the windows do.
+    const uint64_t s0 = first + i;
+    const size_t n = static_cast<size_t>(std::min<uint64_t>(grain_ - s0 % grain_, len - i));
+    float peak = 0.0f;
+    size_t at = 0;
+    for (size_t k = 0; k < n; ++k) {
+      const float a = std::fabs(x[i + k]);
+      if (a > peak) {
+        peak = a;
+        at = k;
+      }
+    }
+    // A newer peak at least as high outlasts every older one it is not below.
+    while (!q_.empty() && q_.back().second <= peak) q_.pop_back();
+    if (peak > 0.0f) q_.push_back({s0 + at, peak});
+    i += n;
+  }
+  fed_ = std::max(fed_, first + len);
+}
+
+float PeakHold::value(uint64_t now) {
+  while (!q_.empty() && now > q_.front().first && now - q_.front().first > hold_) q_.pop_front();
+  return q_.empty() ? 0.0f : q_.front().second;
+}
+
+void Analysis::update_meters(unsigned ch, const float* buf, size_t len, size_t rms_len,
+                             uint64_t now) {
+  const float* win = buf + (len - rms_len);
   double sum2 = 0.0;
   float peak = 0.0f;
-  for (size_t i = 0; i < len; ++i) {
-    const float v = buf[i];
+  for (size_t i = 0; i < rms_len; ++i) {
+    const float v = win[i];
     sum2 += static_cast<double>(v) * v;
     peak = std::max(peak, std::fabs(v));
   }
-  const float rms = static_cast<float>(std::sqrt(sum2 / static_cast<double>(len)));
+  const float rms = static_cast<float>(std::sqrt(sum2 / static_cast<double>(rms_len)));
 
-  const uint64_t hold = static_cast<uint64_t>(kPeakHoldS * rate_);
-  if (peak >= peak_hold_[ch] || now - peak_time_[ch] > hold) {
-    peak_hold_[ch] = peak;
-    peak_time_[ch] = now;
+  // Every sample since the last tick (not only the 100 ms window: a late tick would skip some),
+  // so a 1 ms transient is never missed and is held kPeakHoldS after its own sample.
+  PeakHold& h = peak_hold_[ch];
+  h.add(buf, len, now - len);
+  const float held = h.value(now);
+  float span_peak = peak;
+  for (size_t i = 0; i < len - rms_len; ++i) span_peak = std::max(span_peak, std::fabs(buf[i]));
+
+  ChannelMeters& m = snap_.meters[ch];
+  m.rms_db = lin_to_db(rms);
+  m.peak_db = lin_to_db(held);
+  m.peak_now_db = lin_to_db(peak);
+  if (lin_to_db(span_peak) > kGenieSoundThresholdDb) {
+    m.last_loud = now;
+    m.loud_seen = true;
   }
+}
 
-  snap_.meters[ch].rms_db = lin_to_db(rms);
-  snap_.meters[ch].peak_db = lin_to_db(peak_hold_[ch]);
+const char* tone_reason_name(ToneReason r) {
+  switch (r) {
+    case ToneReason::Silent: return "silent";
+    case ToneReason::NotATone: return "not_a_tone";
+    case ToneReason::None: break;
+  }
+  return nullptr;
+}
+
+ToneMetrics tone_from_power(const std::vector<float>& power, double bin_hz) {
+  // Locate the dominant partial, then measure everything else in band against it.
+  ToneMetrics tm;
+  if (power.size() < 3 || bin_hz <= 0.0) return tm;
+  const unsigned k_lo = std::max(1u, static_cast<unsigned>(kThdLowHz / bin_hz));
+  const unsigned k_hi = std::min<unsigned>(static_cast<unsigned>(kThdHighHz / bin_hz),
+                                           static_cast<unsigned>(power.size()) - 2);
+  unsigned kp = 0;
+  float pmax = 0.0f;
+  for (unsigned k = k_lo; k <= k_hi; ++k) {
+    if (power[k] > pmax) {
+      pmax = power[k];
+      kp = k;
+    }
+  }
+  if (kp == 0) return tm;  // all zero: digital silence
+
+  // Parabolic interpolation on the log-magnitude peak for sub-bin frequency accuracy.
+  const float a = 10.0f * std::log10(std::max(power[kp - 1], 1e-20f));
+  const float b = 10.0f * std::log10(std::max(power[kp], 1e-20f));
+  const float c = 10.0f * std::log10(std::max(power[kp + 1], 1e-20f));
+  const float denom = a - 2.0f * b + c;
+  const float delta = denom != 0.0f ? 0.5f * (a - c) / denom : 0.0f;
+  tm.peak_hz = static_cast<float>((kp + delta) * bin_hz);
+  // The parabola's vertex: the bin straddling two FFT bins reads up to 1.4 dB (Hann) low otherwise.
+  tm.peak_db = std::max(kMinDb, b - 0.25f * (a - c) * delta);
+  if (tm.peak_db <= kToneFloorDb) return tm;  // reason stays Silent
+
+  double fund = 0.0;
+  double rest = 0.0;
+  for (unsigned k = k_lo; k <= k_hi; ++k) {
+    if (k + kFundamentalBins >= kp && k <= kp + kFundamentalBins) {
+      fund += power[k];
+    } else {
+      rest += power[k];
+    }
+  }
+  if (fund > 0.0) tm.thd_n_pct = 100.0f * static_cast<float>(std::sqrt(rest / fund));
+  if (tm.thd_n_pct > kToneMaxThdNPct) {
+    tm.reason = ToneReason::NotATone;
+    return tm;
+  }
+  tm.valid = true;
+  tm.reason = ToneReason::None;
+  tm.freq_hz = tm.peak_hz;
+  return tm;
 }
 
 void Analysis::update_spectrum(unsigned ch, const float* buf) {
@@ -119,46 +217,7 @@ void Analysis::update_spectrum(unsigned ch, const float* buf) {
     out[b] = peak > 0.0f ? std::max(kMinDb, 10.0f * std::log10(peak)) : kMinDb;
   }
 
-  // Tone metrics: locate the dominant partial, then measure everything else in band.
-  ToneMetrics tm;
-  const double bin_hz = rate_ / kSpectrumFft;
-  const unsigned k_lo = std::max(1u, static_cast<unsigned>(kThdLowHz / bin_hz));
-  const unsigned k_hi = std::min<unsigned>(static_cast<unsigned>(kThdHighHz / bin_hz),
-                                           static_cast<unsigned>(power_.size()) - 1);
-  unsigned kp = 0;
-  float pmax = 0.0f;
-  for (unsigned k = k_lo; k <= k_hi; ++k) {
-    if (power_[k] > pmax) {
-      pmax = power_[k];
-      kp = k;
-    }
-  }
-
-  if (kp > 0 && 10.0f * std::log10(std::max(pmax, 1e-20f)) > kToneThresholdDb) {
-    // Parabolic interpolation on the log-magnitude peak for sub-bin frequency accuracy.
-    const float a = 10.0f * std::log10(std::max(power_[kp - 1], 1e-20f));
-    const float b = 10.0f * std::log10(std::max(power_[kp], 1e-20f));
-    const float c = 10.0f * std::log10(std::max(power_[kp + 1], 1e-20f));
-    const float denom = a - 2.0f * b + c;
-    const float delta = denom != 0.0f ? 0.5f * (a - c) / denom : 0.0f;
-
-    double fund = 0.0;
-    double rest = 0.0;
-    for (unsigned k = k_lo; k <= k_hi; ++k) {
-      if (k + kFundamentalBins >= kp && k <= kp + kFundamentalBins) {
-        fund += power_[k];
-      } else {
-        rest += power_[k];
-      }
-    }
-
-    tm.valid = true;
-    tm.freq_hz = static_cast<float>((kp + delta) * bin_hz);
-    if (fund > 0.0) {
-      tm.thd_n_pct = 100.0f * static_cast<float>(std::sqrt(rest / fund));
-    }
-  }
-  snap_.tone[ch] = tm;
+  snap_.tone[ch] = tone_from_power(power_, rate_ / kSpectrumFft);
 }
 
 void Analysis::update_envelope(uint64_t now) {
@@ -192,13 +251,16 @@ void Analysis::update_envelope(uint64_t now) {
 
 void Analysis::run() {
   const size_t rms_frames = static_cast<size_t>(kRmsWindowS * rate_);
-  std::vector<float> mbuf(rms_frames);
+  const size_t max_frames =
+      std::max(rms_frames, static_cast<size_t>(kMeterCatchUpS * rate_));
+  std::vector<float> mbuf(max_frames);
   std::vector<float> sbuf(kSpectrumFft);
   // Wait until the widest window fits: `now - rms_frames` below must not go negative.
   const uint64_t warmup = std::max<uint64_t>(kSpectrumFft, rms_frames);
 
   auto next = std::chrono::steady_clock::now();
   bool spectrum_tick = false;
+  uint64_t prev = 0;  // the last tick's `now`: the meters cover every sample since
 
   while (running_.load()) {
     next += std::chrono::microseconds(static_cast<int64_t>(1e6 / kTickHz));
@@ -206,13 +268,17 @@ void Analysis::run() {
 
     const uint64_t now = ring_.counter();
     if (now < warmup) continue;
+    // The samples since the last tick, at least the 100 ms window, at most kMeterCatchUpS.
+    const size_t span = static_cast<size_t>(std::clamp<uint64_t>(
+        now > prev ? now - prev : 0, rms_frames, std::min<uint64_t>(max_frames, now)));
+    prev = now;
 
     std::lock_guard<std::mutex> lock(m_);
     snap_.sample = now;
 
     for (unsigned ch = 0; ch < st::channels().total(); ++ch) {
-      if (ring_.read_channel(now - rms_frames, rms_frames, ch, mbuf.data())) {
-        update_meters(ch, mbuf.data(), rms_frames, now);
+      if (ring_.read_channel(now - span, span, ch, mbuf.data())) {
+        update_meters(ch, mbuf.data(), span, rms_frames, now);
       }
       // Spectra are the expensive part; half rate is plenty for a 5 Hz display push.
       if (spectrum_tick && ring_.read_channel(now - kSpectrumFft, kSpectrumFft, ch, sbuf.data())) {

@@ -25,6 +25,7 @@ struct WindowResult {
   bool raw = false;             // true: `samples` holds one value per point
   uint64_t start = 0;
   uint64_t len = 0;
+  unsigned cols = 0;            // the columns asked for, as served (raw: len <= 2 x cols)
   std::vector<float> samples;   // raw mode
   std::vector<float> mins;      // column mode
   std::vector<float> maxs;
@@ -70,8 +71,24 @@ class CaptureStore {
   // snapshot when frozen, otherwise best-effort from the live ring.
   WindowResult window(unsigned ch, uint64_t start, uint64_t len, unsigned cols) const;
 
-  // Frozen snapshot only: a live read of up to 2^19 frames would race the writer.
-  XcorrResult xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, uint64_t len);
+  // Frozen snapshot only: every channel of [start, start+len) interleaved into `out`
+  // (len x channels().total() floats), provided the snapshot is still the one frozen at
+  // `freeze_sample`. False when it was resumed, re-frozen or resized since, or the span is outside
+  // it. Takes the lock per call, so a long export reads in chunks without holding it throughout.
+  bool snapshot_frames(uint64_t freeze_sample, uint64_t start, uint64_t len, float* out) const;
+
+  // Frozen snapshot only: the RMS of one channel over [start, start+len) with its DC removed (so
+  // an offset is not "sound"), in dBFS, floored at -120. False when not frozen, out of range, or
+  // (freeze_sample != 0) no longer the snapshot frozen at `freeze_sample`.
+  bool rms_db(unsigned ch, uint64_t start, uint64_t len, double* out,
+              uint64_t freeze_sample = 0) const;
+
+  // Frozen snapshot only: a live read of up to 2^19 frames would race the writer. With
+  // freeze_sample != 0 it reads only the snapshot frozen at that sample, else an error that
+  // starts with kSnapshotLost — so a measurement of many windows is never two snapshots.
+  XcorrResult xcorr(unsigned ch_a, unsigned ch_b, uint64_t start, uint64_t len,
+                    uint64_t freeze_sample = 0);
+  static constexpr const char* kSnapshotLost = "the snapshot was resumed or replaced";
 
  private:
   bool snapshot_read(unsigned ch, uint64_t start, uint64_t len, float* out) const;
@@ -94,6 +111,7 @@ class CaptureStore {
 
   std::mutex fft_m_;
   std::vector<float> fa_, fb_, corr_, env_;
+  std::vector<double> cum_a_, cum_b_;  // running energy of each window, for the steady-tone test
   std::vector<std::complex<float>> ca_, cb_, analytic_;
 };
 

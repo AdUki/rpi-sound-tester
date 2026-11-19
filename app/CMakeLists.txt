@@ -140,6 +140,9 @@ add_library(soundtester_core STATIC
   src/devices.cpp
   src/engine_core.cpp
   src/generators.cpp
+  src/genie_select.cpp
+  src/genie_wait.cpp
+  src/genie_watch.cpp
   src/kmsg_watch.cpp
   src/listen_encoder.cpp
   src/listen_stream.cpp
@@ -156,7 +159,20 @@ target_link_libraries(soundtester_core PUBLIC third_party
   PkgConfig::SYSTEMD Threads::Threads)
 target_compile_options(soundtester_core PRIVATE -Wall -Wextra)
 
-add_executable(soundtesterd src/main.cpp)
+# Which build this is (GET /api/state `version`): regenerated on every build, since a commit or an
+# edit changes it without touching any source CMake knows of. Only the daemon links it, so a new
+# timestamp costs one tiny compile and a relink, and the tests not even that.
+set(ST_VERSION_GIT "" CACHE STRING "version string to report instead of `git describe`")
+set(ST_BUILD_INFO ${CMAKE_CURRENT_BINARY_DIR}/build_info.cpp)
+add_custom_target(build_info
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${ST_BUILD_INFO}
+          -DGIT=${ST_VERSION_GIT} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_info.cmake
+  BYPRODUCTS ${ST_BUILD_INFO}
+  COMMENT "Stamping the build's version"
+  VERBATIM)
+
+add_executable(soundtesterd src/main.cpp ${ST_BUILD_INFO})
+add_dependencies(soundtesterd build_info)
 target_link_libraries(soundtesterd PRIVATE soundtester_core)
 
 include(GNUInstallDirs)

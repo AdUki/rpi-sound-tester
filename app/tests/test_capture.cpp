@@ -9,6 +9,8 @@
 #include "channel_layout.h"
 #include "check.h"
 #include "constants.h"
+#include "generators.h"
+#include "genie.h"
 #include "rates.h"
 #include "ring_buffer.h"
 
@@ -20,14 +22,40 @@ constexpr unsigned kPeriod = kTestPeriod;
 
 enum class Stimulus { Broadband, PingTrain, BongSingle, BongTrain, ContinuousSine };
 
-// A bong-shaped burst: 440 Hz decaying sine, tau 80 ms, a quarter of a second long — the
-// generator's ringing tone.
-void add_bong(std::vector<float>& src, uint64_t at, double rate) {
-  const unsigned len = static_cast<unsigned>(rate / 4);
+// A ringing burst: a decaying sine, `dur` seconds long.
+void add_ring(std::vector<float>& src, uint64_t at, double rate, double freq, float tau,
+              double dur) {
+  const unsigned len = static_cast<unsigned>(rate * dur);
   for (unsigned i = 0; i < len && at + i < src.size(); ++i) {
     const double t = i / rate;
-    const float env = std::exp(-static_cast<float>(t) / 0.080f);
-    src[at + i] += 0.8f * env * static_cast<float>(std::sin(2 * kPi * 440.0 * t));
+    const float env = std::exp(-static_cast<float>(t) / tau);
+    src[at + i] += 0.8f * env * static_cast<float>(std::sin(2 * kPi * freq * t));
+  }
+}
+
+// A bong-shaped burst: 440 Hz decaying sine, tau 80 ms, a quarter of a second long — the
+// generator's ringing tone. (A bing is 1 kHz, tau 20 ms, 60 ms long.)
+void add_bong(std::vector<float>& src, uint64_t at, double rate) {
+  add_ring(src, at, rate, 440.0, 0.080f, 0.25);
+}
+
+// Writes `src` into the ring as channel 0, and delayed by `delay` samples as channel 1, over a
+// low noise floor on every channel. Ring sample t carries src[t + 4096] (so a negative delay
+// still has history to read).
+void write_delayed(RingBuffer& ring, int64_t delay, uint64_t frames, const std::vector<float>& src,
+                   std::mt19937& rng) {
+  std::uniform_real_distribution<float> floor_noise(-0.02f, 0.02f);
+  const unsigned total = st::channels().total();
+  std::vector<float> block(kPeriod * total);
+  for (uint64_t n = 0; n < frames; n += kPeriod) {
+    for (unsigned i = 0; i < kPeriod; ++i) {
+      const uint64_t t = n + i;
+      for (unsigned c = 0; c < total; ++c) block[i * total + c] = floor_noise(rng);
+      block[i * total + 0] += src[t + 4096];
+      const int64_t td = static_cast<int64_t>(t) + 4096 - delay;
+      if (td >= 0 && td < static_cast<int64_t>(src.size())) block[i * total + 1] += src[td];
+    }
+    ring.write(block.data(), kPeriod);
   }
 }
 
@@ -36,7 +64,6 @@ void add_bong(std::vector<float>& src, uint64_t at, double rate) {
 void fill_with_delayed_copy(RingBuffer& ring, int64_t delay, uint64_t frames, Stimulus stim,
                             double rate) {
   std::mt19937 rng(1234);
-  std::uniform_real_distribution<float> floor_noise(-0.02f, 0.02f);
   std::uniform_real_distribution<float> broadband(-0.5f, 0.5f);
 
   std::vector<float> src(frames + 8192, 0.0f);
@@ -61,18 +88,21 @@ void fill_with_delayed_copy(RingBuffer& ring, int64_t delay, uint64_t frames, St
     for (size_t i = 0; i < src.size(); ++i)
       src[i] = 0.5f * static_cast<float>(std::sin(2 * kPi * 440.0 * (i / rate)));
   }
+  write_delayed(ring, delay, frames, src, rng);
+}
 
-  std::vector<float> block(kPeriod * st::channels().total());
-  for (uint64_t n = 0; n < frames; n += kPeriod) {
-    for (unsigned i = 0; i < kPeriod; ++i) {
-      const uint64_t t = n + i;
-      for (unsigned c = 0; c < st::channels().total(); ++c) block[i * st::channels().total() + c] = floor_noise(rng);
-      block[i * st::channels().total() + 0] += src[t + 4096];
-      const int64_t td = static_cast<int64_t>(t) + 4096 - delay;
-      if (td >= 0 && td < static_cast<int64_t>(src.size())) block[i * st::channels().total() + 1] += src[td];
-    }
-    ring.write(block.data(), kPeriod);
+// Fills the ring with a steady waveform `wave(phase)` (phase in cycles) at `freq`, channel 1
+// delayed by `delay`.
+template <typename Wave>
+void fill_with_steady_tone(RingBuffer& ring, int64_t delay, uint64_t frames, double rate,
+                           double freq, Wave wave) {
+  std::mt19937 rng(99);
+  std::vector<float> src(frames + 8192);
+  for (size_t i = 0; i < src.size(); ++i) {
+    const double cyc = freq * static_cast<double>(i) / rate;
+    src[i] = 0.5f * static_cast<float>(wave(cyc - std::floor(cyc)));
   }
+  write_delayed(ring, delay, frames, src, rng);
 }
 
 void test_xcorr_recovers_a_known_delay(double rate) {
@@ -189,6 +219,158 @@ void test_xcorr_never_blesses_a_continuous_tone(double rate) {
   std::cout << "  continuous sine -> lag " << r.lag_samples << " (confidence " << r.confidence
             << ")\n";
   CHECK(r.confidence < 2.0);
+  // genie/sync's sliding windows are short: the linear correlation's taper over 2^14 must not
+  // hide the tone's equal crests (it read 999, "no rival", and a wrong lag was trusted).
+  for (const uint64_t win : {uint64_t{1} << 14, uint64_t{1} << 12}) {
+    const XcorrResult w = cap.xcorr(0, 1, cs.valid_start + 5000, win);
+    CHECK(w.ok);
+    std::cout << "  continuous sine, window " << win << " -> lag " << w.lag_samples
+              << " (confidence " << w.confidence << ")\n";
+    CHECK(w.confidence < 1.5);
+  }
+}
+
+// The Scope cursors, genie/sync's cur_x/cur_y and its last ping window bracket a ringing burst
+// in a short window. Its onset is in the window on both channels and pins the lag: a bong (tau
+// 80 ms, so ~0.9 of the cross-spectrum is its one partial) must read sample-exact and
+// confident, not as a steady tone — that correction lifts its ring-out crests to the winner's
+// height (it read confidence ~1.0). A window that opens mid ring-out has no onset to pin the
+// cycle: it must stay unresolved (it read a wrong lag at 999 before the correction).
+void test_xcorr_burst_onset_in_a_short_window(double rate) {
+  constexpr uint64_t kOnsetSrc = 60000;
+  constexpr uint64_t kOnset = kOnsetSrc - 4096;  // where the burst starts in the ring
+  {
+    RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
+    CaptureStore cap(ring, rate, kPeriod);
+    std::mt19937 rng(7);
+    std::vector<float> src(400000 + 8192, 0.0f);
+    add_bong(src, kOnsetSrc, rate);
+    write_delayed(ring, 137, 400000, src, rng);
+    const CaptureStatus cs = cap.freeze(0);
+    CHECK(cs.frozen);
+    for (const uint64_t len : {uint64_t{6000}, uint64_t{8192}}) {
+      for (const uint64_t lead : {uint64_t{300}, uint64_t{1000}, uint64_t{2500}}) {
+        const XcorrResult r = cap.xcorr(0, 1, cs.valid_start + kOnset - lead, len);
+        CHECK(r.ok);
+        std::cout << "  bong onset " << lead << " into a " << len << " window -> lag "
+                  << r.lag_samples << " (confidence " << r.confidence << ")\n";
+        CHECK_EQ(r.lag_samples, 137);
+        CHECK(r.confidence > 3.0);
+      }
+      // Opening 2000 samples into the ring-out: no onset, the cycle is unknowable.
+      const XcorrResult mid = cap.xcorr(0, 1, cs.valid_start + kOnset + 2000, len);
+      CHECK(mid.ok);
+      std::cout << "  bong mid ring-out, " << len << " window -> lag " << mid.lag_samples
+                << " (confidence " << mid.confidence << ")\n";
+      CHECK(mid.lag_samples == 137 || mid.confidence < 1.5);
+    }
+  }
+  {
+    // A bing a long way apart: 3000 samples, in a 4096 window that holds both onsets.
+    RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
+    CaptureStore cap(ring, rate, kPeriod);
+    std::mt19937 rng(8);
+    std::vector<float> src(400000 + 8192, 0.0f);
+    add_ring(src, kOnsetSrc, rate, 1000.0, 0.020f, 0.060);
+    write_delayed(ring, 3000, 400000, src, rng);
+    const CaptureStatus cs = cap.freeze(0);
+    CHECK(cs.frozen);
+    const XcorrResult r = cap.xcorr(0, 1, cs.valid_start + kOnset - 500, 4096);
+    CHECK(r.ok);
+    std::cout << "  bing, delay 3000, 4096 window -> lag " << r.lag_samples << " (confidence "
+              << r.confidence << ")\n";
+    CHECK_EQ(r.lag_samples, 3000);
+    CHECK(r.confidence > 3.0);
+  }
+}
+
+// A steady tone rich in harmonics is as ambiguous as a sine, but its fundamental holds only
+// 0.79-0.90 of the cross-spectrum: the steady-tone test must count its harmonic series, or
+// genie/sync's sliding windows trust a lag a cycle off (28 or -103 instead of 137).
+void test_xcorr_never_blesses_a_harmonic_rich_tone(double rate) {
+  struct Shape {
+    const char* name;
+    double (*wave)(double);
+  };
+  const Shape shapes[] = {
+      {"square", [](double p) { return p < 0.5 ? 1.0 : -1.0; }},
+      {"sine + 30 % third",
+       [](double p) { return (std::sin(2 * kPi * p) + 0.3 * std::sin(6 * kPi * p)) / 1.3; }},
+      {"clipped sine", [](double p) { return std::clamp(1.6 * std::sin(2 * kPi * p), -1.0, 1.0); }},
+  };
+  for (const Shape& shape : shapes) {
+    for (const double freq : {200.0, 440.0}) {
+      RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
+      CaptureStore cap(ring, rate, kPeriod);
+      fill_with_steady_tone(ring, 137, 200000, rate, freq, shape.wave);
+      const CaptureStatus cs = cap.freeze(0);
+      CHECK(cs.frozen);
+      for (const uint64_t win : {uint64_t{1} << 12, uint64_t{1} << 13, uint64_t{1} << 14}) {
+        const XcorrResult r = cap.xcorr(0, 1, cs.valid_start + 5000, win);
+        CHECK(r.ok);
+        if (r.lag_samples != 137 && r.confidence >= 1.5) {
+          std::cout << "  " << shape.name << " " << freq << " Hz, window " << win << " -> lag "
+                    << r.lag_samples << " (confidence " << r.confidence << ")\n";
+        }
+        CHECK(r.lag_samples == 137 || r.confidence < 1.5);
+      }
+    }
+  }
+}
+
+// A tone so low that two of its periods outlast half the correlation lobe leaves no crest to
+// compare against the winner: the envelope alone read 20 Hz in an 8192 window at 48 kHz as lag
+// 106 at confidence 143.
+void test_xcorr_never_blesses_a_very_low_tone(double rate) {
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
+  CaptureStore cap(ring, rate, kPeriod);
+  fill_with_steady_tone(ring, 137, 300000, rate, 20.0,
+                        [](double p) { return std::sin(2 * kPi * p); });
+  const CaptureStatus cs = cap.freeze(0);
+  CHECK(cs.frozen);
+  for (const uint64_t win : {uint64_t{1} << 12, uint64_t{1} << 13, uint64_t{1} << 14}) {
+    for (const uint64_t at : {uint64_t{5000}, uint64_t{40000}, uint64_t{77777}}) {
+      const XcorrResult r = cap.xcorr(0, 1, cs.valid_start + at, win);
+      CHECK(r.ok);
+      if (r.confidence > 1.5) {
+        std::cout << "  20 Hz, window " << win << " at " << at << " -> lag " << r.lag_samples
+                  << " (confidence " << r.confidence << ")\n";
+      }
+      CHECK(r.confidence <= 1.5);
+    }
+  }
+}
+
+// The simulator's music in genie/sync's sliding windows: held synth notes are about as tonal as
+// music gets, yet it must stay measurable — about a third of the windows clear 1.5, every one of
+// them at the true lag.
+void test_xcorr_music_stays_measurable(double rate) {
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
+  CaptureStore cap(ring, rate, kPeriod);
+  Generators gen;
+  gen.init(rate);
+  const uint64_t frames = static_cast<uint64_t>(10 * rate);
+  std::vector<float> src(frames + 8192);
+  gen.render_music(0, src.size(), 0.5f, src.data());
+  std::mt19937 rng(5);
+  write_delayed(ring, 137, frames, src, rng);
+  const CaptureStatus cs = cap.freeze(0);
+  CHECK(cs.frozen);
+  const uint64_t win = sliding_default_window(rate);
+  unsigned windows = 0, kept = 0, wrong = 0;
+  for (uint64_t at = 0; at + win <= cs.valid_len; at += win) {
+    const XcorrResult r = cap.xcorr(0, 1, cs.valid_start + at, win);
+    CHECK(r.ok);
+    ++windows;
+    if (r.confidence >= 1.5 && r.peak >= kPingMinPeak) {
+      ++kept;
+      if (r.lag_samples != 137) ++wrong;
+    }
+  }
+  std::cout << "  music, " << windows << " windows of " << win << ": " << kept << " kept, "
+            << wrong << " at a wrong lag\n";
+  CHECK(kept * 4 >= windows);
+  CHECK_EQ(wrong, 0u);
 }
 
 void test_xcorr_needs_a_freeze(double rate) {
@@ -219,6 +401,27 @@ void test_window_returns_raw_and_columns(double rate) {
   CHECK_EQ(cols.mins.size(), 500u);
   CHECK_EQ(cols.maxs.size(), 500u);
   for (size_t i = 0; i < cols.mins.size(); ++i) CHECK(cols.mins[i] <= cols.maxs[i]);
+  CHECK_EQ(cols.cols, 500u);  // echoed, so a caller sees what it was served
+
+  // Columns past the maximum are refused, not clamped: clamped, 4096 columns over 8192 frames
+  // would come back as min/max pairs that a caller asked for as raw samples.
+  const WindowResult wide = cap.window(0, cs.valid_start + 100, 8192, kWindowMaxCols + 1);
+  CHECK(!wide.ok);
+  CHECK(wide.error.find("cols must be 1..2048") != std::string::npos);
+  CHECK(!cap.window(0, cs.valid_start + 100, 512, 0).ok);
+  const WindowResult max = cap.window(0, cs.valid_start + 100, 2 * kWindowMaxCols, kWindowMaxCols);
+  CHECK(max.ok);
+  CHECK(max.raw);
+  CHECK_EQ(max.samples.size(), 2u * kWindowMaxCols);
+
+  // A range error names both the span asked for and the span there is.
+  const WindowResult out = cap.window(0, cs.valid_start - 1000, 512, 1024);
+  CHECK(!out.ok);
+  CHECK(out.error.find("[" + std::to_string(cs.valid_start - 1000) + ", ") == 0);
+  CHECK(out.error.find("frozen range [" + std::to_string(cs.valid_start) + ", ") !=
+        std::string::npos);
+  const WindowResult zero = cap.window(0, cs.valid_start, 0, 1024);
+  CHECK(zero.error.find("len must be 1..") == 0);
 }
 
 void test_analyze_length_is_configurable(double rate) {
@@ -315,6 +518,32 @@ void test_freeze_never_overruns_the_snapshot(double rate) {
   CHECK(w.ok);
 }
 
+void test_snapshot_frames_copies_every_channel(double rate) {
+  RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
+  CaptureStore cap(ring, rate, kPeriod);
+  fill_with_delayed_copy(ring, 0, 200000, Stimulus::Broadband, rate);
+  const CaptureStatus cs = cap.freeze(0);
+  CHECK(cs.frozen);
+  const unsigned total = st::channels().total();
+
+  const uint64_t start = cs.valid_start + 777, len = 1000;
+  std::vector<float> all(len * total), one(len);
+  CHECK(cap.snapshot_frames(cs.freeze_sample, start, len, all.data()));
+  for (unsigned c = 0; c < total; c += total - 1) {  // the first and the last column
+    const WindowResult w = cap.window(c, start, len, 1024);
+    CHECK(w.ok && w.raw);
+    bool same = w.samples.size() == len;
+    for (uint64_t i = 0; same && i < len; ++i) same = all[i * total + c] == w.samples[i];
+    CHECK(same);
+  }
+  // Out of the frozen range, or a different snapshot: refused.
+  CHECK(!cap.snapshot_frames(cs.freeze_sample, cs.valid_start - 1, len, all.data()));
+  CHECK(!cap.snapshot_frames(cs.freeze_sample, cs.valid_start + cs.valid_len - 10, len, all.data()));
+  CHECK(!cap.snapshot_frames(cs.freeze_sample + 1, start, len, all.data()));
+  cap.resume();
+  CHECK(!cap.snapshot_frames(cs.freeze_sample, start, len, all.data()));
+}
+
 void test_window_rejects_out_of_range(double rate) {
   RingBuffer ring(kRingFrames, st::channels().total(), 2 * kPeriod);
   CaptureStore cap(ring, rate, kPeriod);
@@ -342,9 +571,14 @@ int main() {
     test_xcorr_ringing_tone_single_burst_is_confident(rate);
     test_xcorr_ringing_tone_train_stays_on_the_true_interval(rate);
     test_xcorr_never_blesses_a_continuous_tone(rate);
+    test_xcorr_burst_onset_in_a_short_window(rate);
+    test_xcorr_never_blesses_a_harmonic_rich_tone(rate);
+    test_xcorr_never_blesses_a_very_low_tone(rate);
+    test_xcorr_music_stays_measurable(rate);
     test_xcorr_needs_a_freeze(rate);
     test_window_returns_raw_and_columns(rate);
     test_window_rejects_out_of_range(rate);
+    test_snapshot_frames_copies_every_channel(rate);
     test_analyze_length_is_configurable(rate);
     test_analyze_length_drives_the_allocation(rate);
     test_resize_while_frozen_is_deferred(rate);

@@ -565,6 +565,115 @@ void test_a_feed_lands_the_delay_ahead_of_playout() {
   CHECK(!feed.behind());
 }
 
+// underruns: a run that runs dry while it is streaming, judged once per run so both halves of a
+// pair always agree, with underrun_events counting where each dry spell starts. A sender that
+// simply stops (pause, a PCM held open and silent) adds nothing.
+void test_underruns_count_only_while_streaming_and_once_per_run() {
+  Control ctl;
+  ManualClock clock;
+  NetAudioServer net(ctl, kRate, kTestPeriod, clock);
+  constexpr uint64_t kN = 1000000;
+  constexpr uint32_t kDelay = 9600;  // 100 ms
+  ctl.net.delay_frames.store(kDelay);
+  std::vector<float> live(kTestPeriod * channels().total()), ring(kTestPeriod * channels().total());
+  auto block = [&](uint64_t n) {
+    ctl.anchor.publish(n, clock.now_ns());
+    net.read_block(n, kTestPeriod, kDelay, live.data(), ring.data());
+  };
+  block(kN);
+
+  const int base = net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", 2);
+  CHECK_EQ(base, 0);
+  // Claimed, nothing sent yet: the lead filling is not an underrun.
+  block(kN);
+  CHECK_EQ(net.status()[0].underruns, 0u);
+
+  NetAudioServer::Feed feed(net);
+  std::string err;
+  CHECK(feed.configure(base, 2, static_cast<unsigned>(kRate), &err));
+  std::vector<float> il(4096 * 2, 0.25f);
+  for (int i = 0; i < 4; ++i) feed.push(il.data(), 4096, false);
+  const uint64_t end = net.status()[0].write_end;
+  CHECK(end > kN + kDelay);
+
+  // Inside what was sent: nothing.
+  block(kN + kTestPeriod);
+  CHECK_EQ(net.status()[0].underruns, 0u);
+
+  // Playout past the end with the sender heard just now: three blocks dry, one event, on both.
+  for (int i = 0; i < 3; ++i) block(end + i * kTestPeriod);
+  auto st = net.status();
+  CHECK_EQ(st[0].underruns, 3u);
+  CHECK_EQ(st[1].underruns, 3u);
+  CHECK_EQ(st[0].underrun_events, 1u);
+  CHECK_EQ(st[1].underrun_events, 1u);
+
+  // The sender has gone quiet for longer than kNetStreamingNs: running dry is idle, not counted.
+  clock.advance(kNetStreamingNs + 1);
+  for (int i = 3; i < 10; ++i) block(end + i * kTestPeriod);
+  st = net.status();
+  CHECK_EQ(st[0].underruns, 3u);
+  CHECK_EQ(st[1].underruns, 3u);
+  CHECK_EQ(st[0].state, std::string("connected"));
+
+  // It comes back, anchored afresh ahead of playout: back in its data, then dry again is a second
+  // event.
+  const uint64_t n2 = end + 10 * kTestPeriod;
+  block(n2);
+  feed.push(il.data(), 4096, true);
+  block(n2 + kTestPeriod);
+  const uint64_t end2 = net.status()[0].write_end;
+  CHECK(end2 > n2 + kDelay);
+  block(end2);
+  block(end2 + kTestPeriod);
+  st = net.status();
+  CHECK_EQ(st[0].underruns, 5u);
+  CHECK_EQ(st[1].underruns, 5u);
+  CHECK_EQ(st[0].underrun_events, 2u);
+  CHECK_EQ(st[1].underrun_events, 2u);
+}
+
+// connects, connected_since_ms and last_audio_ms_ago: what a reader needs to tell a fresh link
+// from a stalled one with a single read.
+void test_a_channel_reports_its_connection_and_last_audio() {
+  Control ctl;
+  ManualClock clock;
+  NetAudioServer net(ctl, kRate, kTestPeriod, clock);
+  auto st = net.status();
+  CHECK_EQ(st[0].connects, 0u);
+  CHECK_EQ(st[0].connected_since_unix_ms, 0);
+  CHECK(!st[0].last_audio_ms_ago);
+
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", 2), 0);
+  st = net.status();
+  CHECK_EQ(st[0].connects, 1u);
+  CHECK_EQ(st[1].connects, 1u);
+  CHECK(st[0].connected_since_unix_ms > 1600000000000LL);  // a wall clock, in ms
+  CHECK(!st[0].last_audio_ms_ago);  // claimed, nothing heard yet
+
+  ctl.anchor.publish(1000000, clock.now_ns());
+  NetAudioServer::Feed feed(net);
+  std::string err;
+  CHECK(feed.configure(0, 2, static_cast<unsigned>(kRate), &err));
+  std::vector<float> il(1024 * 2, 0.1f);
+  feed.push(il.data(), 1024, false);
+  clock.advance(250 * 1000000ull);
+  st = net.status();
+  CHECK(st[0].last_audio_ms_ago.has_value());
+  CHECK_EQ(*st[0].last_audio_ms_ago, 250u);
+
+  net.release_channels(0, 2);
+  st = net.status();
+  CHECK_EQ(st[0].connected_since_unix_ms, 0);
+  CHECK(!st[0].last_audio_ms_ago);
+  CHECK_EQ(net.claim_channels(ST_HELLO_ANY_CHANNEL, "10.0.0.1", 2), 0);
+  CHECK_EQ(net.status()[1].connects, 2u);
+  // Forgetting a channel starts its count over.
+  net.release_channels(0, 2);
+  CHECK(net.forget_channel(0));
+  CHECK_EQ(net.status()[0].connects, 0u);
+}
+
 // ---- which channels one mixer drives -----------------------------------------------------
 
 // The bug this pins down: a mixer opened before anything played found a run one channel wide, and
@@ -932,6 +1041,8 @@ int main() {
   test_the_mac_trailer_parses();
   test_an_in_process_sender_is_labelled_as_such();
   test_a_feed_lands_the_delay_ahead_of_playout();
+  test_underruns_count_only_while_streaming_and_once_per_run();
+  test_a_channel_reports_its_connection_and_last_audio();
   test_a_channel_is_only_in_use_once_it_has_been();
   test_a_free_channel_can_be_forgotten();
   test_a_mixer_follows_its_sender_onto_the_whole_run();

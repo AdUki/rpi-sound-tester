@@ -20,6 +20,7 @@
 #include "bt_input.h"
 #include "bt_player.h"
 #include "board.h"
+#include "build_info.h"
 #include "capture.h"
 #include "channel_layout.h"
 #include "config.h"
@@ -209,6 +210,7 @@ int main(int argc, char** argv) {
              net_want, net_fit, layout.net);
   }
   st::set_channels(layout);
+  LOG_INFO("soundtesterd {} (built {})", st::kBuildGit, st::kBuildTime);
   LOG_INFO("board: {}; {} Hz, period {}; {} local inputs, {} outputs, {} network inputs, {} for "
            "device inputs",
            sim ? std::string("simulated Octo")
@@ -348,6 +350,8 @@ int main(int argc, char** argv) {
   // buttons must not systemctl the host.
   wopt.allow_reboot = !sim && !board.desktop;
   wopt.net_inputs_max = std::min(net_max, net_fit);
+  wopt.version_git = st::kBuildGit;
+  wopt.build_time = st::kBuildTime;
 
   st::Deps deps{ctl, net, devices, bt, bt_in, ring, engine, analysis, capture, kmsg, store, cfg};
   st::WebServer server(deps, wopt);
