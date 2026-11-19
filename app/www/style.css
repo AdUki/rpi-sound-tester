@@ -112,6 +112,12 @@ a:not(.tab) { color: var(--accent); }
 
 a.tab { text-decoration: none; }
 .tab-ext { margin-left: auto; }
+/* On a phone the tabs wrap; tighter padding keeps them (Bluetooth and API included) to two rows
+   instead of three, so the panel starts on the first screen. */
+@media (max-width: 600px) {
+  .tabs { padding: 0.4rem 0.5rem 0; gap: 0; }
+  .tab { padding: 0.5rem 0.55rem; }
+}
 
 main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
 
@@ -130,13 +136,13 @@ main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
    where these three breakpoints come from; 260 px is the width at which a channel name and both
    Listen buttons still share one line. Six across would need 1620 px of content and main stops
    at 1368, so it is not reachable without widening main. */
-#inputs, #netinputs, #outputs, #hdmiouts, #lineoutouts { --cols: 1; }
-@media (min-width: 564px)  { #inputs, #netinputs, #outputs, #hdmiouts, #lineoutouts { --cols: 2; } }
+#inputs, #netinputs, #outputs, .sinkouts { --cols: 1; }
+@media (min-width: 564px)  { #inputs, #netinputs, #outputs, .sinkouts { --cols: 2; } }
 @media (min-width: 836px)  { #inputs, #netinputs                                    { --cols: 3; } }
 @media (min-width: 1108px) { #outputs                                               { --cols: 4; } }
-/* HDMI's and the line out's cards, sized like the four output cards above so L and R line up
-   under OUT 1-2. */
-@media (min-width: 1108px) { #hdmiouts, #lineoutouts { --cols: 4; } }
+/* Every sink's cards (built per sink by app.js, id <key>outs), sized like the four output cards
+   above so L and R line up under OUT 1-2. */
+@media (min-width: 1108px) { .sinkouts { --cols: 4; } }
 
 .socbar { display: flex; align-items: center; gap: 0.6rem 1rem; flex-wrap: wrap; margin-bottom: 0.4rem; }
 .socbar label { display: inline-flex; align-items: center; margin: 0; white-space: nowrap; max-width: 100%; }

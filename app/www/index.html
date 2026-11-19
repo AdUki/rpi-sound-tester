@@ -44,7 +44,8 @@
   <strong>Monitor audio is dropping out over the connection.</strong>
   <span id="conntext"></span>
   The audio is reaching this browser too late to play cleanly — the cause is the network between
-  your browser and the Sound Tester, not the device under test. Raise the Monitor buffer past the
+  your browser and the Sound Tester, not the device under test. Raise the
+  <a href="#" data-tab="in">Monitor buffer</a> past the
   length of the stalls, move closer to the access point, or use a wired connection. The meters, THD+N and the scope read the device directly and are
   unaffected.
 </div>
@@ -55,7 +56,9 @@
 </div><!-- #banners: fixed overlay, out of flow -->
 
 <nav class="tabs">
-  <button class="tab active" data-tab="dash">Dashboard</button>
+  <!-- Inputs and Outputs were one Dashboard tab ("dash"); app.js sends that name to Inputs. -->
+  <button class="tab active" data-tab="in">Inputs</button>
+  <button class="tab" data-tab="out">Outputs</button>
   <button class="tab" data-tab="scope">Scope &amp; sync</button>
   <button class="tab" data-tab="net">Network</button>
   <button class="tab" data-tab="bt" id="bttab" hidden>Bluetooth</button>
@@ -68,7 +71,9 @@
 
 <main>
 
-<section id="dash" class="panel active">
+<!-- What comes in: the cards, meters and spectra, and the monitor controls, which act on nothing
+     but the Listen buttons on these cards. -->
+<section id="in" class="panel active">
   <div class="monitor">
     <span class="mlabel">Monitor volume</span>
     <input type="range" id="monvol" step="0.5">
@@ -129,7 +134,12 @@
       <a href="#" data-tab="net">Network settings ↗</a></p>
     <div id="netinputs" class="grid"></div>
   </div>
+</section>
 
+<!-- What goes out: the engine card's outputs and every sink, each routed from any input or
+     generator. The generators' own settings stay on Configuration: they are set once and rarely
+     touched, while routing is what an operator flips during a test. -->
+<section id="out" class="panel">
   <!-- The engine card's own outputs: the Octo's DACs. A board without one has none. -->
   <div id="outsec">
     <h2>Outputs <label class="allbox" title="Mute or unmute every output"><input
@@ -142,6 +152,8 @@
        above and on the same sample axis, so a ping through a TV can be measured like one through
        a DAC. -->
   <div id="sinks"></div>
+  <p id="nooutputs" class="muted" hidden>This device has no outputs right now: no sound card of its
+    own, and no other playback device found. One plugged in (HDMI, USB) shows up here.</p>
 </section>
 
 <section id="scope" class="panel">
@@ -270,7 +282,7 @@
       <span id="btadapterstate" class="pill">—</span>
     </div>
     <p class="muted small">The Pi's own radio, both ways: a paired speaker or headphones become the
-      <a href="#" data-tab="dash">Bluetooth output</a>, and a phone or laptop that plays to this
+      <a href="#" data-tab="out" data-scroll="skbluetoothsec">Bluetooth output</a>, and a phone or laptop that plays to this
       device becomes a pair of network inputs. Both share the sample axis with every other input
       and output.</p>
     <div class="btrow">
@@ -315,9 +327,10 @@
   <div class="card wide">
     <h3>Bluetooth output</h3>
     <p class="muted small">Plays what is routed to it on the
-      <a href="#" data-tab="dash">Dashboard</a>. Its latency is held constant up to the Bluetooth
-      stack; the codec and the radio add more, which the speaker reports and which is not constant,
-      so calibrate with a ping before trusting an absolute delay.</p>
+      <a href="#" data-tab="out" data-scroll="skbluetoothsec">Outputs</a> tab. Its latency is held
+      constant up to the Bluetooth stack; the codec and the radio add more, which the speaker
+      reports and which is not constant, so calibrate with a ping before trusting an absolute
+      delay.</p>
     <label>Play to <select id="btoutdev"></select></label>
     <div id="btoutstate" class="small mono"></div>
   </div>
@@ -417,7 +430,8 @@
     <h3>Sound devices</h3>
     <p class="muted small">Every PCM device ALSA has, as <span class="mono">aplay -l</span> and
       <span class="mono">arecord -l</span> list them, found again every couple of seconds: a USB
-      device plugged in now shows up here, and as an output or input on the Dashboard.</p>
+      device plugged in now shows up here, and on the <a href="#" data-tab="out">Outputs</a> or
+      <a href="#" data-tab="in">Inputs</a> tab.</p>
     <table id="devtable"></table>
   </div>
   <div class="card wide">

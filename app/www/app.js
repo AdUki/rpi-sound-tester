@@ -109,19 +109,52 @@ let gainMinDb = 0, gainMaxDb = 40;
 
 // ---------------------------------------------------------------- tabs
 
+// The open tab is the URL's hash, so a reload, a bookmark or a link sent to a colleague comes back
+// to it. Inputs and Outputs were one Dashboard tab, "dash": a hash from before the split lands on
+// Inputs, where its meters went, and is rewritten so the address bar stops showing it.
+const DEFAULT_TAB = 'in';
+const TAB_ALIASES = {dash: 'in'};
+
+// The tab the hash names, or the default for none, an unknown name or a tab this device does not
+// have. A hidden tab (Bluetooth) counts as missing only once /state has said whether it is there.
+function tabFromHash() {
+  let name = location.hash.slice(1);
+  name = TAB_ALIASES[name] || name;
+  const btn = [...document.querySelectorAll('.tab[data-tab]')].find(t => t.dataset.tab === name);
+  return btn && $(name) && !(state && btn.hidden) ? name : DEFAULT_TAB;
+}
+
+// Buttons and panels only: safe before /state has arrived, so a restored tab shows from the first
+// paint instead of flashing Inputs while the page loads.
+function selectTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === name));
+  // replaceState, not a new history entry: Back leaves the console rather than walking the tabs,
+  // and setting the hash this way does not fire hashchange back at us.
+  if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+}
+
+function openTab(name) {
+  selectTab(name);
+  // A canvas in a display:none panel measures zero, so neither could draw until now.
+  if (name === 'scope') drawScope();
+  else if (name === 'in') redrawSpectra();
+  else if (name === 'net') refreshNet();
+  syncBtPoll(name);
+}
+
 document.querySelectorAll('[data-tab]').forEach(el => {
   el.addEventListener('click', e => {
     e.preventDefault();
-    const name = el.dataset.tab;
-    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
-    document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === name));
-    // A canvas in a display:none panel measures zero, so neither could draw until now.
-    if (name === 'scope') drawScope();
-    else if (name === 'dash') redrawSpectra();
-    else if (name === 'net') refreshNet();
-    syncBtPoll(name);
+    openTab(el.dataset.tab);
+    // A link into the middle of a tab (the Bluetooth output, below the card's own outputs).
+    const to = el.dataset.scroll && $(el.dataset.scroll);
+    if (to) to.scrollIntoView({block: 'start'});
   });
 });
+// A hash typed into the address bar, or a bookmark of another tab opened from this page.
+window.addEventListener('hashchange', () => { if (state) openTab(tabFromHash()); });
+selectTab(tabFromHash());
 
 // A resize gives every canvas a new backing store; nothing else repaints them. Debounced,
 // because a drag of the window edge fires this continuously.
@@ -173,7 +206,7 @@ let monitorDb = 0;
 // How far ahead of real time the browser schedules monitor audio: the playback buffer. A bigger
 // buffer rides out a jittery link (fewer of the late chunks connWatch flags) but adds that much
 // delay between the device and what you hear. A buffer longer than the link's stalls (a VPN that
-// drops out for a few seconds) plays straight through them. Configurable from the dashboard.
+// drops out for a few seconds) plays straight through them. Configurable on the Inputs tab.
 const MON_LAT_MIN_MS = 50, MON_LAT_MAX_MS = 5000;
 let monLatency = 0.15;   // seconds
 
@@ -735,7 +768,7 @@ function applyInputEnabled(ch) {
   scopeDirty = true;
 }
 
-// One entry point for both checkbox sets (dashboard #en, scope #lane) and a section's "all" box:
+// One entry point for both checkbox sets (Inputs tab #en, scope #lane) and a section's "all" box:
 // flip the state of one channel or a list of them, persist it, reflect it everywhere
 // (applyInputEnabled ticks both twins), refetch the frozen scope without the dropped lanes, and
 // tell the daemon — once, however many channels changed.
@@ -1078,12 +1111,15 @@ function buildSinks() {
         <label id="${k.k}laywrap" hidden>Channels <select id="${k.k}layout"></select></label>
       </div>
       <div id="${k.k}detail" class="socdetail muted small mono"></div>
-      <div id="${k.k}outs" class="grid"></div>
+      <div id="${k.k}outs" class="grid sinkouts"></div>
     </div>`).join('');
   sinks.forEach((k, i) => {
     sinkState[k.k] = list[i];
     buildSink(k);
   });
+  // A board without an engine card (the VIM3L) and nothing plugged in: say so, rather than leave
+  // the Outputs tab blank as if it had failed to load.
+  $('nooutputs').hidden = !!(state.outputs.length || sinks.length);
 }
 
 // Channels are named by speaker on HDMI, by number elsewhere. The daemon says which each routed
@@ -1274,7 +1310,7 @@ function drawSpectrumBars(ch) {
   const cv = $('spec' + ch);
   if (!cv || !st) return;
   const w = cv.clientWidth, h = cv.clientHeight;
-  // Zero while the Dashboard is hidden. Sizing the canvas to it would blank the display and nothing
+  // Zero while the Inputs tab is hidden. Sizing the canvas to it would blank the display and nothing
   // would repaint it, because the next message would find the width unchanged.
   if (!w || !h) return;
   if (cv.width !== w) cv.width = w;
@@ -1303,11 +1339,11 @@ function redrawSpectra() {
   }
 }
 
-// Dashboard render loop, twin of scopeTick: while the Dashboard is showing, ease every input's bars
+// Inputs render loop, twin of scopeTick: while the Inputs tab is showing, ease every input's bars
 // toward the latest spectrum targets and repaint. Gated on the tab so it idles elsewhere; targets
 // keep updating in the background via ingestSpectrum, so a return to the tab catches up smoothly.
 function spectraTick() {
-  if (tabActive('dash')) {
+  if (tabActive('in')) {
     for (const key of Object.keys(barState)) {
       const ch = Number(key);
       if (!inputEnabled[ch]) continue;
@@ -1465,7 +1501,7 @@ function refreshOutputSourceOptions() {
 }
 
 // The heading and its explanation belong to the cards under it: with no sender there is nothing
-// for them to introduce, and the Dashboard should read exactly as it did before this existed.
+// for them to introduce, and the Inputs tab should read exactly as it did before this existed.
 function syncNetSection() {
   const sec = $('netsec');
   if (!sec) return;
@@ -1641,7 +1677,7 @@ function refreshNet() {
 // someone is looking at their phone rather than this tab, so it also rides the 1 Hz system frame
 // and is shown on every tab (renderBtRequest).
 
-// The Bluetooth output's section on the Dashboard, when it has one: a full status from the
+// The Bluetooth output's section on the Outputs tab, when it has one: a full status from the
 // Bluetooth tab updates it there too.
 function btApplyOutput(o) {
   const sink = sinks.find(k => k.id === BT_SINK_ID);
@@ -1929,7 +1965,7 @@ function renderBt(b) {
     sel.value = outDev || BT_DEFAULT_DEVICE;
   }
   const o = b.output;
-  $('btoutstate').textContent = !o ? '' : !o.enabled ? 'off — turn it on on the Dashboard'
+  $('btoutstate').textContent = !o ? '' : !o.enabled ? 'off — turn it on on the Outputs tab'
     : o.playing ? `playing to ${o.name || o.address} · ${o.device_rate} Hz · latency ${o.latency_ms.toFixed(1)} ms`
     : o.error ? o.error : 'starting';
   $('btoutstate').className = 'small mono ' + (o && o.playing ? 'btaudio' : o && o.error ? 'bterr' : 'muted');
@@ -2017,7 +2053,7 @@ function buildMap() {
 // is narrow enough. The envelope stream alone can never show a single sample — zooming past
 // its 5 ms floor needs the snapshot.
 
-// The scope lanes are the same on/off state as the dashboard's per-input enable: disabling an
+// The scope lanes are the same on/off state as the Inputs tab's per-input enable: disabling an
 // input hides its lane and vice versa. There is one source of truth, inputEnabled, and the two
 // checkbox sets are kept in step through applyInputEnabled().
 // Widest the scope zooms out. Keep this many seconds of columns so that span is backed by data:
@@ -3753,6 +3789,10 @@ api('/state').then(s => {
     startPingPoll();
     refreshPings();
   }
+  // Everything is built and the feed state is known, so the restored tab can draw and start its
+  // poll. Bluetooth's tab is known to be there or not by now: a #bt on a device without a radio
+  // falls back to Inputs.
+  openTab(tabFromHash());
   requestAnimationFrame(scopeTick);
   requestAnimationFrame(spectraTick);
 }).catch(e => {
